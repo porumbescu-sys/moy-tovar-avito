@@ -222,7 +222,14 @@ def detect_color(name: str) -> str:
 
 
 def fmt_ruble_template(value: float | int) -> str:
-    return f"{int(round(float(value))):,}".replace(",", " ") + "р"
+    return f"{int(round(float(value))):,}".replace(",", " ") + " руб."
+
+
+def is_available(row: pd.Series) -> bool:
+    try:
+        return float(row.get("free_qty", 0)) > 0
+    except Exception:
+        return False
 
 
 def build_offer_template(df: pd.DataFrame, query: str, round100: bool) -> str:
@@ -234,6 +241,11 @@ def build_offer_template(df: pd.DataFrame, query: str, round100: bool) -> str:
             lines.append(f"{part} --- продан")
             continue
         row = exact.iloc[0]
+        if not is_available(row):
+            color = detect_color(str(row["name"]))
+            prefix = f"{row['article']} {color}".strip()
+            lines.append(f"{prefix} --- продан")
+            continue
         color = detect_color(str(row["name"]))
         prefix = f"{row['article']} {color}".strip()
         avito = float(row["sale_price"]) * (1 - DEFAULT_DISCOUNT_1 / 100)
@@ -245,6 +257,21 @@ def build_offer_template(df: pd.DataFrame, query: str, round100: bool) -> str:
             avito = round(avito)
             cash = round(cash)
         lines.append(f"{prefix} --- {fmt_ruble_template(avito)} - Авито / {fmt_ruble_template(cash)} за наличный расчет")
+    return "\n\n".join(lines)
+
+
+def build_selected_price_template(df: pd.DataFrame, query: str, price_mode: str, round100: bool, custom_discount: float) -> str:
+    lines: list[str] = []
+    for part in split_query_parts(query):
+        article_norm = normalize_article(part)
+        exact = df[df["article_norm"] == article_norm] if isinstance(df, pd.DataFrame) else pd.DataFrame()
+        if exact.empty:
+            continue
+        row = exact.iloc[0]
+        if not is_available(row):
+            continue
+        selected_price = get_selected_price_raw(row, price_mode, round100, custom_discount)
+        lines.append(f"{row['article']} {row['name']} --- {fmt_ruble_template(selected_price)}.")
     return "\n\n".join(lines)
 
 
@@ -520,8 +547,29 @@ else:
     line_count = len(split_query_parts(submitted_query))
     c1, c2 = st.columns([1, 4])
     c1.metric("Строк в шаблоне", line_count)
-    c2.markdown("<div style='padding-top:30px;color:#64748b;font-size:13px;'>Ниже готовый текст. Его можно сразу скопировать целиком и вставить в сообщение.</div>", unsafe_allow_html=True)
+    c2.markdown("<div style='padding-top:30px;color:#64748b;font-size:13px;'>Ниже готовый текст. Округление до 100 и наличие по колонке «Свободно» применяются и здесь.</div>", unsafe_allow_html=True)
     st.text_area("Готовый шаблон", value=template_text, height=min(360, max(150, 52 + line_count * 42)), key="offer_template_text")
     render_copy_big_button(template_text)
+
+st.markdown('</div>', unsafe_allow_html=True)
+
+st.markdown('<div class="result-wrap">', unsafe_allow_html=True)
+st.markdown(f"""<div class="section-title">Шаблон: артикул + название + выбранная цена</div><div class="section-sub">Формат: Артикул + название --- цена. Цена берётся из выбранного режима слева ({html.escape(price_label)}). Если по колонке «Свободно» товара нет в наличии, он во второй шаблон не попадает. Округление из левой панели применяется и здесь.</div>""", unsafe_allow_html=True)
+
+if current_df is None:
+    st.info("Сначала загрузите прайс в левой панели 👈")
+elif not submitted_query.strip():
+    st.info("Введите артикулы через Enter или запятую, затем нажмите **Найти**.")
+else:
+    second_template_text = build_selected_price_template(current_df, submitted_query, price_mode, round100, custom_discount)
+    if second_template_text.strip():
+        second_line_count = len([x for x in second_template_text.split("\n\n") if x.strip()])
+        c1, c2 = st.columns([1, 4])
+        c1.metric("Строк во 2 шаблоне", second_line_count)
+        c2.markdown("<div style='padding-top:30px;color:#64748b;font-size:13px;'>Во второй шаблон попадают только найденные позиции, которые есть в наличии.</div>", unsafe_allow_html=True)
+        st.text_area("Готовый шаблон 2", value=second_template_text, height=min(360, max(150, 52 + second_line_count * 42)), key="selected_price_template_text")
+        render_copy_big_button(second_template_text, "📋 Скопировать 2 шаблон")
+    else:
+        st.info("Во втором шаблоне нечего показывать: найденных позиций в наличии нет.")
 
 st.markdown('</div>', unsafe_allow_html=True)
