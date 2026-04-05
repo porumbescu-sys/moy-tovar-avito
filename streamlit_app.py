@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import json
 import io
 import math
 import re
@@ -32,6 +33,31 @@ COLUMN_ALIASES = {
     "price": ["Цена", "Цена продажи", "Продажа", "розница", "price"],
 }
 
+
+
+COLOR_KEYWORDS = [
+    ("желтый", "желтый"),
+    ("yellow", "желтый"),
+    ("yello", "желтый"),
+    ("cyan", "голубой"),
+    ("голубой", "голубой"),
+    ("синий", "синий"),
+    ("blue", "синий"),
+    ("magenta", "пурпурный"),
+    ("пурпур", "пурпурный"),
+    ("фиолет", "пурпурный"),
+    ("purple", "пурпурный"),
+    ("red", "красный"),
+    ("красный", "красный"),
+    ("black", "черный"),
+    ("черный", "черный"),
+    ("чёрный", "черный"),
+    ("grey", "серый"),
+    ("gray", "серый"),
+    ("серый", "серый"),
+    ("green", "зеленый"),
+    ("зел", "зеленый"),
+]
 
 def init_state() -> None:
     defaults = {
@@ -183,8 +209,60 @@ def fmt_qty(value: float | int) -> str:
     return f"{v:,.2f}".replace(",", " ").replace(".", ",")
 
 
+def split_query_parts(query: str) -> list[str]:
+    return [normalize_text(x) for x in re.split(r"[\n,;]+", query) if normalize_text(x)]
+
+
+def detect_color(name: str) -> str:
+    low = normalize_text(name).lower()
+    for needle, label in COLOR_KEYWORDS:
+        if needle in low:
+            return label
+    return ""
+
+
+def fmt_ruble_template(value: float | int) -> str:
+    return f"{int(round(float(value))):,}".replace(",", " ") + "р"
+
+
+def build_offer_template(df: pd.DataFrame, query: str, round100: bool) -> str:
+    lines: list[str] = []
+    for part in split_query_parts(query):
+        article_norm = normalize_article(part)
+        exact = df[df["article_norm"] == article_norm] if isinstance(df, pd.DataFrame) else pd.DataFrame()
+        if exact.empty:
+            lines.append(f"{part} --- продан")
+            continue
+        row = exact.iloc[0]
+        color = detect_color(str(row["name"]))
+        prefix = f"{row['article']} {color}".strip()
+        avito = float(row["sale_price"]) * (1 - DEFAULT_DISCOUNT_1 / 100)
+        cash = avito * 0.90
+        if round100:
+            avito = round_up_to_100(avito)
+            cash = round_up_to_100(cash)
+        else:
+            avito = round(avito)
+            cash = round(cash)
+        lines.append(f"{prefix} --- {fmt_ruble_template(avito)} - Авито / {fmt_ruble_template(cash)} за наличный расчет")
+    return "\n\n".join(lines)
+
+
+def render_copy_big_button(text_value: str, button_label: str = "📋 Скопировать весь шаблон") -> None:
+    escaped = json.dumps(text_value, ensure_ascii=False)
+    html_block = f"""
+    <div style='margin-top:8px;'>
+      <button onclick='navigator.clipboard.writeText({escaped}).then(() => {{ this.innerText = "Скопировано"; setTimeout(() => this.innerText = {json.dumps(button_label, ensure_ascii=False)}, 1200); }})'
+        style='border:none;background:#315efb;color:white;font-weight:800;border-radius:12px;padding:12px 16px;cursor:pointer;min-width:220px;'>
+        {html.escape(button_label)}
+      </button>
+    </div>
+    """
+    components.html(html_block, height=58)
+
+
 def perform_search(df: pd.DataFrame, query: str) -> pd.DataFrame:
-    parts = [normalize_text(x) for x in re.split(r"[\n,;]+", query) if normalize_text(x)]
+    parts = split_query_parts(query)
     if not parts:
         return df.iloc[0:0].copy()
 
@@ -427,5 +505,23 @@ else:
     with st.expander("Показать техническую таблицу"):
         st.dataframe(build_display_df(result_df, price_mode, round100, custom_discount), use_container_width=True, hide_index=True, height=300)
     st.download_button("⬇️ Скачать найденное в Excel", to_excel_bytes(result_df, price_mode, round100, custom_discount), file_name="moy_tovar_results.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+st.markdown('</div>', unsafe_allow_html=True)
+
+st.markdown('<div class="result-wrap">', unsafe_allow_html=True)
+st.markdown("""<div class="section-title">Шаблон для Авито / сообщения клиенту</div><div class="section-sub">Для каждого введённого артикула собираю строку в формате: цена Авито = продажа -12%, цена за наличный расчёт = ещё -10% от цены Авито. Если артикула нет в прайсе — пишу «продан». Округление из левой панели применяется и здесь.</div>""", unsafe_allow_html=True)
+
+if current_df is None:
+    st.info("Сначала загрузите прайс в левой панели 👈")
+elif not submitted_query.strip():
+    st.info("Введите артикулы через Enter или запятую, затем нажмите **Найти**.")
+else:
+    template_text = build_offer_template(current_df, submitted_query, round100)
+    line_count = len(split_query_parts(submitted_query))
+    c1, c2 = st.columns([1, 4])
+    c1.metric("Строк в шаблоне", line_count)
+    c2.markdown("<div style='padding-top:30px;color:#64748b;font-size:13px;'>Ниже готовый текст. Его можно сразу скопировать целиком и вставить в сообщение.</div>", unsafe_allow_html=True)
+    st.text_area("Готовый шаблон", value=template_text, height=min(360, max(150, 52 + line_count * 42)), key="offer_template_text")
+    render_copy_big_button(template_text)
 
 st.markdown('</div>', unsafe_allow_html=True)
