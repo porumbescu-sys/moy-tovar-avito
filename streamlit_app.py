@@ -271,7 +271,8 @@ def build_selected_price_template(df: pd.DataFrame, query: str, price_mode: str,
         if not is_available(row):
             continue
         selected_price = get_selected_price_raw(row, price_mode, round100, custom_discount)
-        lines.append(f"{row['article']} {row['name']} --- {fmt_ruble_template(selected_price)}.")
+        name_only = normalize_text(row["name"])
+        lines.append(f"{name_only} --- {fmt_ruble_template(selected_price)}")
     return "\n\n".join(lines)
 
 
