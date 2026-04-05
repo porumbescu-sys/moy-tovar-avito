@@ -305,6 +305,24 @@ st.markdown(
     [data-testid="stSidebar"] { background: linear-gradient(180deg, #0f172a 0%, #172554 100%); border-right: 1px solid rgba(255,255,255,.08); }
     [data-testid="stSidebar"] * { color: #e5ecff !important; }
     [data-testid="stSidebar"] .stFileUploader section { background: rgba(255,255,255,0.06) !important; border: 1px dashed rgba(255,255,255,0.25) !important; border-radius: 14px !important; }
+    [data-testid="stSidebar"] .stNumberInput input,
+    [data-testid="stSidebar"] .stTextInput input,
+    [data-testid="stSidebar"] .stTextArea textarea {
+        background: #ffffff !important;
+        color: #0f172a !important;
+        -webkit-text-fill-color: #0f172a !important;
+        caret-color: #0f172a !important;
+        opacity: 1 !important;
+    }
+    [data-testid="stSidebar"] .stNumberInput button,
+    [data-testid="stSidebar"] .stNumberInput button * {
+        color: #94a3b8 !important;
+    }
+    [data-testid="stSidebar"] .stNumberInput label,
+    [data-testid="stSidebar"] .stRadio label,
+    [data-testid="stSidebar"] .stCheckbox label {
+        color: #e5ecff !important;
+    }
     .topbar { background: linear-gradient(90deg, #0f172a 0%, #1d4ed8 100%); color: white; padding: 16px 18px; border-radius: 18px; margin-top: 0.4rem; margin-bottom: 10px; box-shadow: 0 12px 28px rgba(15, 23, 42, .18); }
     .topbar-grid { display:grid; grid-template-columns: 1.6fr 1fr 1fr 1fr; gap: 10px; align-items:center; }
     .brand-box { display:flex; gap:12px; align-items:center; }
