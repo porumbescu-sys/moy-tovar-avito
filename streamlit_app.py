@@ -298,14 +298,18 @@ def perform_search(df: pd.DataFrame, query: str) -> pd.DataFrame:
     used_indices = set()
     for part in parts:
         article_norm = normalize_article(part)
-        exact = df[df["article_norm"] == article_norm]
+        exact = df[df["article_norm"] == article_norm].copy()
         if not exact.empty:
+            exact["match_type"] = "exact"
+            exact["match_query"] = part
             results.append(exact)
             used_indices.update(exact.index.tolist())
             continue
         contains_mask = df["search_blob"].str.contains(re.escape(part.upper()), na=False)
-        contains = df[contains_mask & ~df.index.isin(used_indices)].head(50)
+        contains = df[contains_mask & ~df.index.isin(used_indices)].head(50).copy()
         if not contains.empty:
+            contains["match_type"] = "similar"
+            contains["match_query"] = part
             results.append(contains)
             used_indices.update(contains.index.tolist())
 
@@ -313,6 +317,10 @@ def perform_search(df: pd.DataFrame, query: str) -> pd.DataFrame:
         return df.iloc[0:0].copy()
     merged = pd.concat(results, ignore_index=False)
     merged = merged.drop_duplicates(subset=["article_norm"], keep="first")
+    if "match_type" not in merged.columns:
+        merged["match_type"] = ""
+    if "match_query" not in merged.columns:
+        merged["match_query"] = ""
     return merged.reset_index(drop=True)
 
 
@@ -359,11 +367,17 @@ def render_results_table(df: pd.DataFrame, price_mode: str, round100: bool, cust
     for _, row in df.iterrows():
         selected_raw = get_selected_price_raw(row, price_mode, round100, custom_discount)
         selected_fmt = fmt_price(selected_raw)
+        match_type = str(row.get("match_type", ""))
+        badge_html = ""
+        if match_type == "exact":
+            badge_html = "<div class='match-badge match-badge-exact'>Точное совпадение</div>"
+        elif match_type == "similar":
+            badge_html = "<div class='match-badge match-badge-similar'>Похожее совпадение</div>"
         rows_html.append(
             f"""
             <tr>
               <td><span class='article-pill'>{html.escape(str(row['article']))}</span></td>
-              <td><div class='name-cell'>{html.escape(str(row['name']))}</div></td>
+              <td><div class='name-cell'>{html.escape(str(row['name']))}</div>{badge_html}</td>
               <td>{html.escape(str(row['brand'] or ''))}</td>
               <td>{fmt_qty(row['free_qty'])}</td>
               <td>{fmt_qty(row['total_qty'])}</td>
@@ -384,7 +398,10 @@ def render_results_table(df: pd.DataFrame, price_mode: str, round100: bool, cust
       tbody td {{ padding:14px; border-bottom:1px solid #e5edf6; vertical-align:top; color:#1e293b; }}
       tbody tr:last-child td {{ border-bottom:none; }}
       .article-pill {{ display:inline-block; padding:6px 10px; border-radius:999px; background:#edf2ff; color:#315efb; font-weight:800; }}
-      .name-cell {{ font-weight:800; line-height:1.35; color:#1e293b; }}
+      .name-cell {{ font-weight:800; line-height:1.35; color:#1e293b; margin-bottom:6px; }}
+      .match-badge {{ display:inline-block; padding:5px 10px; border-radius:999px; font-size:12px; font-weight:800; }}
+      .match-badge-exact {{ background:#e8f7ee; color:#15803d; }}
+      .match-badge-similar {{ background:#fff0df; color:#c26a00; }}
       .sale-col {{ font-weight:800; }}
       .selected-col {{ background:#eef4ff; border-left:1px solid #c7d7ff; border-right:1px solid #c7d7ff; font-weight:900; color:#315efb; }}
       .copy-btn {{ border:none; background:#e9efff; color:#315efb; font-weight:800; border-radius:14px; padding:11px 14px; cursor:pointer; min-width:130px; }}
@@ -515,7 +532,7 @@ submitted_query = st.session_state.submitted_query
 result_df = st.session_state.last_result
 
 st.markdown('<div class="result-wrap">', unsafe_allow_html=True)
-st.markdown('<div class="section-title">Результаты</div><div class="section-sub">Показываю таблицу в стиле первой картинки: продажа, выбранная цена и кнопка копирования по строке.</div>', unsafe_allow_html=True)
+st.markdown('<div class="section-title">Результаты</div><div class="section-sub">Показываю таблицу в стиле первой картинки: продажа, выбранная цена, кнопка копирования и отметка точного или похожего совпадения.</div>', unsafe_allow_html=True)
 
 if current_df is None:
     st.info("Сначала загрузите прайс в левой панели 👈")
