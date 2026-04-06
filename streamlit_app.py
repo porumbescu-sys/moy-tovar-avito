@@ -33,8 +33,6 @@ COLUMN_ALIASES = {
     "price": ["Цена", "Цена продажи", "Продажа", "розница", "price"],
 }
 
-
-
 COLOR_KEYWORDS = [
     ("желтый", "желтый"),
     ("yellow", "желтый"),
@@ -58,6 +56,7 @@ COLOR_KEYWORDS = [
     ("green", "зеленый"),
     ("зел", "зеленый"),
 ]
+
 
 def init_state() -> None:
     defaults = {
@@ -209,8 +208,46 @@ def fmt_qty(value: float | int) -> str:
     return f"{v:,.2f}".replace(",", " ").replace(".", ",")
 
 
+def looks_like_article_token(token: str) -> bool:
+    token = normalize_text(token)
+    if not token:
+        return False
+
+    compact = re.sub(r"[\s\-_./]", "", token)
+    has_digit = any(ch.isdigit() for ch in compact)
+    has_alpha = any(ch.isalpha() for ch in compact)
+
+    return len(compact) >= 3 and has_digit and has_alpha
+
+
 def split_query_parts(query: str) -> list[str]:
-    return [normalize_text(x) for x in re.split(r"[\n,;]+", query) if normalize_text(x)]
+    parts: list[str] = []
+
+    raw_chunks = re.split(r"[\n,;]+", query)
+
+    for chunk in raw_chunks:
+        chunk = normalize_text(chunk)
+        if not chunk:
+            continue
+
+        if "/" in chunk:
+            slash_parts = [normalize_text(x) for x in re.split(r"\s*/\s*", chunk) if normalize_text(x)]
+            if len(slash_parts) > 1:
+                parts.extend(slash_parts)
+                continue
+
+        space_parts = [normalize_text(x) for x in re.split(r"\s+", chunk) if normalize_text(x)]
+
+        if len(space_parts) > 1 and all(looks_like_article_token(x) for x in space_parts):
+            parts.extend(space_parts)
+        else:
+            parts.append(chunk)
+
+    return parts
+
+
+def normalize_query_for_display(query: str) -> str:
+    return "\n".join(split_query_parts(query))
 
 
 def detect_color(name: str) -> str:
@@ -510,7 +547,13 @@ st.markdown('<div class="toolbar">', unsafe_allow_html=True)
 st.markdown('<div class="toolbar-title">Поиск товара</div><div class="toolbar-sub">Можно искать по одному или нескольким артикулам, а также по части названия или бренда.</div>', unsafe_allow_html=True)
 
 with st.form("search_form", clear_on_submit=False):
-    search_value = st.text_area("Поисковый запрос", value=st.session_state.search_input, placeholder="Например:\n006R01380\n106R00646\nили Xerox 700", height=90, label_visibility="collapsed")
+    search_value = st.text_area(
+        "Поисковый запрос",
+        value=st.session_state.search_input,
+        placeholder="Например:\nCC530AC CC531AC CC532AC\nили\nCC530AC / CC531AC / CC532AC\nили\n006R01380\n106R00646\nили Xerox 700",
+        height=90,
+        label_visibility="collapsed",
+    )
     c1, c2, c3 = st.columns([1, 1, 2.4])
     find_clicked = c1.form_submit_button("🔎 Найти", use_container_width=True, type="primary")
     clear_clicked = c2.form_submit_button("🧹 Очистить", use_container_width=True)
@@ -522,10 +565,17 @@ if clear_clicked:
     st.session_state.submitted_query = ""
     st.session_state.last_result = None
     st.rerun()
+
 if find_clicked:
-    st.session_state.search_input = search_value
-    st.session_state.submitted_query = search_value
-    st.session_state.last_result = perform_search(st.session_state.catalog_df, search_value) if isinstance(st.session_state.catalog_df, pd.DataFrame) else None
+    normalized_query = normalize_query_for_display(search_value)
+    st.session_state.search_input = normalized_query
+    st.session_state.submitted_query = normalized_query
+    st.session_state.last_result = (
+        perform_search(st.session_state.catalog_df, normalized_query)
+        if isinstance(st.session_state.catalog_df, pd.DataFrame)
+        else None
+    )
+    st.rerun()
 
 current_df = st.session_state.catalog_df
 submitted_query = st.session_state.submitted_query
