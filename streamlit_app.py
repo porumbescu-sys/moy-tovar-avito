@@ -77,6 +77,35 @@ def normalize_article(value: object) -> str:
     return re.sub(r"[^A-Za-z0-9]", "", text).upper()
 
 
+def extract_first_url(value: object) -> str:
+    text = normalize_text(value)
+    if not text:
+        return ""
+
+    # Поддержка Excel-формулы HYPERLINK(...)
+    if text.startswith("="):
+        m = re.match(r'^=\s*(?:HYPERLINK|ГИПЕРССЫЛКА)\(\s*"([^"]+)"', text, flags=re.IGNORECASE)
+        if m:
+            return normalize_text(m.group(1))
+
+    m = re.search(r'https?://[^\s"\'<>]+', text, flags=re.IGNORECASE)
+    if not m:
+        return ""
+
+    url = m.group(0).strip()
+
+    # Иногда после ссылки в ячейке идёт хвост вида: " ! alt : ..."
+    url = re.sub(r'[!;,]+$', '', url).strip()
+
+    # Обрезаем совсем явный мусор после картинки/файла, если он попал в строку.
+    for stopper in [' ! ', ' alt :', ' title :', ' desc :', ' caption :']:
+        pos = url.lower().find(stopper.strip().lower())
+        if pos > 0:
+            url = url[:pos].strip()
+
+    return url
+
+
 def compact_text(value: object) -> str:
     return re.sub(r"\s+", "", normalize_text(value)).upper()
 
@@ -1216,6 +1245,103 @@ st.markdown(
     .sidebar-card-note { font-size: .79rem; line-height: 1.52; color:#c7d6ff !important; margin-bottom: .65rem; }
     .sidebar-status { background: rgba(7, 31, 74, .92); border: 1px solid rgba(255,255,255,.06); border-radius: 14px; padding: .76rem .82rem; color:#ffffff !important; font-weight: 800; margin-top: .58rem; }
     .sidebar-mini { font-size:.78rem; color:#c7d6ff !important; line-height:1.5; margin-top:.65rem; }
+    [data-testid="stSidebar"] .stFileUploader section,
+    [data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"],
+    [data-testid="stSidebar"] section[data-testid="stFileUploaderDropzone"] {
+        background: linear-gradient(180deg, rgba(10,24,67,.92), rgba(9,20,56,.88)) !important;
+        border: 1px dashed rgba(140,173,255,.34) !important;
+        border-radius: 18px !important;
+        box-shadow: inset 0 1px 0 rgba(255,255,255,.05) !important;
+    }
+    [data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"] * {
+        color: #dfe8ff !important;
+        -webkit-text-fill-color: #dfe8ff !important;
+        opacity: 1 !important;
+    }
+    [data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"] button,
+    [data-testid="stSidebar"] .stFileUploader button,
+    [data-testid="stSidebar"] .stFileUploader [data-baseweb="button"] {
+        background: linear-gradient(180deg, #3b6dff 0%, #2758ef 100%) !important;
+        color: #ffffff !important;
+        -webkit-text-fill-color: #ffffff !important;
+        border: none !important;
+        border-radius: 14px !important;
+        font-weight: 800 !important;
+        box-shadow: 0 10px 20px rgba(49,94,251,.28) !important;
+    }
+    [data-testid="stSidebar"] [data-testid="stFileUploaderFileData"],
+    [data-testid="stSidebar"] [data-testid="stFileUploaderFile"],
+    [data-testid="stSidebar"] [data-testid="stFileUploaderFileName"] {
+        color: #f8fbff !important;
+        -webkit-text-fill-color: #f8fbff !important;
+        opacity: 1 !important;
+    }
+    [data-testid="stSidebar"] .stTextArea textarea,
+    [data-testid="stSidebar"] .stTextInput input,
+    [data-testid="stSidebar"] .stNumberInput input,
+    [data-testid="stSidebar"] [data-baseweb="input"] input,
+    [data-testid="stSidebar"] [data-baseweb="base-input"] input,
+    [data-testid="stSidebar"] [data-baseweb="textarea"] textarea,
+    [data-testid="stSidebar"] [data-baseweb="select"] > div {
+        background: linear-gradient(180deg, rgba(9,22,60,.98), rgba(7,18,50,.96)) !important;
+        color: #f8fbff !important;
+        -webkit-text-fill-color: #f8fbff !important;
+        caret-color: #ffffff !important;
+        border: none !important;
+        border-radius: 16px !important;
+        box-shadow: inset 0 0 0 1px rgba(135,170,255,.24), 0 8px 18px rgba(2,8,23,.12) !important;
+    }
+    [data-testid="stSidebar"] .stTextArea textarea::placeholder,
+    [data-testid="stSidebar"] .stTextInput input::placeholder,
+    [data-testid="stSidebar"] .stNumberInput input::placeholder,
+    [data-testid="stSidebar"] [data-baseweb="textarea"] textarea::placeholder {
+        color: #9fb4ef !important;
+        -webkit-text-fill-color: #9fb4ef !important;
+        opacity: 1 !important;
+    }
+    [data-testid="stSidebar"] .stNumberInput button,
+    [data-testid="stSidebar"] .stNumberInput [data-baseweb="button"],
+    [data-testid="stSidebar"] .stNumberInput svg {
+        background: rgba(255,255,255,.04) !important;
+        color: #cfe0ff !important;
+        fill: #cfe0ff !important;
+        stroke: #cfe0ff !important;
+        border-color: rgba(135,170,255,.18) !important;
+        opacity: 1 !important;
+    }
+    [data-testid="stSidebar"] .stButton > button,
+    [data-testid="stSidebar"] .stDownloadButton > button {
+        width: 100% !important;
+        min-height: 48px !important;
+        background: linear-gradient(180deg, #3b6dff 0%, #2758ef 100%) !important;
+        color: #ffffff !important;
+        -webkit-text-fill-color: #ffffff !important;
+        border: none !important;
+        border-radius: 16px !important;
+        font-weight: 900 !important;
+        box-shadow: 0 10px 22px rgba(49,94,251,.30) !important;
+    }
+    [data-testid="stSidebar"] .stButton > button:hover,
+    [data-testid="stSidebar"] .stDownloadButton > button:hover {
+        background: linear-gradient(180deg, #4a79ff 0%, #2d61f2 100%) !important;
+        color: #ffffff !important;
+        -webkit-text-fill-color: #ffffff !important;
+    }
+    [data-testid="stSidebar"] .stButton > button:disabled,
+    [data-testid="stSidebar"] .stDownloadButton > button:disabled {
+        background: linear-gradient(180deg, rgba(96,114,167,.72), rgba(80,95,143,.72)) !important;
+        color: rgba(255,255,255,.86) !important;
+        -webkit-text-fill-color: rgba(255,255,255,.86) !important;
+        box-shadow: none !important;
+        opacity: 1 !important;
+    }
+    [data-testid="stSidebar"] label,
+    [data-testid="stSidebar"] .stRadio p,
+    [data-testid="stSidebar"] .stCheckbox p,
+    [data-testid="stSidebar"] .stSelectbox p {
+        color: #eef4ff !important;
+        -webkit-text-fill-color: #eef4ff !important;
+    }
     .topbar { position: relative; background: linear-gradient(110deg, #0f172a 0%, #1742a8 56%, #2d6bff 100%); color: white; padding: 18px 20px; border-radius: 24px; margin-top: 0.55rem; margin-bottom: 14px; box-shadow: 0 18px 38px rgba(15, 23, 42, .22); overflow: hidden; }
     .topbar-grid { display:grid; grid-template-columns: 1.6fr 1fr 1fr 1fr; gap: 12px; align-items:center; position:relative; z-index:1; }
     .brand-box { display:flex; gap:14px; align-items:center; }
