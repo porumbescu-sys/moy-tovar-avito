@@ -245,6 +245,41 @@ def build_row_compare_codes(article: object, name: object) -> list[str]:
     return unique_norm_codes([article, *extract_article_candidates_from_text(name)])
 
 
+def build_sheet_code_reason_lookup(df: pd.DataFrame | None, reason: str) -> dict[str, set[str]]:
+    lookup: dict[str, set[str]] = {}
+    if df is None or df.empty:
+        return lookup
+    for _, row in df.iterrows():
+        codes = row.get("row_codes")
+        if not isinstance(codes, list) or not codes:
+            codes = build_row_compare_codes(row.get("article", ""), row.get("name", ""))
+        for code in codes:
+            norm = normalize_article(code)
+            if not norm:
+                continue
+            lookup.setdefault(norm, set()).add(reason)
+    return lookup
+
+
+def merge_code_reason_lookups(*lookups: dict[str, set[str]]) -> dict[str, list[str]]:
+    merged: dict[str, set[str]] = {}
+    for lookup in lookups:
+        for code, reasons in (lookup or {}).items():
+            if not code or not reasons:
+                continue
+            merged.setdefault(code, set()).update(set(reasons))
+    return {code: sorted(reasons) for code, reasons in merged.items() if reasons}
+
+
+def get_original_block_reasons(codes: list[str], block_lookup: dict[str, list[str]]) -> list[str]:
+    reasons: set[str] = set()
+    for code in codes or []:
+        for reason in block_lookup.get(normalize_article(code), []) or []:
+            if reason:
+                reasons.add(str(reason))
+    return sorted(reasons)
+
+
 def build_compatible_price_lookup(compatible_df: pd.DataFrame | None) -> dict[str, dict[str, set[float]]]:
     lookup: dict[str, dict[str, set[float]]] = {}
     if compatible_df is None or compatible_df.empty:
@@ -497,11 +532,19 @@ def load_comparison_workbook(file_name: str, file_bytes: bytes) -> dict[str, pd.
         raise ValueError("Не удалось прочитать comparison-файл: на листах не найдены обязательные колонки Артикул / Наименование / Наша цена / Наш склад.")
 
     compatible_df = sheets.get("Совместимые")
+    discount_df = sheets.get("Уценка")
     compatible_lookup = build_compatible_price_lookup(compatible_df)
     original_df = sheets.get("Сравнение")
-    if compatible_lookup and isinstance(original_df, pd.DataFrame) and not original_df.empty:
+    original_block_lookup = merge_code_reason_lookups(
+        build_sheet_code_reason_lookup(discount_df, "Уценка"),
+        build_sheet_code_reason_lookup(compatible_df, "Совместимые"),
+    )
+    if isinstance(original_df, pd.DataFrame) and not original_df.empty:
         original_df = original_df.copy()
-        original_df["blocked_source_prices"] = original_df["row_codes"].apply(lambda codes: merge_blocked_source_prices(codes, compatible_lookup))
+        if compatible_lookup:
+            original_df["blocked_source_prices"] = original_df["row_codes"].apply(lambda codes: merge_blocked_source_prices(codes, compatible_lookup))
+        original_df["original_block_reasons"] = original_df["row_codes"].apply(lambda codes: get_original_block_reasons(codes, original_block_lookup))
+        original_df["blocked_in_original"] = original_df["original_block_reasons"].map(lambda x: isinstance(x, list) and len(x) > 0)
         sheets["Сравнение"] = original_df
     return sheets
 
@@ -2012,11 +2055,15 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
     min_dist_qty = float(st.session_state.get("distributor_min_qty", 1.0))
 
     if sheet_name == "Сравнение":
+        blocked_count = 0
+        if isinstance(sheet_df, pd.DataFrame) and "blocked_in_original" in sheet_df.columns:
+            blocked_count = int(sheet_df["blocked_in_original"].fillna(False).sum())
+            sheet_df = sheet_df[sheet_df["blocked_in_original"] != True].copy().reset_index(drop=True)
         render_info_banner(
-            "Защита от совместимки и мусорных цен",
-            "Во вкладке Оригинал сначала скрываются цены поставщиков, которые уже совпали с листом Совместимые по OEM-коду. Дополнительно отсекаются экстремально низкие выбросы, если они резко выпадают из нормального коридора цен.",
+            "Защита от уценки и совместимки",
+            "Во вкладке Оригинал позиции целиком скрываются, если их OEM-код найден на листе Уценка или Совместимые. После этого дополнительно отсекаются мусорные экстремально низкие цены поставщиков.",
             icon="🛡️",
-            chips=["сначала фильтр по совместимым", "потом отсев аномально низких цен", "оригинальная строка остаётся"],
+            chips=[f"скрыто строк: {blocked_count}", "если код есть в Уценке — не показываем", "если код есть в Совместимых — не показываем"],
             tone="green",
         )
 
