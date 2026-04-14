@@ -36,7 +36,8 @@ PHOTO_COLUMN_ALIASES = {
     "article": ["Артикул", "артикул", "Код", "код", "sku", "article"],
     "photo_url": [
         "Фото", "Ссылка на фото", "URL фото", "photo", "image", "image_url",
-        "photo_url", "url", "link", "picture", "картинка", "ссылка"
+        "photo_url", "url", "link", "picture", "картинка", "ссылка",
+        "imag", "images"
     ],
 }
 
@@ -354,25 +355,76 @@ def load_comparison_workbook(file_name: str, file_bytes: bytes) -> dict[str, pd.
 @st.cache_data(show_spinner=False)
 def load_photo_map_file(file_name: str, file_bytes: bytes) -> pd.DataFrame:
     suffix = Path(file_name).suffix.lower()
-    bio = io.BytesIO(file_bytes)
+
+    def _from_raw(raw: pd.DataFrame) -> pd.DataFrame:
+        raw = raw.dropna(how="all")
+        if raw.empty:
+            return pd.DataFrame(columns=["article", "article_norm", "photo_url"])
+
+        raw = raw.copy()
+        raw.columns = [normalize_text(c) for c in raw.columns]
+
+        mapping = detect_mapping(raw, PHOTO_COLUMN_ALIASES)
+
+        # Частый кейс: лист из 2 колонок, где первая = Артикул, а вторая без имени.
+        if not mapping.get("article"):
+            for col in raw.columns:
+                if compact_text(col) == "АРТИКУЛ":
+                    mapping["article"] = col
+                    break
+        if not mapping.get("photo_url") and len(raw.columns) >= 2:
+            first_col = mapping.get("article") or raw.columns[0]
+            second_col = next((c for c in raw.columns if c != first_col), None)
+            if second_col is not None:
+                second_vals = raw[second_col].map(normalize_text)
+                url_hits = second_vals.map(lambda x: bool(extract_first_url(x))).sum()
+                if url_hits > 0:
+                    mapping["photo_url"] = second_col
+
+        # Ещё один кейс: на листе "Worksheet" URL лежит в imag/images.
+        if not mapping.get("photo_url"):
+            for col in raw.columns:
+                col_key = compact_text(col)
+                if col_key in {"IMAG", "IMAGES"}:
+                    mapping["photo_url"] = col
+                    break
+
+        if not mapping.get("article") or not mapping.get("photo_url"):
+            return pd.DataFrame(columns=["article", "article_norm", "photo_url"])
+
+        out = pd.DataFrame()
+        out["article"] = raw[mapping["article"]].map(normalize_text)
+        out["article_norm"] = raw[mapping["article"]].map(normalize_article)
+        out["photo_url"] = raw[mapping["photo_url"]].map(extract_first_url)
+        out = out[(out["article_norm"] != "") & (out["photo_url"] != "")].drop_duplicates(subset=["article_norm"], keep="first").reset_index(drop=True)
+        return out
+
     if suffix == ".csv":
+        bio = io.BytesIO(file_bytes)
         try:
             raw = pd.read_csv(bio)
         except UnicodeDecodeError:
             bio.seek(0)
             raw = pd.read_csv(bio, encoding="cp1251")
-    else:
-        raw = pd.read_excel(bio)
-    raw = raw.dropna(how="all")
-    mapping = detect_mapping(raw, PHOTO_COLUMN_ALIASES)
-    if not mapping.get("article") or not mapping.get("photo_url"):
+        out = _from_raw(raw)
+        if out.empty:
+            raise ValueError("В файле фото нужны колонки с артикулом и ссылкой на фото.")
+        return out
+
+    sheets = pd.read_excel(io.BytesIO(file_bytes), sheet_name=None)
+    parts: list[pd.DataFrame] = []
+    for sheet_name, raw in sheets.items():
+        part = _from_raw(raw)
+        if not part.empty:
+            part["source_sheet"] = sheet_name
+            parts.append(part)
+
+    if not parts:
         raise ValueError("В файле фото нужны колонки с артикулом и ссылкой на фото.")
-    out = pd.DataFrame()
-    out["article"] = raw[mapping["article"]].map(normalize_text)
-    out["article_norm"] = raw[mapping["article"]].map(normalize_article)
-    out["photo_url"] = raw[mapping["photo_url"]].map(normalize_text)
-    out = out[(out["article_norm"] != "") & (out["photo_url"] != "")].drop_duplicates(subset=["article_norm"], keep="first").reset_index(drop=True)
-    return out
+
+    combined = pd.concat(parts, ignore_index=True)
+    combined = combined.drop_duplicates(subset=["article_norm"], keep="first").reset_index(drop=True)
+    return combined
 
 
 def apply_photo_map(df: pd.DataFrame | None, photo_df: pd.DataFrame | None) -> pd.DataFrame | None:
