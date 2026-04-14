@@ -1022,6 +1022,134 @@ def report_to_excel_bytes(df: pd.DataFrame) -> bytes:
     bio.seek(0)
     return bio.read()
 
+def build_product_analysis_df(result_df: pd.DataFrame, min_qty: float = 1.0) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    if result_df is None or result_df.empty:
+        return pd.DataFrame()
+
+    seen: set[str] = set()
+    for _, row in result_df.iterrows():
+        row_key = str(row.get("article_norm") or normalize_article(row.get("article", "")))
+        if row_key in seen:
+            continue
+        seen.add(row_key)
+
+        best_offer = get_best_offer(row, min_qty=min_qty)
+        rows.append({
+            "Артикул": str(row.get("article", "") or ""),
+            "Название": str(row.get("name", "") or ""),
+            "КОЛ.": safe_float(row.get("free_qty", 0), 0.0),
+            "тек прод": safe_float(row.get("sale_price", 0), 0.0),
+            "дистр": safe_float(best_offer.get("price", 0), 0.0) if best_offer else None,
+            "Дистрибьютор": str(best_offer.get("source", "") or "") if best_offer else "",
+            "Остаток дистрибьютора": safe_float(best_offer.get("qty", 0), 0.0) if best_offer else None,
+        })
+
+    return pd.DataFrame(rows)
+
+
+def build_product_analysis_workbook_bytes(result_df: pd.DataFrame, min_qty: float = 1.0) -> bytes:
+    analysis_df = build_product_analysis_df(result_df, min_qty=min_qty)
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Анализ товара"
+
+    headers = [
+        "Артикул", "", "КОЛ.", "тек прод", "дистр", "МИ", "ВЦМ", "Ятовары", "Мы на авито",
+        "авито мин", "сред. Зак.", "Прод пред", "пред на Авито", "", "% прод", "% Авито"
+    ]
+    ws.append(headers)
+
+    column_widths = {
+        "A": 14, "B": 4, "C": 10, "D": 12, "E": 12, "F": 10, "G": 10, "H": 12,
+        "I": 13, "J": 12, "K": 12, "L": 12, "M": 14, "N": 4, "O": 10, "P": 10,
+    }
+    for col, width in column_widths.items():
+        ws.column_dimensions[col].width = width
+
+    header_fill = openpyxl.styles.PatternFill(fill_type="solid", fgColor="D9E2F3")
+    thin_gray = openpyxl.styles.Side(style="thin", color="D0D7E2")
+    border = openpyxl.styles.Border(left=thin_gray, right=thin_gray, top=thin_gray, bottom=thin_gray)
+    header_font = openpyxl.styles.Font(bold=True)
+    center = openpyxl.styles.Alignment(horizontal="center", vertical="center")
+
+    for cell in ws[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.border = border
+        cell.alignment = center
+
+    currency_format = '#,##0.00'
+    percent_format = '0.00%'
+
+    for excel_row, rec in enumerate(analysis_df.to_dict(orient="records"), start=2):
+        ws.cell(excel_row, 1).value = rec.get("Артикул", "")
+        ws.cell(excel_row, 3).value = rec.get("КОЛ.", None)
+        ws.cell(excel_row, 4).value = rec.get("тек прод", None)
+        ws.cell(excel_row, 5).value = rec.get("дистр", None)
+        ws.cell(excel_row, 6).value = None
+        ws.cell(excel_row, 7).value = None
+        ws.cell(excel_row, 8).value = None
+        ws.cell(excel_row, 9).value = None
+        ws.cell(excel_row, 10).value = None
+        ws.cell(excel_row, 11).value = None
+        ws.cell(excel_row, 12).value = f'=IF(E{excel_row}="","",E{excel_row}-E{excel_row}*5%)'
+        ws.cell(excel_row, 13).value = f'=IF(L{excel_row}="","",L{excel_row}-L{excel_row}*20%)'
+        ws.cell(excel_row, 15).value = f'=IF(OR(K{excel_row}="",K{excel_row}=0,L{excel_row}=""),"",L{excel_row}/K{excel_row}-1)'
+        ws.cell(excel_row, 16).value = f'=IF(OR(K{excel_row}="",K{excel_row}=0,M{excel_row}=""),"",M{excel_row}/K{excel_row}-1)'
+
+        if rec.get("дистр") not in (None, ""):
+            comment_lines = []
+            dist_name = normalize_text(rec.get("Дистрибьютор", ""))
+            if dist_name:
+                comment_lines.append(f"Лучшее предложение: {dist_name}")
+            dist_qty = rec.get("Остаток дистрибьютора")
+            if dist_qty not in (None, ""):
+                comment_lines.append(f"Остаток: {fmt_qty(dist_qty)} шт.")
+            if comment_lines:
+                ws.cell(excel_row, 5).comment = openpyxl.comments.Comment("\n".join(comment_lines), "ChatGPT")
+
+        for col_idx in [4, 5, 6, 7, 8, 9, 10, 11, 12, 13]:
+            ws.cell(excel_row, col_idx).number_format = currency_format
+        for col_idx in [15, 16]:
+            ws.cell(excel_row, col_idx).number_format = percent_format
+
+    max_row = max(ws.max_row, 2)
+    for row in ws.iter_rows(min_row=2, max_row=max_row, min_col=1, max_col=16):
+        for cell in row:
+            cell.border = border
+            if cell.column in (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16):
+                cell.alignment = center
+
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:P{max_row}"
+
+    info = wb.create_sheet("Справка")
+    info["A1"] = "Как читать файл"
+    info["A1"].font = openpyxl.styles.Font(bold=True, size=12)
+    info["A3"] = "Артикул / КОЛ. / тек прод"
+    info["B3"] = "Заполняются автоматически из результата поиска и текущего листа comparison-файла."
+    info["A4"] = "дистр"
+    info["B4"] = "Подставляется лучшая валидная цена поставщика. В комментарии к ячейке есть поставщик и остаток."
+    info["A5"] = "МИ / ВЦМ / Ятовары / Мы на авито / авито мин / сред. Зак."
+    info["B5"] = "Эти поля вы заполняете вручную перед обсуждением."
+    info["A6"] = "Прод пред"
+    info["B6"] = "Считается как дистр - 5%."
+    info["A7"] = "пред на Авито"
+    info["B7"] = "Считается как Прод пред - 20%."
+    info["A8"] = "% прод / % Авито"
+    info["B8"] = "Считаются относительно среднего закупа."
+    info.column_dimensions["A"].width = 26
+    info.column_dimensions["B"].width = 90
+    info.freeze_panes = "A3"
+
+    bio = io.BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+    return bio.read()
+
+
 
 def build_offer_template(df: pd.DataFrame, query: str, round100: bool, footer_text: str, search_mode: str) -> str:
     result_df = search_in_df(df, query, search_mode)
@@ -1958,6 +2086,24 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
                 tone="green",
             )
             render_all_prices_block(result_df, min_dist_qty, price_mode, round100, custom_discount)
+            st.markdown('</div>', unsafe_allow_html=True)
+
+            st.markdown('<div class="result-wrap">', unsafe_allow_html=True)
+            render_info_banner(
+                "Файл для согласования с руководителем",
+                "Этот экспорт собирает базовую аналитику по найденным товарам: ваш текущий прод, лучшую цену поставщика и поля, которые удобно дозаполнить вручную перед обсуждением новых цен.",
+                icon="🗂️",
+                chips=["артикул и количество уже заполнены", "лучшая цена дистрибьютора уже внутри", "готово для обсуждения"],
+                tone="blue",
+            )
+            st.download_button(
+                "⬇️ Скачать анализ товара",
+                build_product_analysis_workbook_bytes(result_df, min_qty=min_dist_qty),
+                file_name=f"analysis_for_manager_{tab_key}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=False,
+                key=f"download_analysis_{tab_key}",
+            )
             st.markdown('</div>', unsafe_allow_html=True)
 
             st.markdown('<div class="result-wrap">', unsafe_allow_html=True)
