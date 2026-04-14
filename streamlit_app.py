@@ -54,6 +54,49 @@ CYRILLIC_ARTICLE_TRANSLATION = str.maketrans({
     "Ё": "E", "ё": "E",
 })
 
+MERLION_PANTUM_EXTRA_ZERO_CODES = {
+    "DL420P", "DL5120P", "DLR5220",
+    "TL420HP", "TL420XP", "TL5120HP", "TL5120P", "TL5120XP",
+}
+
+
+def normalize_merlion_source_price(row: pd.Series, source: str, price: float) -> float:
+    """
+    Безопасная правка только для проблемной группы Pantum у Мерлиона.
+    Делим на 10 только когда:
+    - источник именно Мерлион
+    - в строке есть Pantum
+    - найден один из известных OEM-кодов
+    - цена выглядит как явно раздутая: 51000 / 73500 / 122000 и т.п.
+    """
+    try:
+        price_val = float(price)
+    except Exception:
+        return float(price)
+
+    if compact_text(source) != "МЕРЛИОН":
+        return price_val
+    if price_val < 10000:
+        return price_val
+
+    row_text = contains_text(f"{row.get('article', '')} {row.get('name', '')}")
+    if "PANTUM" not in row_text:
+        return price_val
+
+    row_codes = row.get("row_codes")
+    if not isinstance(row_codes, list) or not row_codes:
+        row_codes = build_row_compare_codes(row.get("article", ""), row.get("name", ""))
+    if not any(normalize_article(code) in MERLION_PANTUM_EXTRA_ZERO_CODES for code in (row_codes or [])):
+        return price_val
+
+    rounded = int(round(price_val))
+    if abs(price_val - rounded) > 1e-9:
+        return price_val
+    if rounded % 100 != 0:
+        return price_val
+
+    return price_val / 10.0
+
 
 def normalize_text(value: object) -> str:
     if value is None:
@@ -291,6 +334,7 @@ def build_compatible_price_lookup(compatible_df: pd.DataFrame | None) -> dict[st
         for pair in row.get("source_pairs", []) or []:
             source = str(pair.get("source", "") or "")
             price = safe_float(row.get(pair.get("price_col", "")), 0.0)
+            price = normalize_merlion_source_price(row, source, price)
             qty = parse_qty_generic(row.get(pair.get("qty_col", "")))
             if not source or price <= 0 or qty <= 0:
                 continue
@@ -905,6 +949,7 @@ def get_row_offers(row: pd.Series, min_qty: float = 1.0) -> list[dict[str, Any]]
     for pair in row.get("source_pairs", []) or []:
         source = pair["source"]
         price = safe_float(row.get(pair["price_col"]), 0.0)
+        price = normalize_merlion_source_price(row, source, price)
         qty = parse_qty_generic(row.get(pair["qty_col"]))
         if price <= 0 or qty < float(min_qty):
             continue
