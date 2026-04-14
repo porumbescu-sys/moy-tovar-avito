@@ -970,7 +970,7 @@ def apply_photo_map(df: pd.DataFrame | None, photo_df: pd.DataFrame | None) -> p
     return out
 
 
-@st.cache_data@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False)
 def load_avito_file(file_name: str, file_bytes: bytes) -> pd.DataFrame:
     suffix = Path(file_name).suffix.lower()
     if suffix == ".csv":
