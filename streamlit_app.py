@@ -1237,13 +1237,20 @@ def render_results_table(df: pd.DataFrame, price_mode: str, round100: bool, cust
         rows_html.append(
             f"""
             <tr>
-              <td><span class='article-pill'>{html.escape(str(row['article']))}</span></td>
-              <td><div class='name-cell'>{html.escape(str(row['name']))}</div>{badge_html}</td>
+              <td class='item-col'>
+                <div class='item-wrap'>
+                  <div class='item-photo'>{photo_html}</div>
+                  <div class='item-main'>
+                    <div class='item-top'><span class='article-pill'>{html.escape(str(row['article']))}</span></div>
+                    <div class='name-cell'>{html.escape(str(row['name']))}</div>
+                    {badge_html}
+                  </div>
+                </div>
+              </td>
               <td>{fmt_qty(row['free_qty'])}</td>
               <td class='sale-col'>{fmt_price(row['sale_price'])} руб.</td>
               <td class='selected-col'>{fmt_price(selected_raw)} руб.</td>
               <td class='compare-col'>{compare_html}</td>
-              <td class='photo-col'>{photo_html}</td>
             </tr>
             """
         )
@@ -1296,7 +1303,7 @@ def render_results_table(df: pd.DataFrame, price_mode: str, round100: bool, cust
       .photo-empty-small {{ width:72px; height:72px; }}
     </style></head><body>
       <div class='wrap'><table>
-        <thead><tr><th>Артикул</th><th>Название</th><th>Наш склад</th><th>Наша цена</th><th>{html.escape(selected_label)}</th><th>Где лучше нас</th><th>Фото</th></tr></thead>
+        <thead><tr><th>Товар</th><th>Наш склад</th><th>Наша цена</th><th>{html.escape(selected_label)}</th><th>Где лучше нас</th></tr></thead>
         <tbody>{''.join(rows_html)}</tbody>
       </table></div>
     </body></html>
