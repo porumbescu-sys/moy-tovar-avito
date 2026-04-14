@@ -459,6 +459,7 @@ def load_comparison_workbook(file_name: str, file_bytes: bytes) -> dict[str, pd.
         df["free_qty"] = df[mapping["qty"]].apply(parse_qty_generic)
         df["total_qty"] = df["free_qty"]
         df["search_blob"] = (df["article"] + " " + df["name"]).map(contains_text)
+        df["search_blob_compact"] = (df["article"] + " " + df["name"]).map(compact_text)
         df["name_tokens"] = df["name"].map(tokenize_text)
         df["sheet_name"] = sheet
 
@@ -509,47 +510,60 @@ def load_comparison_workbook(file_name: str, file_bytes: bytes) -> dict[str, pd.
 def load_photo_map_file(file_name: str, file_bytes: bytes) -> pd.DataFrame:
     suffix = Path(file_name).suffix.lower()
 
-    def _from_raw(raw: pd.DataFrame) -> pd.DataFrame:
+    def _sheet_priority(sheet_name: str) -> int:
+        name = contains_text(sheet_name)
+        if "ФОТО" in name or "СЫЛ" in name:
+            return 0
+        if "WORKSHEET" in name:
+            return 20
+        return 10
+
+    def _from_raw(raw: pd.DataFrame, sheet_name: str = "") -> pd.DataFrame:
         raw = raw.dropna(how="all")
         if raw.empty:
-            return pd.DataFrame(columns=["article", "article_norm", "photo_url"])
+            return pd.DataFrame(columns=["article", "article_norm", "photo_url", "source_sheet", "sheet_priority"])
 
         raw = raw.copy()
         raw.columns = [normalize_text(c) for c in raw.columns]
 
         mapping = detect_mapping(raw, PHOTO_COLUMN_ALIASES)
 
-        # Частый кейс: лист из 2 колонок, где первая = Артикул, а вторая без имени.
         if not mapping.get("article"):
             for col in raw.columns:
                 if compact_text(col) == "АРТИКУЛ":
                     mapping["article"] = col
                     break
+
+        # Для Worksheet сначала стараемся взять чистую колонку images, а не шумную imag.
+        if "images" in raw.columns and raw["images"].map(lambda x: bool(extract_first_url(x))).sum() > 0:
+            mapping["photo_url"] = "images"
+        elif not mapping.get("photo_url") and "imag" in raw.columns and raw["imag"].map(lambda x: bool(extract_first_url(x))).sum() > 0:
+            mapping["photo_url"] = "imag"
+
         if not mapping.get("photo_url") and len(raw.columns) >= 2:
             first_col = mapping.get("article") or raw.columns[0]
-            second_col = next((c for c in raw.columns if c != first_col), None)
-            if second_col is not None:
-                second_vals = raw[second_col].map(normalize_text)
-                url_hits = second_vals.map(lambda x: bool(extract_first_url(x))).sum()
-                if url_hits > 0:
-                    mapping["photo_url"] = second_col
-
-        # Ещё один кейс: на листе "Worksheet" URL лежит в imag/images.
-        if not mapping.get("photo_url"):
+            best_col = None
+            best_hits = 0
             for col in raw.columns:
-                col_key = compact_text(col)
-                if col_key in {"IMAG", "IMAGES"}:
-                    mapping["photo_url"] = col
-                    break
+                if col == first_col:
+                    continue
+                hits = raw[col].map(lambda x: bool(extract_first_url(x))).sum()
+                if hits > best_hits:
+                    best_hits = hits
+                    best_col = col
+            if best_col is not None and best_hits > 0:
+                mapping["photo_url"] = best_col
 
         if not mapping.get("article") or not mapping.get("photo_url"):
-            return pd.DataFrame(columns=["article", "article_norm", "photo_url"])
+            return pd.DataFrame(columns=["article", "article_norm", "photo_url", "source_sheet", "sheet_priority"])
 
         out = pd.DataFrame()
         out["article"] = raw[mapping["article"]].map(normalize_text)
         out["article_norm"] = raw[mapping["article"]].map(normalize_article)
         out["photo_url"] = raw[mapping["photo_url"]].map(extract_first_url)
-        out = out[(out["article_norm"] != "") & (out["photo_url"] != "")].drop_duplicates(subset=["article_norm"], keep="first").reset_index(drop=True)
+        out["source_sheet"] = sheet_name
+        out["sheet_priority"] = _sheet_priority(sheet_name)
+        out = out[(out["article_norm"] != "") & (out["photo_url"] != "")].reset_index(drop=True)
         return out
 
     if suffix == ".csv":
@@ -559,25 +573,25 @@ def load_photo_map_file(file_name: str, file_bytes: bytes) -> pd.DataFrame:
         except UnicodeDecodeError:
             bio.seek(0)
             raw = pd.read_csv(bio, encoding="cp1251")
-        out = _from_raw(raw)
+        out = _from_raw(raw, "CSV")
         if out.empty:
             raise ValueError("В файле фото нужны колонки с артикулом и ссылкой на фото.")
-        return out
+        out = out.sort_values(["sheet_priority", "article_norm"]).drop_duplicates(subset=["article_norm"], keep="first").reset_index(drop=True)
+        return out[["article", "article_norm", "photo_url", "source_sheet"]]
 
     sheets = pd.read_excel(io.BytesIO(file_bytes), sheet_name=None)
     parts: list[pd.DataFrame] = []
     for sheet_name, raw in sheets.items():
-        part = _from_raw(raw)
+        part = _from_raw(raw, sheet_name)
         if not part.empty:
-            part["source_sheet"] = sheet_name
             parts.append(part)
 
     if not parts:
         raise ValueError("В файле фото нужны колонки с артикулом и ссылкой на фото.")
 
     combined = pd.concat(parts, ignore_index=True)
-    combined = combined.drop_duplicates(subset=["article_norm"], keep="first").reset_index(drop=True)
-    return combined
+    combined = combined.sort_values(["sheet_priority", "article_norm"]).drop_duplicates(subset=["article_norm"], keep="first").reset_index(drop=True)
+    return combined[["article", "article_norm", "photo_url", "source_sheet"]]
 
 
 def apply_photo_map(df: pd.DataFrame | None, photo_df: pd.DataFrame | None) -> pd.DataFrame | None:
@@ -679,7 +693,7 @@ def init_state() -> None:
         "price_mode": "-12%",
         "custom_discount": 10.0,
         "round100": True,
-        "search_mode": "Только артикул",
+        "search_mode": "Артикул + коды из названия",
         "template1_footer": DEFAULT_TEMPLATE1_FOOTER,
         "price_patch_input": "",
         "patch_message": "",
@@ -705,12 +719,37 @@ def rebuild_current_df() -> None:
         st.session_state.current_df = None
 
 
+def refresh_all_search_results() -> None:
+    sheets = st.session_state.get("comparison_sheets", {})
+    photo_df = st.session_state.get("photo_df")
+    search_mode = st.session_state.get("search_mode", "Артикул + коды из названия")
+    tab_specs = [
+        ("Сравнение", "original"),
+        ("Уценка", "discount"),
+        ("Совместимые", "compatible"),
+    ]
+    for sheet_name, tab_key in tab_specs:
+        base_df = sheets.get(sheet_name) if isinstance(sheets, dict) else None
+        if isinstance(base_df, pd.DataFrame):
+            sheet_df = apply_photo_map(base_df, photo_df)
+        else:
+            sheet_df = None
+        submitted_key = f"submitted_query_{tab_key}"
+        result_key = f"last_result_{tab_key}"
+        query = normalize_text(st.session_state.get(submitted_key, ""))
+        if query and isinstance(sheet_df, pd.DataFrame):
+            st.session_state[result_key] = search_in_df(sheet_df, query, search_mode)
+        else:
+            st.session_state[result_key] = None
+
+
 def search_in_df(df: pd.DataFrame, query: str, search_mode: str) -> pd.DataFrame:
     tokens = split_query_parts(query)
     if not tokens:
         return df.iloc[0:0].copy()
 
     exact_hits = []
+    linked_hits = []
     contains_hits = []
     seen: set[str] = set()
 
@@ -729,8 +768,23 @@ def search_in_df(df: pd.DataFrame, query: str, search_mode: str) -> pd.DataFrame
             row_dict["match_query"] = token
             exact_hits.append(row_dict)
 
-        if search_mode != "Только артикул":
-            mask = df["search_blob"].str.contains(re.escape(token_upper), na=False, regex=True)
+        if search_mode in {"Артикул + коды из названия", "Артикул + название + бренд"} and token_norm:
+            linked = df[df["row_codes"].apply(lambda codes: token_norm in (codes or []) if isinstance(codes, list) else False)]
+            for _, row in linked.iterrows():
+                key = str(row["article_norm"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                row_dict = row.to_dict()
+                row_dict["match_type"] = "linked"
+                row_dict["match_query"] = token
+                linked_hits.append(row_dict)
+
+        if search_mode == "Артикул + название + бренд":
+            mask = (
+                df["search_blob"].str.contains(re.escape(token_upper), na=False, regex=True)
+                | df["search_blob_compact"].str.contains(re.escape(token_norm), na=False, regex=True)
+            )
             contains = df[mask]
             for _, row in contains.iterrows():
                 key = str(row["article_norm"])
@@ -742,11 +796,11 @@ def search_in_df(df: pd.DataFrame, query: str, search_mode: str) -> pd.DataFrame
                 row_dict["match_query"] = token
                 contains_hits.append(row_dict)
 
-    rows = exact_hits + contains_hits
+    rows = exact_hits + linked_hits + contains_hits
     if not rows:
         return df.iloc[0:0].copy()
     out = pd.DataFrame(rows)
-    rank_map = {"exact": 0, "contains": 1}
+    rank_map = {"exact": 0, "linked": 1, "contains": 2}
     out["_rank"] = out["match_type"].map(lambda x: rank_map.get(str(x), 99))
     out = out.sort_values(["_rank", "article"]).drop(columns=["_rank"]).reset_index(drop=True)
     return out
@@ -1133,8 +1187,10 @@ def render_results_table(df: pd.DataFrame, price_mode: str, round100: bool, cust
 
         if match_type == "exact":
             badge_html = "<div class='match-badge match-badge-exact'>Точное совпадение</div>"
+        elif match_type == "linked":
+            badge_html = "<div class='match-badge match-badge-linked'>Код из названия</div>"
         else:
-            badge_html = "<div class='match-badge match-badge-linked'>Найдено по названию</div>"
+            badge_html = "<div class='match-badge match-badge-soft'>По названию / бренду</div>"
 
         if best:
             status_class = status_visual_class(str(best.get("status", "")))
@@ -1156,11 +1212,11 @@ def render_results_table(df: pd.DataFrame, price_mode: str, round100: bool, cust
         if photo_url:
             photo_html = f"""
             <a href="{html.escape(photo_url, quote=True)}" target="_blank" class="photo-wrap">
-              <img src="{html.escape(photo_url, quote=True)}" class="result-photo" loading="lazy" onerror="this.style.display='none'; this.parentNode.innerHTML='<div class=&quot;photo-empty&quot;>нет фото</div>';">
+              <img src="{html.escape(photo_url, quote=True)}" class="result-photo" loading="lazy" onerror="this.style.display='none'; this.parentNode.innerHTML='<div class=&quot;photo-empty photo-empty-small&quot;>нет фото</div>';">
             </a>
             """
         else:
-            photo_html = "<div class='photo-empty'>нет фото</div>"
+            photo_html = "<div class='photo-empty photo-empty-small'>нет фото</div>"
 
         rows_html.append(
             f"""
@@ -1183,30 +1239,32 @@ def render_results_table(df: pd.DataFrame, price_mode: str, round100: bool, cust
       body {{ margin:0; font-family: Inter, Arial, sans-serif; background: transparent; }}
       .wrap {{ background:linear-gradient(180deg, #ffffff 0%, #fbfdff 100%); border:1px solid #dbe5f1; border-radius:22px; overflow:hidden; box-shadow: 0 10px 26px rgba(15,23,42,.06); }}
       table {{ width:100%; border-collapse:separate; border-spacing:0; font-size:14px; }}
-      thead th {{ position: sticky; top: 0; z-index: 2; background:linear-gradient(180deg, #f4f8ff 0%, #eef3fb 100%); color:#334155; text-align:left; padding:15px 14px; font-weight:800; border-bottom:1px solid #d7e1ef; }}
-      tbody td {{ padding:14px; border-bottom:1px solid #e5edf6; vertical-align:top; color:#1e293b; background: rgba(255,255,255,.96); }}
+      thead th {{ position: sticky; top: 0; z-index: 2; background:linear-gradient(180deg, #f4f8ff 0%, #eef3fb 100%); color:#334155; text-align:left; padding:12px 12px; font-weight:800; border-bottom:1px solid #d7e1ef; }}
+      tbody td {{ padding:12px; border-bottom:1px solid #e5edf6; vertical-align:top; color:#1e293b; background: rgba(255,255,255,.96); }}
       tbody tr:nth-child(even) td {{ background: #fcfdff; }}
       tbody tr:hover td {{ background: #f7faff; }}
-      .article-pill {{ display:inline-block; padding:6px 10px; border-radius:999px; background:#edf2ff; color:#315efb; font-weight:800; }}
-      .name-cell {{ font-weight:800; line-height:1.35; color:#1e293b; margin-bottom:6px; }}
-      .match-badge {{ display:inline-block; padding:5px 10px; border-radius:999px; font-size:12px; font-weight:800; }}
+      .article-pill {{ display:inline-block; padding:6px 10px; border-radius:999px; background:#edf2ff; color:#315efb; font-weight:800; white-space:nowrap; }}
+      .name-cell {{ font-weight:800; line-height:1.33; color:#1e293b; margin-bottom:6px; max-width: 560px; }}
+      .match-badge {{ display:inline-block; padding:4px 9px; border-radius:999px; font-size:12px; font-weight:800; }}
       .match-badge-exact {{ background:#e8f7ee; color:#15803d; }}
       .match-badge-linked {{ background:#e8f1ff; color:#1d4ed8; }}
+      .match-badge-soft {{ background:#fff4e5; color:#b45309; }}
       .sale-col {{ font-weight:800; white-space:nowrap; }}
       .selected-col {{ background: linear-gradient(180deg, #f4f8ff 0%, #eef4ff 100%); border-left:1px solid #c7d7ff; border-right:1px solid #c7d7ff; font-weight:900; color:#315efb; white-space:nowrap; }}
-      .compare-col {{ min-width:220px; }}
-      .best-box {{ background:linear-gradient(180deg, #f8fbff 0%, #f3f8ff 100%); border:1px solid #d9e6ff; border-radius:18px; padding:11px 12px; min-width:190px; }}
-      .best-box-empty {{ color:#64748b; font-weight:700; text-align:center; background:#f8fafc; border-color:#e2e8f0; }}
-      .best-top {{ display:flex; justify-content:space-between; gap:8px; align-items:center; margin-bottom:6px; }}
-      .dist-pill {{ display:inline-block; padding:5px 10px; border-radius:999px; background:#e9efff; color:#315efb; font-weight:800; }}
-      .delta-pill {{ display:inline-block; padding:5px 10px; border-radius:999px; background:#e8f7ee; color:#15803d; font-weight:900; }}
-      .best-price {{ font-size:18px; font-weight:900; color:#0f2f83; line-height:1.2; margin-bottom:5px; }}
-      .best-meta {{ font-size:12px; margin-bottom:5px; color:#475569; }}
+      .compare-col {{ min-width:205px; }}
+      .best-box {{ background:linear-gradient(180deg, #f8fbff 0%, #f3f8ff 100%); border:1px solid #d9e6ff; border-radius:16px; padding:9px 10px; min-width:168px; }}
+      .best-box-empty {{ color:#64748b; font-weight:700; text-align:center; background:#f8fafc; border-color:#e2e8f0; padding-top:14px; padding-bottom:14px; }}
+      .best-top {{ display:flex; justify-content:space-between; gap:6px; align-items:center; margin-bottom:5px; }}
+      .dist-pill {{ display:inline-block; padding:4px 8px; border-radius:999px; background:#e9efff; color:#315efb; font-weight:800; font-size:12px; }}
+      .delta-pill {{ display:inline-block; padding:4px 8px; border-radius:999px; background:#e8f7ee; color:#15803d; font-weight:900; font-size:12px; }}
+      .best-price {{ font-size:17px; font-weight:900; color:#0f2f83; line-height:1.18; margin-bottom:4px; }}
+      .best-meta {{ font-size:12px; margin-bottom:4px; color:#475569; }}
       .best-delta {{ font-size:12px; color:#64748b; }}
-      .photo-col {{ width:128px; }}
-      .photo-wrap {{ display:inline-flex; align-items:center; justify-content:center; width:108px; height:108px; border-radius:18px; overflow:hidden; border:1px solid #dbe5f1; background:#f8fbff; text-decoration:none; }}
+      .photo-col {{ width:92px; text-align:center; }}
+      .photo-wrap {{ display:inline-flex; align-items:center; justify-content:center; width:72px; height:72px; border-radius:14px; overflow:hidden; border:1px solid #dbe5f1; background:#f8fbff; text-decoration:none; }}
       .result-photo {{ width:100%; height:100%; object-fit:cover; display:block; }}
-      .photo-empty {{ width:108px; height:108px; border-radius:18px; display:flex; align-items:center; justify-content:center; background:#f8fafc; border:1px dashed #d6deea; color:#94a3b8; font-size:12px; font-weight:800; text-transform:uppercase; }}
+      .photo-empty {{ border-radius:14px; display:flex; align-items:center; justify-content:center; background:#f8fafc; border:1px dashed #d6deea; color:#94a3b8; font-size:11px; font-weight:800; text-transform:uppercase; }}
+      .photo-empty-small {{ width:72px; height:72px; }}
     </style></head><body>
       <div class='wrap'><table>
         <thead><tr><th>Артикул</th><th>Название</th><th>Наш склад</th><th>Наша цена</th><th>{html.escape(selected_label)}</th><th>Где лучше нас</th><th>Фото</th></tr></thead>
@@ -1214,7 +1272,7 @@ def render_results_table(df: pd.DataFrame, price_mode: str, round100: bool, cust
       </table></div>
     </body></html>
     """
-    height = min(max(220, 82 + len(df) * 88), 1100)
+    height = min(max(220, 72 + len(df) * 72), 1050)
     components.html(table_html, height=height, scrolling=True)
 
 
@@ -1562,6 +1620,7 @@ with st.sidebar:
             if available and st.session_state.selected_sheet not in available:
                 st.session_state.selected_sheet = available[0]
             rebuild_current_df()
+            refresh_all_search_results()
         except Exception as exc:
             st.error(f"Ошибка файла: {exc}")
     st.markdown(f'<div class="sidebar-status">Файл: {html.escape(st.session_state.get("comparison_name", "ещё не загружен"))}</div>', unsafe_allow_html=True)
@@ -1576,6 +1635,7 @@ with st.sidebar:
             st.session_state.photo_df = load_photo_map_file(photo_uploaded.name, photo_uploaded.getvalue())
             st.session_state.photo_name = photo_uploaded.name
             rebuild_current_df()
+            refresh_all_search_results()
         except Exception as exc:
             st.error(f"Ошибка файла фото: {exc}")
     st.markdown(f'<div class="sidebar-status">Фото: {html.escape(st.session_state.get("photo_name", "ещё не загружен"))}</div>', unsafe_allow_html=True)
@@ -1626,7 +1686,8 @@ st.markdown(f"""
 
 
 def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> None:
-    sheet_df = sheets.get(sheet_name) if isinstance(sheets, dict) else None
+    base_sheet_df = sheets.get(sheet_name) if isinstance(sheets, dict) else None
+    sheet_df = apply_photo_map(base_sheet_df, st.session_state.get("photo_df")) if isinstance(base_sheet_df, pd.DataFrame) else None
     source_pairs = get_source_pairs(sheet_df) if isinstance(sheet_df, pd.DataFrame) else []
     search_key = f"search_input_{tab_key}"
     submitted_key = f"submitted_query_{tab_key}"
@@ -1656,7 +1717,10 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
         c1, c2, c3 = st.columns([1, 1, 2.4])
         find_clicked = c1.form_submit_button("🔎 Найти", use_container_width=True, type="primary")
         clear_clicked = c2.form_submit_button("🧹 Очистить", use_container_width=True)
-        c3.markdown("<div style='padding-top:9px;color:#64748b;font-size:12px;'>Фото берутся из отдельного файла по артикулу. Лучшая цена поставщика считается заново, а не читается из готовой колонки Excel.</div>", unsafe_allow_html=True)
+        c3.markdown(
+            f"<div style='padding-top:9px;color:#64748b;font-size:12px;'>Тип поиска сейчас: <b>{html.escape(search_mode)}</b>. Короткие OEM-коды вроде TK-8600Y лучше искать режимом «Артикул + коды из названия».</div>",
+            unsafe_allow_html=True,
+        )
     st.markdown('</div>', unsafe_allow_html=True)
 
     if clear_clicked:
