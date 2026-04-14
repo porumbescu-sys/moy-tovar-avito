@@ -193,6 +193,12 @@ def fmt_price(value: Any) -> str:
     return f"{val:,.2f}".replace(",", " ").replace(".", ",")
 
 
+
+
+def fmt_price_with_rub(value: Any) -> str:
+    txt = fmt_price(value)
+    return f"{txt} руб." if txt else ""
+
 def fmt_qty(value: Any) -> str:
     if value is None:
         return ""
