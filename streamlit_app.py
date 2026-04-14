@@ -1174,10 +1174,19 @@ def status_visual_class(status: str) -> str:
     return "offer-muted"
 
 
+
 def render_results_table(df: pd.DataFrame, price_mode: str, round100: bool, custom_discount: float, distributor_map: Optional[dict[str, dict[str, Any]]] = None) -> None:
     selected_label = current_price_label(price_mode, custom_discount)
     distributor_map = distributor_map or {}
     rows_html = []
+
+    def state_label_from_class(status_class: str) -> str:
+        return {
+            "offer-good": "выгоднее",
+            "offer-bad": "дороже",
+            "offer-neutral": "цена равна",
+            "offer-own": "наша позиция",
+        }.get(status_class, "найдено")
 
     for _, row in df.iterrows():
         row_key = str(row.get("article_norm", ""))
@@ -1194,19 +1203,26 @@ def render_results_table(df: pd.DataFrame, price_mode: str, round100: bool, cust
 
         if best:
             status_class = status_visual_class(str(best.get("status", "")))
+            state_label = state_label_from_class(status_class)
+            pct_txt = str(best.get("delta_percent_fmt", "")).strip()
+            pct_html = f"-{html.escape(pct_txt)}%" if pct_txt else "—"
             compare_html = f"""
             <div class='best-box {status_class}'>
               <div class='best-top'>
-                <span class='dist-pill'>{html.escape(str(best.get('source', '')))}</span>
-                <span class='delta-pill'>-{html.escape(str(best.get('delta_percent_fmt', '')))}%</span>
+                <span class='best-source-pill'>{html.escape(str(best.get('source', '')))}</span>
+                <span class='best-state-pill'>{html.escape(state_label)}</span>
               </div>
               <div class='best-price'>{html.escape(str(best.get('price_fmt', '')))} руб.</div>
-              <div class='best-meta'>Остаток: <b>{html.escape(str(best.get('qty_fmt', '')))}</b></div>
-              <div class='best-delta'>Лучше на {html.escape(str(best.get('delta_fmt', '')))} руб.</div>
+              <div class='best-meta-row'>Остаток: <b>{html.escape(str(best.get('qty_fmt', '')))}</b></div>
+              <div class='best-delta-row'>Разница к нам: {html.escape(str(best.get('delta_fmt', '')))} руб. • {pct_html}</div>
             </div>
             """
         else:
-            compare_html = "<div class='best-box best-box-empty'>Нет цены лучше</div>"
+            compare_html = """
+            <div class='best-box best-box-empty'>
+              <div class='best-empty-title'>Нет цены лучше</div>
+            </div>
+            """
 
         photo_url = normalize_text(row.get("photo_url", ""))
         if photo_url:
@@ -1251,15 +1267,28 @@ def render_results_table(df: pd.DataFrame, price_mode: str, round100: bool, cust
       .match-badge-soft {{ background:#fff4e5; color:#b45309; }}
       .sale-col {{ font-weight:800; white-space:nowrap; }}
       .selected-col {{ background: linear-gradient(180deg, #f4f8ff 0%, #eef4ff 100%); border-left:1px solid #c7d7ff; border-right:1px solid #c7d7ff; font-weight:900; color:#315efb; white-space:nowrap; }}
-      .compare-col {{ min-width:205px; }}
-      .best-box {{ background:linear-gradient(180deg, #f8fbff 0%, #f3f8ff 100%); border:1px solid #d9e6ff; border-radius:16px; padding:9px 10px; min-width:168px; }}
-      .best-box-empty {{ color:#64748b; font-weight:700; text-align:center; background:#f8fafc; border-color:#e2e8f0; padding-top:14px; padding-bottom:14px; }}
-      .best-top {{ display:flex; justify-content:space-between; gap:6px; align-items:center; margin-bottom:5px; }}
-      .dist-pill {{ display:inline-block; padding:4px 8px; border-radius:999px; background:#e9efff; color:#315efb; font-weight:800; font-size:12px; }}
-      .delta-pill {{ display:inline-block; padding:4px 8px; border-radius:999px; background:#e8f7ee; color:#15803d; font-weight:900; font-size:12px; }}
-      .best-price {{ font-size:17px; font-weight:900; color:#0f2f83; line-height:1.18; margin-bottom:4px; }}
-      .best-meta {{ font-size:12px; margin-bottom:4px; color:#475569; }}
-      .best-delta {{ font-size:12px; color:#64748b; }}
+      .compare-col {{ min-width:230px; }}
+      .best-box {{ border-radius:18px; padding:11px 12px; min-width:190px; border:1px solid #dce6f7; background:linear-gradient(180deg, #f8fbff 0%, #f3f8ff 100%); box-shadow: inset 0 1px 0 rgba(255,255,255,.72); }}
+      .best-box-empty {{ text-align:center; background:linear-gradient(180deg, #fafcff 0%, #f5f7fb 100%); border-color:#e2e8f0; min-height:76px; display:flex; align-items:center; justify-content:center; }}
+      .best-empty-title {{ color:#64748b; font-weight:800; }}
+      .best-top {{ display:flex; justify-content:space-between; gap:8px; align-items:center; margin-bottom:7px; }}
+      .best-source-pill, .best-state-pill {{ display:inline-flex; align-items:center; padding:5px 10px; border-radius:999px; font-size:12px; font-weight:800; line-height:1; }}
+      .best-price {{ font-size:18px; font-weight:900; color:#12348a; line-height:1.15; margin-bottom:6px; }}
+      .best-meta-row {{ font-size:12px; color:#475569; margin-bottom:5px; }}
+      .best-delta-row {{ font-size:12px; color:#64748b; line-height:1.45; }}
+      .offer-good {{ border-color:#cfead6; background:linear-gradient(180deg, #fbfffc 0%, #f2fff6 100%); }}
+      .offer-good .best-source-pill {{ background:#e9efff; color:#315efb; }}
+      .offer-good .best-state-pill {{ background:#e8f7ee; color:#15803d; }}
+      .offer-good .best-price {{ color:#103a8c; }}
+      .offer-bad {{ border-color:#f7d7dd; background:linear-gradient(180deg, #fffafb 0%, #fff3f4 100%); }}
+      .offer-bad .best-source-pill {{ background:#ffe8ec; color:#be123c; }}
+      .offer-bad .best-state-pill {{ background:#ffe8ec; color:#be123c; }}
+      .offer-bad .best-price {{ color:#991b1b; }}
+      .offer-neutral {{ border-color:#d7e2ff; background:linear-gradient(180deg, #fbfdff 0%, #f3f7ff 100%); }}
+      .offer-neutral .best-source-pill {{ background:#e9efff; color:#315efb; }}
+      .offer-neutral .best-state-pill {{ background:#eef4ff; color:#315efb; }}
+      .offer-own .best-source-pill {{ background:#eef2ff; color:#315efb; }}
+      .offer-own .best-state-pill {{ background:#f1f5f9; color:#475569; }}
       .photo-col {{ width:92px; text-align:center; }}
       .photo-wrap {{ display:inline-flex; align-items:center; justify-content:center; width:72px; height:72px; border-radius:14px; overflow:hidden; border:1px solid #dbe5f1; background:#f8fbff; text-decoration:none; }}
       .result-photo {{ width:100%; height:100%; object-fit:cover; display:block; }}
