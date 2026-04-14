@@ -2050,6 +2050,34 @@ with st.sidebar:
     st.text_area("Правка цен", key="price_patch_input", height=110, label_visibility="collapsed", placeholder="CE278A 8900\nCF364A - 29700")
     if st.button("Править цены в листе", use_container_width=True):
         current_df = st.session_state.get("current_df")
+        if isinstance(current_df, pd.DataFrame) and not current_df.empty:
+            updated_df, patch_message = apply_price_updates(current_df, st.session_state.price_patch_input)
+            st.session_state.current_df = updated_df
+            st.session_state.patch_message = patch_message
+            refresh_all_search_results()
+        else:
+            st.session_state.patch_message = "Сначала загрузите comparison-файл."
+    if st.session_state.get("patch_message"):
+        st.markdown(f'<div class="sidebar-mini">{html.escape(st.session_state.patch_message)}</div>', unsafe_allow_html=True)
+    else:
+        st.markdown('<div class="sidebar-mini">Прайс сохраняется локально. После правок цены не пропадут до загрузки нового файла.</div>', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="sidebar-card">', unsafe_allow_html=True)
+    render_sidebar_card_header("Настройки", "⚙️", "Управляет режимом поиска, главной ценой, пользовательской скидкой и округлением.")
+    st.selectbox("Режим поиска", ["Только артикул", "Артикул + коды из названия", "Артикул + название + бренд"], key="search_mode")
+    st.radio("Какая цена главная", ["-12%", "-20%", "Своя скидка"], key="price_mode")
+    st.number_input("Своя скидка, %", min_value=0.0, max_value=99.0, step=1.0, key="custom_discount")
+    st.checkbox("Округлять вверх до 100", key="round100")
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="sidebar-card">', unsafe_allow_html=True)
+    render_sidebar_card_header("Текст шаблона 1", "🧾", "Этот текст добавляется один раз в конце шаблона 1.")
+    st.markdown('<div class="sidebar-card-note">Этот текст добавляется один раз в конце шаблона 1. Хэштеги по артикулам подставляются автоматически.</div>', unsafe_allow_html=True)
+    st.text_area("Текст шаблона 1", key="template1_footer", height=170, label_visibility="collapsed")
+    st.markdown('<div class="sidebar-mini">Текст сохраняется локально и останется до следующего изменения.</div>', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
 comparison_name = st.session_state.get("comparison_name", "ещё не загружен")
 sheets = st.session_state.get("comparison_sheets", {})
 loaded_sheet_count = len(sheets) if isinstance(sheets, dict) else 0
