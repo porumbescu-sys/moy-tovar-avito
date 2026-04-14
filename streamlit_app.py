@@ -1302,10 +1302,7 @@ with st.sidebar:
         except Exception as exc:
             st.error(f"Ошибка файла: {exc}")
     st.markdown(f'<div class="sidebar-status">Файл: {html.escape(st.session_state.get("comparison_name", "ещё не загружен"))}</div>', unsafe_allow_html=True)
-    sheet_options = list(st.session_state.get("comparison_sheets", {}).keys()) or ["Сравнение"]
-    selected_sheet = st.selectbox("Лист", sheet_options, key="selected_sheet")
-    if st.session_state.get("comparison_sheets"):
-        rebuild_current_df()
+    st.markdown('<div class="sidebar-mini">Листы теперь открываются сверху как 3 отдельные вкладки: <b>Оригинал</b>, <b>Уценка</b>, <b>Совместимые</b>.</div>', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown('<div class="sidebar-card">', unsafe_allow_html=True)
@@ -1345,44 +1342,10 @@ with st.sidebar:
     st.text_area("Правка цен", key="price_patch_input", height=110, label_visibility="collapsed", placeholder="CE278A 8900\nCF364A - 29700")
     if st.button("Править цены в листе", use_container_width=True):
         current_df = st.session_state.get("current_df")
-        sheets = st.session_state.get("comparison_sheets", {})
-        current_sheet = st.session_state.get("selected_sheet")
-        if isinstance(current_df, pd.DataFrame) and current_sheet in sheets:
-            updated_df, patch_message = apply_price_updates(current_df, st.session_state.price_patch_input)
-            # сохраняем назад в рабочий лист, но без потерянных фото
-            base_df = sheets[current_sheet].copy()
-            base_df = base_df.drop(columns=["photo_url", "photo_name"], errors="ignore")
-            updated_base = updated_df.drop(columns=["photo_url", "photo_name"], errors="ignore")
-            st.session_state.comparison_sheets[current_sheet] = updated_base
-            st.session_state.patch_message = patch_message
-            rebuild_current_df()
-            if normalize_text(st.session_state.get("submitted_query", "")):
-                st.session_state.last_result = search_in_df(st.session_state.current_df, st.session_state.submitted_query, st.session_state.search_mode)
-        else:
-            st.session_state.patch_message = "Сначала загрузите comparison-файл."
-    if st.session_state.patch_message:
-        st.markdown(f'<div class="sidebar-mini">{html.escape(st.session_state.patch_message)}</div>', unsafe_allow_html=True)
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    st.markdown('<div class="sidebar-card">', unsafe_allow_html=True)
-    render_sidebar_card_header("Настройки", "⚙️", "Режим поиска, цена по скидке и округление.")
-    st.selectbox("Режим поиска", ["Только артикул", "Умный", "Артикул + название + бренд"], key="search_mode")
-    st.radio("Какая цена главная", ["-12%", "-20%", "Своя скидка"], key="price_mode")
-    st.number_input("Своя скидка, %", min_value=0.0, max_value=99.0, step=1.0, key="custom_discount")
-    st.checkbox("Округлять вверх до 100", key="round100")
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    st.markdown('<div class="sidebar-card">', unsafe_allow_html=True)
-    render_sidebar_card_header("Текст шаблона 1", "🧾", "Постоянный хвост для первого шаблона.")
-    st.text_area("Текст шаблона 1", key="template1_footer", height=170, label_visibility="collapsed")
-    st.markdown('</div>', unsafe_allow_html=True)
-
-
-current_df = st.session_state.get("current_df")
 comparison_name = st.session_state.get("comparison_name", "ещё не загружен")
-selected_sheet = st.session_state.get("selected_sheet", "")
-rows_count = len(current_df) if isinstance(current_df, pd.DataFrame) else 0
-source_pairs = get_source_pairs(current_df) if isinstance(current_df, pd.DataFrame) else []
+sheets = st.session_state.get("comparison_sheets", {})
+loaded_sheet_count = len(sheets) if isinstance(sheets, dict) else 0
+rows_count = sum(len(df) for df in sheets.values()) if isinstance(sheets, dict) and sheets else 0
 price_mode = st.session_state.price_mode
 round100 = st.session_state.round100
 custom_discount = float(st.session_state.custom_discount)
@@ -1393,147 +1356,164 @@ st.markdown(f"""
 <div class="topbar"><div class="topbar-grid">
 <div class="brand-box"><div class="logo">📦</div><div><div class="brand-title">{APP_TITLE}</div><div class="brand-sub">Один comparison-файл • поиск • фото • пересчёт цен поставщиков</div></div></div>
 <div class="stat-box"><div class="stat-cap">Файл</div><div class="stat-val">{html.escape(comparison_name)}</div></div>
-<div class="stat-box"><div class="stat-cap">Лист</div><div class="stat-val">{html.escape(selected_sheet or '—')}</div></div>
-<div class="stat-box"><div class="stat-cap">Строк в листе</div><div class="stat-val">{rows_count}</div></div>
+<div class="stat-box"><div class="stat-cap">Вкладок</div><div class="stat-val">{loaded_sheet_count if loaded_sheet_count else '—'}</div></div>
+<div class="stat-box"><div class="stat-cap">Всего строк</div><div class="stat-val">{rows_count}</div></div>
 </div></div>
 """, unsafe_allow_html=True)
 
-st.markdown('<div class="toolbar">', unsafe_allow_html=True)
-render_block_header(
-    "Поиск товара",
-    "Поиск работает по одному comparison-файлу. Сначала артикул, потом — название, если это разрешено режимом поиска.",
-    icon="🔎",
-    help_text="Приложение больше не читает сырые прайсы дистрибьюторов. Оно ищет внутри выбранного листа comparison-файла и по найденным строкам пересчитывает лучшую цену поставщика по колонкам вида 'Источник цена' / 'Источник шт'.",
-)
-with st.form("search_form", clear_on_submit=False):
-    search_value = st.text_area(
-        "Поисковый запрос",
-        value=st.session_state.search_input,
-        placeholder="Например:\nCE278A CE285A\nили\n001R00600 / 006R01464",
-        height=90,
-        label_visibility="collapsed",
-    )
-    c1, c2, c3 = st.columns([1, 1, 2.4])
-    find_clicked = c1.form_submit_button("🔎 Найти", use_container_width=True, type="primary")
-    clear_clicked = c2.form_submit_button("🧹 Очистить", use_container_width=True)
-    c3.markdown("<div style='padding-top:9px;color:#64748b;font-size:12px;'>Фото берутся из отдельного файла по артикулу. Лучшая цена поставщика считается заново, а не читается из готовой колонки Excel.</div>", unsafe_allow_html=True)
-st.markdown('</div>', unsafe_allow_html=True)
 
-if clear_clicked:
-    st.session_state.search_input = ""
-    st.session_state.submitted_query = ""
-    st.session_state.last_result = None
-    st.rerun()
+def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> None:
+    sheet_df = sheets.get(sheet_name) if isinstance(sheets, dict) else None
+    source_pairs = get_source_pairs(sheet_df) if isinstance(sheet_df, pd.DataFrame) else []
+    search_key = f"search_input_{tab_key}"
+    submitted_key = f"submitted_query_{tab_key}"
+    result_key = f"last_result_{tab_key}"
+    if search_key not in st.session_state:
+        st.session_state[search_key] = ""
+    if submitted_key not in st.session_state:
+        st.session_state[submitted_key] = ""
+    if result_key not in st.session_state:
+        st.session_state[result_key] = None
 
-if find_clicked:
-    normalized_query = normalize_query_for_display(search_value)
-    st.session_state.search_input = normalized_query
-    st.session_state.submitted_query = normalized_query
-    st.session_state.last_result = search_in_df(current_df, normalized_query, search_mode) if isinstance(current_df, pd.DataFrame) else None
-    st.rerun()
-
-result_df = st.session_state.get("last_result")
-min_dist_qty = float(st.session_state.get("distributor_min_qty", 1.0))
-
-if not isinstance(current_df, pd.DataFrame):
-    render_info_banner(
-        "С чего начать",
-        "Загрузите comparison-файл. После этого можно выбрать лист, подключить файл фото и уже искать позиции.",
-        icon="🚀",
-        chips=["один файл вместо многих", "лист Сравнение / Уценка / Совместимые", "фото по артикулу"],
-        tone="purple",
-    )
-elif result_df is None:
-    render_info_banner(
-        "Файл загружен",
-        "Теперь выберите лист в sidebar и введите артикул или несколько артикулов в поиск.",
-        icon="✅",
-        chips=["поиск по текущему листу", "фото в таблице", "цены поставщиков считаются заново"],
-        tone="green",
-    )
-else:
-    st.markdown('<div class="result-wrap">', unsafe_allow_html=True)
+    st.markdown('<div class="toolbar">', unsafe_allow_html=True)
     render_block_header(
-        "Результаты поиска",
-        "Главная таблица по найденным позициям. Справа теперь фото, а не кнопка копирования цены.",
-        icon="📋",
-        help_text="Если у товара есть фото по артикулу в отдельном файле, оно покажется прямо в строке результата. Если фото нет, будет заглушка.",
+        f"{tab_label} — поиск товара",
+        f"Работа только по листу «{sheet_name}». Сначала артикул, потом название, если это разрешено режимом поиска.",
+        icon="🔎",
+        help_text="Приложение больше не читает сырые прайсы дистрибьюторов. Оно ищет внутри текущего листа comparison-файла и по найденным строкам пересчитывает лучшую цену поставщика по колонкам вида 'Источник цена' / 'Источник шт'.",
     )
-    if result_df.empty:
-        st.warning("Ничего не найдено. Попробуйте другой артикул или часть названия.")
-    else:
-        compare_map = build_distributor_compare(result_df, min_qty=min_dist_qty)
-        render_results_insight_dashboard(result_df, compare_map, source_pairs)
-        render_results_table(result_df.head(200), price_mode, round100, custom_discount, distributor_map=compare_map)
-        st.download_button(
-            "⬇️ Скачать результаты в Excel",
-            to_excel_bytes(result_df, price_mode, round100, custom_discount, min_dist_qty),
-            file_name="moy_tovar_search_results.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
+    with st.form(f"search_form_{tab_key}", clear_on_submit=False):
+        search_value = st.text_area(
+            "Поисковый запрос",
+            value=st.session_state[search_key],
+            placeholder="Например:\nCE278A CE285A\nили\n001R00600 / 006R01464",
+            height=90,
+            label_visibility="collapsed",
         )
-        with st.expander("Показать техническую таблицу"):
-            tech = result_df.copy()
-            tech["Наша цена"] = tech["sale_price"].map(fmt_price)
-            tech["Наш склад"] = tech["free_qty"].map(fmt_qty)
-            tech["Лучшая цена"] = tech.apply(lambda row: (get_best_offer(row, min_qty=min_dist_qty) or {}).get("price_fmt", ""), axis=1)
-            tech["Лучший поставщик"] = tech.apply(lambda row: (get_best_offer(row, min_qty=min_dist_qty) or {}).get("source", ""), axis=1)
-            tech["Фото"] = tech.get("photo_url", "")
-            tech = tech[["article", "name", "Наша цена", "Наш склад", "Лучший поставщик", "Лучшая цена", "Фото"]].rename(columns={"article": "Артикул", "name": "Название"})
-            st.dataframe(tech, use_container_width=True, hide_index=True)
+        c1, c2, c3 = st.columns([1, 1, 2.4])
+        find_clicked = c1.form_submit_button("🔎 Найти", use_container_width=True, type="primary")
+        clear_clicked = c2.form_submit_button("🧹 Очистить", use_container_width=True)
+        c3.markdown("<div style='padding-top:9px;color:#64748b;font-size:12px;'>Фото берутся из отдельного файла по артикулу. Лучшая цена поставщика считается заново, а не читается из готовой колонки Excel.</div>", unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
-    if not result_df.empty:
-        st.markdown('<div class="result-wrap">', unsafe_allow_html=True)
-        render_block_header(
-            "Показать цены у всех",
-            "Здесь для каждой найденной позиции показываются все доступные поставщики из колонок текущего comparison-листа.",
-            icon="🏷️",
-        )
+    if clear_clicked:
+        st.session_state[search_key] = ""
+        st.session_state[submitted_key] = ""
+        st.session_state[result_key] = None
+        st.rerun()
+
+    if find_clicked:
+        normalized_query = normalize_query_for_display(search_value)
+        st.session_state[search_key] = normalized_query
+        st.session_state[submitted_key] = normalized_query
+        st.session_state[result_key] = search_in_df(sheet_df, normalized_query, search_mode) if isinstance(sheet_df, pd.DataFrame) else None
+        st.rerun()
+
+    submitted_query = st.session_state.get(submitted_key, "")
+    result_df = st.session_state.get(result_key)
+    min_dist_qty = float(st.session_state.get("distributor_min_qty", 1.0))
+
+    if not isinstance(sheet_df, pd.DataFrame):
         render_info_banner(
-            "Что здесь важно",
-            "Берём только пары колонок 'Источник цена' и 'Источник шт'. Готовые поля 'Мин. у конкурентов' и 'Разница' из Excel не используются вообще.",
-            icon="🧠",
-            chips=["свои расчёты", "динамические источники", "работает и для новых колонок"],
+            f"Вкладка «{tab_label}» пока пуста",
+            f"В comparison-файле не найден лист «{sheet_name}».",
+            icon="📭",
+            chips=["проверь названия листов", "ожидаются: Сравнение / Уценка / Совместимые"],
+            tone="purple",
+        )
+        return
+
+    if result_df is None:
+        render_info_banner(
+            f"{tab_label}: лист загружен",
+            f"Теперь введите артикул или несколько артикулов для поиска по листу «{sheet_name}».",
+            icon="✅",
+            chips=[f"строк: {len(sheet_df)}", "фото в таблице", "цены поставщиков считаются заново"],
             tone="green",
         )
-        render_all_prices_block(result_df, min_dist_qty, price_mode, round100, custom_discount)
-        st.markdown('</div>', unsafe_allow_html=True)
-
+    else:
         st.markdown('<div class="result-wrap">', unsafe_allow_html=True)
         render_block_header(
-            "Шаблоны",
-            "Два быстрых шаблона для ответа или публикации по найденным позициям.",
-            icon="🧾",
+            f"{tab_label} — результаты поиска",
+            "Главная таблица по найденным позициям. Справа теперь фото, а не кнопка копирования цены.",
+            icon="📋",
+            help_text="Если у товара есть фото по артикулу в отдельном файле, оно покажется прямо в строке результата. Если фото нет, будет заглушка.",
         )
-        t1, t2 = st.columns(2)
-        with t1:
-            template1 = build_offer_template(current_df, st.session_state.submitted_query, round100, st.session_state.template1_footer, search_mode)
-            st.text_area("Шаблон 1", value=template1, height=300)
-        with t2:
-            template2 = build_selected_price_template(current_df, st.session_state.submitted_query, price_mode, round100, custom_discount, search_mode)
-            st.text_area("Шаблон 2", value=template2, height=300)
+        if result_df.empty:
+            st.warning("Ничего не найдено. Попробуйте другой артикул или часть названия.")
+        else:
+            compare_map = build_distributor_compare(result_df, min_qty=min_dist_qty)
+            render_results_insight_dashboard(result_df, compare_map, source_pairs)
+            render_results_table(result_df.head(200), price_mode, round100, custom_discount, distributor_map=compare_map)
+            st.download_button(
+                "⬇️ Скачать результаты в Excel",
+                to_excel_bytes(result_df, price_mode, round100, custom_discount, min_dist_qty),
+                file_name=f"moy_tovar_search_results_{tab_key}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key=f"download_results_{tab_key}",
+            )
+            with st.expander("Показать техническую таблицу"):
+                tech = result_df.copy()
+                tech["Наша цена"] = tech["sale_price"].map(fmt_price)
+                tech["Наш склад"] = tech["free_qty"].map(fmt_qty)
+                tech["Лучшая цена"] = tech.apply(lambda row: (get_best_offer(row, min_qty=min_dist_qty) or {}).get("price_fmt", ""), axis=1)
+                tech["Лучший поставщик"] = tech.apply(lambda row: (get_best_offer(row, min_qty=min_dist_qty) or {}).get("source", ""), axis=1)
+                tech["Фото"] = tech.get("photo_url", "")
+                tech = tech[["article", "name", "Наша цена", "Наш склад", "Лучший поставщик", "Лучшая цена", "Фото"]].rename(columns={"article": "Артикул", "name": "Название"})
+                st.dataframe(tech, use_container_width=True, hide_index=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
-        if isinstance(st.session_state.get("avito_df"), pd.DataFrame) and not st.session_state.avito_df.empty:
+        if not result_df.empty:
             st.markdown('<div class="result-wrap">', unsafe_allow_html=True)
             render_block_header(
-                "Авито",
-                "Проверка, есть ли по найденным артикулам объявления в загруженном файле Авито.",
-                icon="🛒",
+                f"{tab_label} — показать цены у всех",
+                "Здесь для каждой найденной позиции показываются все доступные поставщики из колонок текущего comparison-листа.",
+                icon="🏷️",
             )
-            render_avito_block(st.session_state.avito_df, result_df)
+            render_info_banner(
+                "Что здесь важно",
+                "Берём только пары колонок 'Источник цена' и 'Источник шт'. Готовые поля 'Мин. у конкурентов' и 'Разница' из Excel не используются вообще.",
+                icon="🧠",
+                chips=["свои расчёты", "динамические источники", "работает и для новых колонок"],
+                tone="green",
+            )
+            render_all_prices_block(result_df, min_dist_qty, price_mode, round100, custom_discount)
             st.markdown('</div>', unsafe_allow_html=True)
 
-st.markdown('<div class="result-wrap">', unsafe_allow_html=True)
-render_block_header(
-    "Отчёт по листу",
-    "Полный отчёт по выбранному листу: где поставщик реально дешевле нас на заданный процент.",
-    icon="📊",
-    help_text="Отчёт строится по всему выбранному листу, а не только по поисковой выдаче. Порог и минимальный остаток меняются в sidebar.",
-)
-if isinstance(current_df, pd.DataFrame):
-    report_df = build_report_df(current_df, st.session_state.distributor_threshold, st.session_state.distributor_min_qty)
+            st.markdown('<div class="result-wrap">', unsafe_allow_html=True)
+            render_block_header(
+                f"{tab_label} — шаблоны",
+                "Два быстрых шаблона для ответа или публикации по найденным позициям.",
+                icon="🧾",
+            )
+            t1, t2 = st.columns(2)
+            with t1:
+                template1 = build_offer_template(sheet_df, submitted_query, round100, st.session_state.template1_footer, search_mode)
+                st.text_area("Шаблон 1", value=template1, height=300, key=f"template1_{tab_key}")
+            with t2:
+                template2 = build_selected_price_template(sheet_df, submitted_query, price_mode, round100, custom_discount, search_mode)
+                st.text_area("Шаблон 2", value=template2, height=300, key=f"template2_{tab_key}")
+            st.markdown('</div>', unsafe_allow_html=True)
+
+            if isinstance(st.session_state.get("avito_df"), pd.DataFrame) and not st.session_state.avito_df.empty:
+                st.markdown('<div class="result-wrap">', unsafe_allow_html=True)
+                render_block_header(
+                    f"{tab_label} — Авито",
+                    "Проверка, есть ли по найденным артикулам объявления в загруженном файле Авито.",
+                    icon="🛒",
+                )
+                render_avito_block(st.session_state.avito_df, result_df)
+                st.markdown('</div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="result-wrap">', unsafe_allow_html=True)
+    render_block_header(
+        f"{tab_label} — отчёт по листу",
+        "Полный отчёт по выбранному листу: где поставщик реально дешевле нас на заданный процент.",
+        icon="📊",
+        help_text="Отчёт строится по всему текущему листу, а не только по поисковой выдаче. Порог и минимальный остаток меняются в sidebar.",
+    )
+    report_df = build_report_df(sheet_df, st.session_state.distributor_threshold, st.session_state.distributor_min_qty)
     if report_df.empty:
         st.info("По текущему листу нет позиций, которые проходят ваш порог выгоды.")
     else:
@@ -1545,10 +1525,29 @@ if isinstance(current_df, pd.DataFrame):
         st.download_button(
             "⬇️ Скачать отчёт по листу",
             report_to_excel_bytes(report_df),
-            file_name=f"moy_tovar_report_{selected_sheet}.xlsx",
+            file_name=f"moy_tovar_report_{tab_key}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
+            key=f"download_report_{tab_key}",
         )
+    st.markdown('</div>', unsafe_allow_html=True)
+
+
+if not isinstance(sheets, dict) or not sheets:
+    render_info_banner(
+        "С чего начать",
+        "Загрузите comparison-файл. После этого сверху появятся 3 вкладки: Оригинал, Уценка и Совместимые. Затем можно подключить файл фото и искать позиции.",
+        icon="🚀",
+        chips=["один файл вместо многих", "3 отдельные вкладки", "фото по артикулу"],
+        tone="purple",
+    )
 else:
-    st.info("Сначала загрузите comparison-файл.")
-st.markdown('</div>', unsafe_allow_html=True)
+    tab_specs = [
+        ("Сравнение", "Оригинал", "original"),
+        ("Уценка", "Уценка", "discount"),
+        ("Совместимые", "Совместимые", "compatible"),
+    ]
+    tabs = st.tabs([label for _, label, _ in tab_specs])
+    for tab, (sheet_name, tab_label, tab_key) in zip(tabs, tab_specs):
+        with tab:
+            render_sheet_workspace(sheet_name, tab_label, tab_key)
