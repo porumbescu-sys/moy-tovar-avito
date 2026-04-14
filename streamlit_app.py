@@ -344,6 +344,7 @@ def get_series_candidates(df: pd.DataFrame, raw_query: str) -> dict[str, object]
                 "name": str(row.get("name", "")),
                 "free_qty": safe_float(row.get("free_qty", 0), 0.0),
                 "sale_price": safe_float(row.get("sale_price", 0), 0.0),
+                "original_block_reasons": list(row.get("original_block_reasons", []) or []),
             }
             if candidate["article_norm"] and candidate["article_norm"] not in candidates_by_key:
                 candidates_by_key[candidate["article_norm"]] = candidate
@@ -2219,6 +2220,7 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
     submitted_query = st.session_state.get(submitted_key, "")
     result_df = st.session_state.get(result_key)
     min_dist_qty = float(st.session_state.get("distributor_min_qty", 1.0))
+    series_df = sheet_df.copy() if isinstance(sheet_df, pd.DataFrame) else None
 
     if sheet_name == "Сравнение":
         blocked_count = 0
@@ -2233,7 +2235,7 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
             tone="green",
         )
 
-    series_info = get_series_candidates(sheet_df, submitted_query) if isinstance(sheet_df, pd.DataFrame) and normalize_text(submitted_query) else {"prefix": "", "candidates": []}
+    series_info = get_series_candidates(series_df, submitted_query) if isinstance(sheet_df, pd.DataFrame) and normalize_text(submitted_query) else {"prefix": "", "candidates": []}
     series_candidates = series_info.get("candidates", []) if isinstance(series_info, dict) else []
     if isinstance(sheet_df, pd.DataFrame) and normalize_text(submitted_query) and series_candidates:
         st.markdown('<div class="result-wrap">', unsafe_allow_html=True)
@@ -2253,10 +2255,22 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
         if clear_all_clicked:
             st.session_state[f"series_selected_{prefix_key}"] = []
         options = [str(c["article_norm"]) for c in series_candidates]
-        format_map = {
-            str(c["article_norm"]): f"{c['article']} — свободно: {fmt_qty(c['free_qty'])} • {fmt_price_with_rub(c['sale_price'])} • {c['name']}"
+        blocked_map = {
+            str(c["article_norm"]): list(c.get("original_block_reasons", []) or [])
             for c in series_candidates
+            if isinstance(c.get("original_block_reasons", []), list) and c.get("original_block_reasons")
         }
+        hidden_in_original = [norm for norm in options if norm in blocked_map]
+        if sheet_name == "Сравнение" and hidden_in_original:
+            st.info(f"В этой серии скрыто позиций во вкладке Оригинал: {len(hidden_in_original)}. Они найдены в Уценке и/или Совместимых, поэтому в рабочий поиск не добавляются.")
+        format_map = {}
+        for c in series_candidates:
+            norm = str(c["article_norm"])
+            label = f"{c['article']} — свободно: {fmt_qty(c['free_qty'])} • {fmt_price_with_rub(c['sale_price'])} • {c['name']}"
+            reasons = blocked_map.get(norm, [])
+            if reasons:
+                label += f" • скрыт: {' / '.join(reasons)}"
+            format_map[norm] = label
         selected_norms = st.multiselect(
             "Выберите позиции серии",
             options=options,
@@ -2268,12 +2282,29 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
         st.session_state[f"series_selected_{prefix_key}"] = selected_norms
         add_clicked = c_add.button("Добавить отмеченные в поиск", use_container_width=True, key=f"series_add_{prefix_key}")
         if add_clicked and selected_norms:
-            selected_articles = [str(c["article"]) for c in series_candidates if str(c["article_norm"]) in set(selected_norms)]
-            normalized_query = "\n".join(unique_preserve_order(selected_articles))
-            st.session_state[search_key] = normalized_query
-            st.session_state[submitted_key] = normalized_query
-            st.session_state[result_key] = search_in_df(sheet_df, normalized_query, search_mode)
-            st.rerun()
+            selected_articles = []
+            skipped_articles = []
+            selected_set = set(selected_norms)
+            for c in series_candidates:
+                norm = str(c["article_norm"])
+                if norm not in selected_set:
+                    continue
+                if sheet_name == "Сравнение" and blocked_map.get(norm):
+                    skipped_articles.append(str(c["article"]))
+                    continue
+                selected_articles.append(str(c["article"]))
+            if not selected_articles:
+                st.warning("Все отмеченные позиции этой серии сейчас скрыты во вкладке Оригинал из-за совпадений с Уценкой и/или Совместимыми.")
+            else:
+                normalized_query = "\n".join(unique_preserve_order(selected_articles))
+                st.session_state[search_key] = normalized_query
+                st.session_state[submitted_key] = normalized_query
+                st.session_state[result_key] = search_in_df(sheet_df, normalized_query, search_mode)
+                st.session_state[f"series_skip_msg_{prefix_key}"] = "Скрыты и не добавлены в поиск: " + ", ".join(unique_preserve_order(skipped_articles)) if skipped_articles else ""
+                st.rerun()
+        skip_msg = st.session_state.get(f"series_skip_msg_{prefix_key}", "")
+        if skip_msg:
+            st.caption(skip_msg)
         st.markdown('</div>', unsafe_allow_html=True)
 
     if not isinstance(sheet_df, pd.DataFrame):
