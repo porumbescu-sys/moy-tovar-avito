@@ -390,6 +390,59 @@ def get_original_block_reasons(codes: list[str], block_lookup: dict[str, list[st
                 reasons.add(str(reason))
     return sorted(reasons)
 
+def original_reason_badge_text(reasons: list[str]) -> str:
+    if not isinstance(reasons, list) or not reasons:
+        return ""
+    order = []
+    if "Уценка" in reasons:
+        order.append("🟠 Уценка")
+    if "Совместимые" in reasons:
+        order.append("🟣 Совместимые")
+    other = [r for r in reasons if r not in {"Уценка", "Совместимые"}]
+    order.extend([f"⚪ {r}" for r in other])
+    return " · ".join(order)
+
+
+def original_reason_short_tag(reasons: list[str]) -> str:
+    if not isinstance(reasons, list) or not reasons:
+        return ""
+    has_discount = "Уценка" in reasons
+    has_compatible = "Совместимые" in reasons
+    if has_discount and has_compatible:
+        return "[скрыт: Уценка + Совместимые]"
+    if has_discount:
+        return "[скрыт: Уценка]"
+    if has_compatible:
+        return "[скрыт: Совместимые]"
+    return "[скрыт]"
+
+
+def original_reason_summary_html(hidden_reasons: dict[str, list[str]]) -> str:
+    if not hidden_reasons:
+        return ""
+    only_discount = 0
+    only_compatible = 0
+    both = 0
+    for reasons in hidden_reasons.values():
+        has_discount = "Уценка" in reasons
+        has_compatible = "Совместимые" in reasons
+        if has_discount and has_compatible:
+            both += 1
+        elif has_discount:
+            only_discount += 1
+        elif has_compatible:
+            only_compatible += 1
+    chips = []
+    if only_discount:
+        chips.append(f"<span class='series-reason-chip chip-discount'>🟠 только Уценка: {only_discount}</span>")
+    if only_compatible:
+        chips.append(f"<span class='series-reason-chip chip-compatible'>🟣 только Совместимые: {only_compatible}</span>")
+    if both:
+        chips.append(f"<span class='series-reason-chip chip-both'>🔒 обе причины: {both}</span>")
+    if not chips:
+        return ""
+    return "<div class='series-reason-row'>" + "".join(chips) + "</div>"
+
 
 def build_compatible_price_lookup(compatible_df: pd.DataFrame | None) -> dict[str, dict[str, set[float]]]:
     lookup: dict[str, dict[str, set[float]]] = {}
@@ -2263,13 +2316,16 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
         hidden_in_original = [norm for norm in options if norm in blocked_map]
         if sheet_name == "Сравнение" and hidden_in_original:
             st.info(f"В этой серии скрыто позиций во вкладке Оригинал: {len(hidden_in_original)}. Они найдены в Уценке и/или Совместимых, поэтому в рабочий поиск не добавляются.")
+            summary_html = original_reason_summary_html({norm: blocked_map[norm] for norm in hidden_in_original if norm in blocked_map})
+            if summary_html:
+                st.markdown(summary_html, unsafe_allow_html=True)
         format_map = {}
         for c in series_candidates:
             norm = str(c["article_norm"])
             label = f"{c['article']} — свободно: {fmt_qty(c['free_qty'])} • {fmt_price_with_rub(c['sale_price'])} • {c['name']}"
             reasons = blocked_map.get(norm, [])
             if reasons:
-                label += f" • скрыт: {' / '.join(reasons)}"
+                label += f" • {original_reason_short_tag(reasons)}"
             format_map[norm] = label
         selected_norms = st.multiselect(
             "Выберите позиции серии",
