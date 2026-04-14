@@ -1863,6 +1863,32 @@ st.markdown(
         padding: 12px 14px !important;
         line-height: 1.55 !important;
     }
+    /* ultra-specific fix for lingering white textarea/select backgrounds in sidebar */
+    [data-testid="stSidebar"] section[data-testid="stSidebarContent"] textarea,
+    [data-testid="stSidebar"] section[data-testid="stSidebarContent"] textarea:focus,
+    [data-testid="stSidebar"] section[data-testid="stSidebarContent"] textarea:hover,
+    [data-testid="stSidebar"] section[data-testid="stSidebarContent"] .stTextArea textarea,
+    [data-testid="stSidebar"] section[data-testid="stSidebarContent"] .stTextArea textarea:focus,
+    [data-testid="stSidebar"] section[data-testid="stSidebarContent"] .stTextArea textarea:hover,
+    [data-testid="stSidebar"] section[data-testid="stSidebarContent"] [data-baseweb="textarea"],
+    [data-testid="stSidebar"] section[data-testid="stSidebarContent"] [data-baseweb="textarea"] > div,
+    [data-testid="stSidebar"] section[data-testid="stSidebarContent"] [data-baseweb="textarea"] textarea,
+    [data-testid="stSidebar"] section[data-testid="stSidebarContent"] [data-baseweb="select"],
+    [data-testid="stSidebar"] section[data-testid="stSidebarContent"] [data-baseweb="select"] > div,
+    [data-testid="stSidebar"] section[data-testid="stSidebarContent"] div[role="combobox"] {
+        background-color: rgba(9,22,60,.98) !important;
+        background: rgba(9,22,60,.98) !important;
+        color: #f8fbff !important;
+        -webkit-text-fill-color: #f8fbff !important;
+        border: 1px solid rgba(135,170,255,.24) !important;
+        box-shadow: inset 0 0 0 1px rgba(135,170,255,.10), 0 8px 18px rgba(2,8,23,.12) !important;
+        border-radius: 16px !important;
+    }
+    [data-testid="stSidebar"] section[data-testid="stSidebarContent"] textarea::placeholder {
+        color: #9fb4ef !important;
+        -webkit-text-fill-color: #9fb4ef !important;
+        opacity: 1 !important;
+    }
     [data-testid="stSidebar"] .stButton > button,
     [data-testid="stSidebar"] .stDownloadButton > button {
         width: 100% !important;
