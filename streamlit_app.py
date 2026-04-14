@@ -200,6 +200,120 @@ def tokenize_text(value: object) -> list[str]:
     return [t for t in re.split(r"[^A-Za-zА-Яа-я0-9]+", text.upper()) if t]
 
 
+ARTICLE_PIECE_RE = re.compile(r"[A-Za-zА-Яа-я0-9._/-]{3,}")
+
+
+def is_candidate_article_norm(norm: str) -> bool:
+    if not norm:
+        return False
+    if len(norm) < 5:
+        return False
+    has_digit = any(ch.isdigit() for ch in norm)
+    has_alpha = any(ch.isalpha() for ch in norm)
+    return has_digit and has_alpha
+
+
+def extract_article_candidates_from_text(text: object) -> list[str]:
+    raw = normalize_text(text)
+    if not raw:
+        return []
+    chunks = ARTICLE_PIECE_RE.findall(raw)
+    out: list[str] = []
+    seen: set[str] = set()
+    for chunk in chunks:
+        norm = normalize_article(chunk)
+        if not is_candidate_article_norm(norm) or norm in seen:
+            continue
+        seen.add(norm)
+        out.append(norm)
+    return out
+
+
+def unique_norm_codes(items: list[object]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in items:
+        norm = normalize_article(item)
+        if not is_candidate_article_norm(norm) or norm in seen:
+            continue
+        seen.add(norm)
+        out.append(norm)
+    return out
+
+
+def build_row_compare_codes(article: object, name: object) -> list[str]:
+    return unique_norm_codes([article, *extract_article_candidates_from_text(name)])
+
+
+def build_compatible_price_lookup(compatible_df: pd.DataFrame | None) -> dict[str, dict[str, set[float]]]:
+    lookup: dict[str, dict[str, set[float]]] = {}
+    if compatible_df is None or compatible_df.empty:
+        return lookup
+    for _, row in compatible_df.iterrows():
+        codes = build_row_compare_codes(row.get("article", ""), row.get("name", ""))
+        if not codes:
+            continue
+        for pair in row.get("source_pairs", []) or []:
+            source = str(pair.get("source", "") or "")
+            price = safe_float(row.get(pair.get("price_col", "")), 0.0)
+            qty = parse_qty_generic(row.get(pair.get("qty_col", "")))
+            if not source or price <= 0 or qty <= 0:
+                continue
+            price_key = round(float(price), 2)
+            for code in codes:
+                lookup.setdefault(code, {}).setdefault(source, set()).add(price_key)
+    return lookup
+
+
+def merge_blocked_source_prices(codes: list[str], compatible_lookup: dict[str, dict[str, set[float]]]) -> dict[str, list[float]]:
+    out: dict[str, set[float]] = {}
+    for code in codes or []:
+        for source, prices in compatible_lookup.get(code, {}).items():
+            out.setdefault(source, set()).update(prices)
+    return {source: sorted(values) for source, values in out.items() if values}
+
+
+def is_blocked_by_compatible_price(row: pd.Series, source: str, price: float) -> bool:
+    blocked_map = row.get("blocked_source_prices", {})
+    if not isinstance(blocked_map, dict) or not blocked_map:
+        return False
+    blocked_prices = blocked_map.get(str(source), [])
+    if not blocked_prices:
+        return False
+    price_key = round(float(price), 2)
+    return any(abs(float(blocked) - price_key) < 0.01 for blocked in blocked_prices)
+
+
+def filter_suspicious_low_offers(row: pd.Series, offers: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
+    sheet_name = normalize_text(row.get("sheet_name", ""))
+    own_price = safe_float(row.get("sale_price"), 0.0)
+    if sheet_name != "Сравнение" or len(offers) < 3:
+        return offers, []
+
+    prices = sorted(float(offer["price"]) for offer in offers if float(offer["price"]) > 0)
+    if len(prices) < 3:
+        return offers, []
+
+    upper_half = prices[len(prices) // 2 :]
+    if not upper_half:
+        return offers, []
+
+    ref_price = upper_half[len(upper_half) // 2]
+    outlier_limit = ref_price * 0.35
+    if own_price > 0:
+        outlier_limit = min(outlier_limit, own_price * 0.35)
+
+    kept: list[dict[str, Any]] = []
+    hidden: list[str] = []
+    for offer in offers:
+        price = float(offer["price"])
+        if price < outlier_limit:
+            hidden.append(f"{offer['source']} {fmt_price(price)}")
+            continue
+        kept.append(offer)
+    return kept, hidden
+
+
 def unique_preserve_order(items: list[str]) -> list[str]:
     seen: set[str] = set()
     out: list[str] = []
@@ -373,11 +487,21 @@ def load_comparison_workbook(file_name: str, file_bytes: bytes) -> dict[str, pd.
         df["source_pairs"] = [source_pairs for _ in range(len(df))]
         df["photo_url"] = ""
         df["photo_name"] = ""
+        df["row_codes"] = df.apply(lambda row: build_row_compare_codes(row.get("article", ""), row.get("name", "")), axis=1)
+        df["blocked_source_prices"] = [{} for _ in range(len(df))]
         df = df[(df["article_norm"] != "") & (df["name"] != "")].copy()
         df = df.reset_index(drop=True)
         sheets[sheet] = df
     if not sheets:
         raise ValueError("Не удалось прочитать comparison-файл: на листах не найдены обязательные колонки Артикул / Наименование / Наша цена / Наш склад.")
+
+    compatible_df = sheets.get("Совместимые")
+    compatible_lookup = build_compatible_price_lookup(compatible_df)
+    original_df = sheets.get("Сравнение")
+    if compatible_lookup and isinstance(original_df, pd.DataFrame) and not original_df.empty:
+        original_df = original_df.copy()
+        original_df["blocked_source_prices"] = original_df["row_codes"].apply(lambda codes: merge_blocked_source_prices(codes, compatible_lookup))
+        sheets["Сравнение"] = original_df
     return sheets
 
 
@@ -680,11 +804,15 @@ def get_source_pairs(df: pd.DataFrame) -> list[dict[str, str]]:
 
 def get_row_offers(row: pd.Series, min_qty: float = 1.0) -> list[dict[str, Any]]:
     offers: list[dict[str, Any]] = []
+    hidden_compatible_sources: list[str] = []
     for pair in row.get("source_pairs", []) or []:
         source = pair["source"]
         price = safe_float(row.get(pair["price_col"]), 0.0)
         qty = parse_qty_generic(row.get(pair["qty_col"]))
         if price <= 0 or qty < float(min_qty):
+            continue
+        if is_blocked_by_compatible_price(row, source, price):
+            hidden_compatible_sources.append(f"{source} {fmt_price(price)}")
             continue
         offers.append({
             "source": source,
@@ -693,6 +821,15 @@ def get_row_offers(row: pd.Series, min_qty: float = 1.0) -> list[dict[str, Any]]
             "price_fmt": fmt_price(price),
             "qty_fmt": fmt_qty(qty),
         })
+
+    offers, hidden_outlier_sources = filter_suspicious_low_offers(row, offers)
+
+    try:
+        row["hidden_compatible_sources"] = unique_preserve_order(hidden_compatible_sources)
+        row["hidden_outlier_sources"] = unique_preserve_order(hidden_outlier_sources)
+    except Exception:
+        pass
+
     offers.sort(key=lambda x: (x["price"], -x["qty"], x["source"]))
     return offers
 
@@ -1538,6 +1675,15 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
     submitted_query = st.session_state.get(submitted_key, "")
     result_df = st.session_state.get(result_key)
     min_dist_qty = float(st.session_state.get("distributor_min_qty", 1.0))
+
+    if sheet_name == "Сравнение":
+        render_info_banner(
+            "Защита от совместимки и мусорных цен",
+            "Во вкладке Оригинал сначала скрываются цены поставщиков, которые уже совпали с листом Совместимые по OEM-коду. Дополнительно отсекаются экстремально низкие выбросы, если они резко выпадают из нормального коридора цен.",
+            icon="🛡️",
+            chips=["сначала фильтр по совместимым", "потом отсев аномально низких цен", "оригинальная строка остаётся"],
+            tone="green",
+        )
 
     if not isinstance(sheet_df, pd.DataFrame):
         render_info_banner(
