@@ -1602,6 +1602,51 @@ st.markdown(
     [data-testid="stSidebar"] .stTextArea [data-baseweb="textarea"] textarea {
         min-height: 110px;
     }
+    /* final hard override for white sidebar fields */
+    [data-testid="stSidebar"] input:not([type="checkbox"]):not([type="radio"]),
+    [data-testid="stSidebar"] textarea,
+    [data-testid="stSidebar"] select,
+    [data-testid="stSidebar"] div[role="combobox"],
+    [data-testid="stSidebar"] [data-baseweb="input"],
+    [data-testid="stSidebar"] [data-baseweb="base-input"],
+    [data-testid="stSidebar"] [data-baseweb="textarea"],
+    [data-testid="stSidebar"] [data-baseweb="select"],
+    [data-testid="stSidebar"] [data-baseweb="input"] > div,
+    [data-testid="stSidebar"] [data-baseweb="base-input"] > div,
+    [data-testid="stSidebar"] [data-baseweb="textarea"] > div,
+    [data-testid="stSidebar"] [data-baseweb="select"] > div {
+        background: linear-gradient(180deg, rgba(9,22,60,.98), rgba(7,18,50,.96)) !important;
+        color: #f8fbff !important;
+        -webkit-text-fill-color: #f8fbff !important;
+        border-color: rgba(135,170,255,.24) !important;
+        border: none !important;
+        box-shadow: inset 0 0 0 1px rgba(135,170,255,.24), 0 8px 18px rgba(2,8,23,.12) !important;
+        border-radius: 16px !important;
+    }
+    [data-testid="stSidebar"] input::placeholder,
+    [data-testid="stSidebar"] textarea::placeholder {
+        color: #9fb4ef !important;
+        -webkit-text-fill-color: #9fb4ef !important;
+        opacity: 1 !important;
+    }
+    [data-testid="stSidebar"] [data-baseweb="select"] svg,
+    [data-testid="stSidebar"] div[role="combobox"] svg {
+        fill: #cfe0ff !important;
+        color: #cfe0ff !important;
+    }
+    [data-testid="stSidebar"] [data-baseweb="input"] button,
+    [data-testid="stSidebar"] [data-baseweb="base-input"] button,
+    [data-testid="stSidebar"] .stNumberInput button {
+        background: rgba(255,255,255,.05) !important;
+        color: #cfe0ff !important;
+        border: none !important;
+        box-shadow: none !important;
+    }
+    [data-testid="stSidebar"] .stTextArea textarea,
+    [data-testid="stSidebar"] [data-baseweb="textarea"] textarea {
+        padding: 12px 14px !important;
+        line-height: 1.55 !important;
+    }
     [data-testid="stSidebar"] .stButton > button,
     [data-testid="stSidebar"] .stDownloadButton > button {
         width: 100% !important;
