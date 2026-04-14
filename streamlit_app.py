@@ -2319,11 +2319,50 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
             summary_html = original_reason_summary_html({norm: blocked_map[norm] for norm in hidden_in_original if norm in blocked_map})
             if summary_html:
                 st.markdown(summary_html, unsafe_allow_html=True)
+
+        st.markdown("""
+        <style>
+        .series-preview-wrap {display:flex; flex-direction:column; gap:8px; margin:8px 0 12px 0;}
+        .series-preview-row {display:flex; align-items:flex-start; justify-content:space-between; gap:10px; padding:10px 12px; border-radius:14px; border:1px solid #dbe5f1; background:linear-gradient(180deg,#ffffff 0%,#f8fbff 100%);}
+        .series-preview-row.series-hidden {background:linear-gradient(180deg,#f5f7fb 0%,#eef2f7 100%); border-color:#d7dde8; opacity:.72;}
+        .series-preview-main {min-width:0;}
+        .series-preview-article {font-size:13px; font-weight:900; color:#0f172a; margin-bottom:3px;}
+        .series-preview-row.series-hidden .series-preview-article {color:#64748b;}
+        .series-preview-name {font-size:12px; line-height:1.45; color:#475569;}
+        .series-preview-row.series-hidden .series-preview-name {color:#7b8797;}
+        .series-preview-meta {font-size:11px; color:#64748b; margin-top:5px;}
+        .series-preview-tag {display:inline-flex; align-items:center; padding:5px 9px; border-radius:999px; font-size:11px; font-weight:900; white-space:nowrap;}
+        .series-preview-tag.visible {background:#e8f7ee; color:#15803d;}
+        .series-preview-tag.hidden {background:#eef2f7; color:#64748b; border:1px solid #d7dde8;}
+        </style>
+        """, unsafe_allow_html=True)
+        preview_rows = []
+        for c in series_candidates:
+            norm = str(c["article_norm"])
+            reasons = blocked_map.get(norm, [])
+            hidden = bool(reasons)
+            tag_text = original_reason_short_tag(reasons) if hidden else "[доступно]"
+            tag_class = "hidden" if hidden else "visible"
+            preview_rows.append((hidden, f"""
+                <div class='series-preview-row {'series-hidden' if hidden else ''}'>
+                  <div class='series-preview-main'>
+                    <div class='series-preview-article'>{html.escape(str(c['article']))}</div>
+                    <div class='series-preview-name'>{html.escape(str(c['name']))}</div>
+                    <div class='series-preview-meta'>Свободно: {html.escape(fmt_qty(c['free_qty']))} • {html.escape(fmt_price_with_rub(c['sale_price']))}</div>
+                  </div>
+                  <div class='series-preview-tag {tag_class}'>{html.escape(tag_text)}</div>
+                </div>
+            """))
+        preview_rows = sorted(preview_rows, key=lambda x: (x[0],))
+        st.markdown("<div class='series-preview-wrap'>" + "".join(row_html for _, row_html in preview_rows) + "</div>", unsafe_allow_html=True)
+
+        options = [str(c["article_norm"]) for c in sorted(series_candidates, key=lambda c: (str(c["article_norm"]) in blocked_map, series_sort_key(c)))]
         format_map = {}
         for c in series_candidates:
             norm = str(c["article_norm"])
-            label = f"{c['article']} — свободно: {fmt_qty(c['free_qty'])} • {fmt_price_with_rub(c['sale_price'])} • {c['name']}"
             reasons = blocked_map.get(norm, [])
+            prefix = "⚪ " if reasons else "🟢 "
+            label = f"{prefix}{c['article']} — свободно: {fmt_qty(c['free_qty'])} • {fmt_price_with_rub(c['sale_price'])} • {c['name']}"
             if reasons:
                 label += f" • {original_reason_short_tag(reasons)}"
             format_map[norm] = label
