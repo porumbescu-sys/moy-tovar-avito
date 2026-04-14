@@ -1533,6 +1533,68 @@ st.markdown(
         border-color: rgba(135,170,255,.18) !important;
         opacity: 1 !important;
     }
+
+    /* stronger sidebar field styling to override white baseweb wrappers */
+    [data-testid="stSidebar"] .stNumberInput,
+    [data-testid="stSidebar"] .stTextInput,
+    [data-testid="stSidebar"] .stTextArea,
+    [data-testid="stSidebar"] .stSelectbox {
+        background: transparent !important;
+    }
+    [data-testid="stSidebar"] .stNumberInput > div,
+    [data-testid="stSidebar"] .stTextInput > div,
+    [data-testid="stSidebar"] .stTextArea > div,
+    [data-testid="stSidebar"] .stSelectbox > div {
+        background: transparent !important;
+    }
+    [data-testid="stSidebar"] .stNumberInput [data-baseweb="base-input"],
+    [data-testid="stSidebar"] .stTextInput [data-baseweb="base-input"],
+    [data-testid="stSidebar"] .stNumberInput [data-baseweb="input"],
+    [data-testid="stSidebar"] .stTextInput [data-baseweb="input"],
+    [data-testid="stSidebar"] .stTextArea [data-baseweb="textarea"],
+    [data-testid="stSidebar"] .stSelectbox [data-baseweb="select"] {
+        background: linear-gradient(180deg, rgba(9,22,60,.98), rgba(7,18,50,.96)) !important;
+        border-radius: 16px !important;
+        box-shadow: inset 0 0 0 1px rgba(135,170,255,.24), 0 8px 18px rgba(2,8,23,.12) !important;
+        border: none !important;
+    }
+    [data-testid="stSidebar"] .stNumberInput [data-baseweb="base-input"] > div,
+    [data-testid="stSidebar"] .stTextInput [data-baseweb="base-input"] > div,
+    [data-testid="stSidebar"] .stNumberInput [data-baseweb="input"] > div,
+    [data-testid="stSidebar"] .stTextInput [data-baseweb="input"] > div,
+    [data-testid="stSidebar"] .stTextArea [data-baseweb="textarea"] > div,
+    [data-testid="stSidebar"] .stSelectbox [data-baseweb="select"] > div {
+        background: transparent !important;
+        border-radius: 16px !important;
+        border: none !important;
+        box-shadow: none !important;
+    }
+    [data-testid="stSidebar"] .stNumberInput [data-baseweb="base-input"] input,
+    [data-testid="stSidebar"] .stTextInput [data-baseweb="base-input"] input,
+    [data-testid="stSidebar"] .stNumberInput [data-baseweb="input"] input,
+    [data-testid="stSidebar"] .stTextInput [data-baseweb="input"] input,
+    [data-testid="stSidebar"] .stTextArea [data-baseweb="textarea"] textarea,
+    [data-testid="stSidebar"] .stSelectbox [data-baseweb="select"] input,
+    [data-testid="stSidebar"] .stSelectbox [data-baseweb="select"] div[role="combobox"] {
+        background: transparent !important;
+        color: #f8fbff !important;
+        -webkit-text-fill-color: #f8fbff !important;
+        border: none !important;
+        box-shadow: none !important;
+    }
+    [data-testid="stSidebar"] .stNumberInput [data-baseweb="base-input"] button,
+    [data-testid="stSidebar"] .stNumberInput [data-baseweb="input"] button,
+    [data-testid="stSidebar"] .stNumberInput [data-baseweb="base-input"] > div > button,
+    [data-testid="stSidebar"] .stNumberInput [data-baseweb="input"] > div > button {
+        background: rgba(255,255,255,.04) !important;
+        color: #cfe0ff !important;
+        border: none !important;
+        border-radius: 12px !important;
+        box-shadow: none !important;
+    }
+    [data-testid="stSidebar"] .stTextArea [data-baseweb="textarea"] textarea {
+        min-height: 110px;
+    }
     [data-testid="stSidebar"] .stButton > button,
     [data-testid="stSidebar"] .stDownloadButton > button {
         width: 100% !important;
