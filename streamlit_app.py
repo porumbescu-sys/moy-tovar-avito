@@ -288,6 +288,67 @@ def build_row_compare_codes(article: object, name: object) -> list[str]:
     return unique_norm_codes([article, *extract_article_candidates_from_text(name)])
 
 
+SERIES_SUFFIX_ORDER = {"A": 0, "AC": 1, "X": 2, "XC": 3, "Y": 4, "YC": 5, "M": 6, "MC": 7, "C": 8, "K": 9}
+
+
+def split_article_family_suffix(article_norm: str) -> tuple[str, str]:
+    m = re.match(r"^(.*?\d)([A-ZА-Я]{1,3})$", article_norm)
+    if m:
+        return m.group(1), m.group(2)
+    return article_norm, ""
+
+
+def natural_chunks(value: str) -> list[object]:
+    parts = re.split(r"(\d+)", value)
+    result: list[object] = []
+    for part in parts:
+        if not part:
+            continue
+        result.append(int(part) if part.isdigit() else part)
+    return result
+
+
+def series_sort_key(candidate: dict[str, object]) -> tuple[object, ...]:
+    article_norm = str(candidate.get("article_norm", ""))
+    family, suffix = split_article_family_suffix(article_norm)
+    rank = SERIES_SUFFIX_ORDER.get(suffix, 50)
+    return (*natural_chunks(family), rank, suffix, article_norm)
+
+
+def get_series_candidates(df: pd.DataFrame, raw_query: str) -> dict[str, object]:
+    tokens = split_query_parts(raw_query)
+    if len(tokens) != 1:
+        return {"prefix": "", "candidates": []}
+    token = tokens[0]
+    token_norm = normalize_article(token)
+    if len(token_norm) < 4:
+        return {"prefix": token, "candidates": []}
+
+    candidates_by_key: dict[str, dict[str, object]] = {}
+
+    direct_df = df[df["article_norm"].str.startswith(token_norm, na=False)].copy()
+    linked_mask = df["row_codes"].apply(lambda codes: any(str(code).startswith(token_norm) for code in (codes or [])) if isinstance(codes, list) else False)
+    linked_df = df[linked_mask].copy()
+
+    for source_df in [direct_df, linked_df]:
+        for _, row in source_df.iterrows():
+            candidate = {
+                "article": str(row.get("article", "")),
+                "article_norm": str(row.get("article_norm", "")),
+                "name": str(row.get("name", "")),
+                "free_qty": safe_float(row.get("free_qty", 0), 0.0),
+                "sale_price": safe_float(row.get("sale_price", 0), 0.0),
+            }
+            if candidate["article_norm"] and candidate["article_norm"] not in candidates_by_key:
+                candidates_by_key[candidate["article_norm"]] = candidate
+
+    candidates = list(candidates_by_key.values())
+    candidates.sort(key=series_sort_key)
+    if len(candidates) < 2:
+        return {"prefix": token, "candidates": []}
+    return {"prefix": token, "candidates": candidates}
+
+
 def build_sheet_code_reason_lookup(df: pd.DataFrame | None, reason: str) -> dict[str, set[str]]:
     lookup: dict[str, set[str]] = {}
     if df is None or df.empty:
@@ -2165,6 +2226,49 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
             chips=[f"скрыто строк: {blocked_count}", "если код есть в Уценке — не показываем", "если код есть в Совместимых — не показываем"],
             tone="green",
         )
+
+    series_info = get_series_candidates(sheet_df, submitted_query) if isinstance(sheet_df, pd.DataFrame) and normalize_text(submitted_query) else {"prefix": "", "candidates": []}
+    series_candidates = series_info.get("candidates", []) if isinstance(series_info, dict) else []
+    if isinstance(sheet_df, pd.DataFrame) and normalize_text(submitted_query) and series_candidates:
+        st.markdown('<div class="result-wrap">', unsafe_allow_html=True)
+        render_block_header(
+            f"{tab_label} — серия / группа по части артикула",
+            "Если вводишь только часть артикула, здесь можно быстро выбрать всю группу и одним кликом добавить нужные позиции в поиск.",
+            icon="🎨",
+            help_text="Подходит для цветов, ёмкостей и серийных товаров: CE505, TK-8600, CTL-1100 и похожих групп. Сначала вводишь часть артикула, потом отмечаешь нужные позиции и добавляешь их в основной поиск текущей вкладки.",
+        )
+        st.caption(f"По префиксу {series_info.get('prefix', '')} найдено позиций: {len(series_candidates)}")
+        c_add, c_all, c_clear = st.columns(3)
+        prefix_key = f"{tab_key}_{normalize_article(str(series_info.get('prefix', '')))}"
+        select_all_clicked = c_all.button("Выбрать все", use_container_width=True, key=f"series_select_all_{prefix_key}")
+        clear_all_clicked = c_clear.button("Очистить выбор", use_container_width=True, key=f"series_clear_all_{prefix_key}")
+        if select_all_clicked:
+            st.session_state[f"series_selected_{prefix_key}"] = [str(c["article_norm"]) for c in series_candidates]
+        if clear_all_clicked:
+            st.session_state[f"series_selected_{prefix_key}"] = []
+        options = [str(c["article_norm"]) for c in series_candidates]
+        format_map = {
+            str(c["article_norm"]): f"{c['article']} — свободно: {fmt_qty(c['free_qty'])} • {fmt_price_with_rub(c['sale_price'])} • {c['name']}"
+            for c in series_candidates
+        }
+        selected_norms = st.multiselect(
+            "Выберите позиции серии",
+            options=options,
+            default=st.session_state.get(f"series_selected_{prefix_key}", []),
+            format_func=lambda x: format_map.get(x, x),
+            key=f"series_multiselect_{prefix_key}",
+            label_visibility="collapsed",
+        )
+        st.session_state[f"series_selected_{prefix_key}"] = selected_norms
+        add_clicked = c_add.button("Добавить отмеченные в поиск", use_container_width=True, key=f"series_add_{prefix_key}")
+        if add_clicked and selected_norms:
+            selected_articles = [str(c["article"]) for c in series_candidates if str(c["article_norm"]) in set(selected_norms)]
+            normalized_query = "\n".join(unique_preserve_order(selected_articles))
+            st.session_state[search_key] = normalized_query
+            st.session_state[submitted_key] = normalized_query
+            st.session_state[result_key] = search_in_df(sheet_df, normalized_query, search_mode)
+            st.rerun()
+        st.markdown('</div>', unsafe_allow_html=True)
 
     if not isinstance(sheet_df, pd.DataFrame):
         render_info_banner(
