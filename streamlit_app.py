@@ -780,7 +780,7 @@ def init_state() -> None:
         "price_mode": "-12%",
         "custom_discount": 10.0,
         "round100": True,
-        "search_mode": "Артикул + коды из названия",
+        "search_mode": "Умный",
         "template1_footer": DEFAULT_TEMPLATE1_FOOTER,
         "price_patch_input": "",
         "patch_message": "",
@@ -809,7 +809,7 @@ def rebuild_current_df() -> None:
 def refresh_all_search_results() -> None:
     sheets = st.session_state.get("comparison_sheets", {})
     photo_df = st.session_state.get("photo_df")
-    search_mode = st.session_state.get("search_mode", "Артикул + коды из названия")
+    search_mode = st.session_state.get("search_mode", "Умный")
     tab_specs = [
         ("Сравнение", "original"),
         ("Уценка", "discount"),
@@ -855,7 +855,7 @@ def search_in_df(df: pd.DataFrame, query: str, search_mode: str) -> pd.DataFrame
             row_dict["match_query"] = token
             exact_hits.append(row_dict)
 
-        if search_mode in {"Артикул + коды из названия", "Артикул + название + бренд"} and token_norm:
+        if search_mode in {"Умный", "Артикул + коды из названия", "Артикул + название + бренд"} and token_norm:
             linked = df[df["row_codes"].apply(lambda codes: token_norm in (codes or []) if isinstance(codes, list) else False)]
             for _, row in linked.iterrows():
                 key = str(row["article_norm"])
@@ -2065,7 +2065,7 @@ with st.sidebar:
 
     st.markdown('<div class="sidebar-card">', unsafe_allow_html=True)
     render_sidebar_card_header("Настройки", "⚙️", "Управляет режимом поиска, главной ценой, пользовательской скидкой и округлением.")
-    st.selectbox("Режим поиска", ["Только артикул", "Артикул + коды из названия", "Артикул + название + бренд"], key="search_mode")
+    st.radio("Режим поиска", ["Только артикул", "Умный", "Артикул + название + бренд"], key="search_mode")
     st.radio("Какая цена главная", ["-12%", "-20%", "Своя скидка"], key="price_mode")
     st.number_input("Своя скидка, %", min_value=0.0, max_value=99.0, step=1.0, key="custom_discount")
     st.checkbox("Округлять вверх до 100", key="round100")
@@ -2131,7 +2131,7 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
         find_clicked = c1.form_submit_button("🔎 Найти", use_container_width=True, type="primary")
         clear_clicked = c2.form_submit_button("🧹 Очистить", use_container_width=True)
         c3.markdown(
-            f"<div style='padding-top:9px;color:#64748b;font-size:12px;'>Тип поиска сейчас: <b>{html.escape(search_mode)}</b>. Короткие OEM-коды вроде TK-8600Y лучше искать режимом «Артикул + коды из названия».</div>",
+            f"<div style='padding-top:9px;color:#64748b;font-size:12px;'>Тип поиска сейчас: <b>{html.escape(search_mode)}</b>. Для коротких OEM-кодов вроде TK-8600Y используй режим «Умный».</div>",
             unsafe_allow_html=True,
         )
     st.markdown('</div>', unsafe_allow_html=True)
