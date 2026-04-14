@@ -942,7 +942,39 @@ def load_photo_map_file(file_name: str, file_bytes: bytes) -> pd.DataFrame:
         raise ValueError("В файле фото нужны колонки с артикулом и хотя бы с фото или полезными полями из Worksheet.")
 
     combined = pd.concat(parts, ignore_index=True)
-    combined = combined.sort_values(["sheet_priority", "article_norm"]).drop_duplicates(subset=["article_norm"], keep="first").reset_index(drop=True)
+    combined = combined.sort_values(["article_norm", "sheet_priority"]).reset_index(drop=True)
+
+    def _first_non_empty(series: pd.Series) -> str:
+        for value in series.tolist():
+            txt = normalize_text(value)
+            if txt:
+                return txt
+        return ""
+
+    def _best_photo(series: pd.Series) -> str:
+        for value in series.tolist():
+            txt = normalize_text(value)
+            if txt:
+                return txt
+        return ""
+
+    rows: list[dict[str, str]] = []
+    for article_norm, grp in combined.groupby("article_norm", sort=False):
+        grp = grp.sort_values(["sheet_priority", "source_sheet"])
+        row = {
+            "article": _first_non_empty(grp["article"]),
+            "article_norm": article_norm,
+            "photo_url": _best_photo(grp["photo_url"]),
+            "source_sheet": _first_non_empty(grp["source_sheet"]),
+            "meta_color": _first_non_empty(grp["meta_color"]),
+            "meta_iso_pages": _first_non_empty(grp["meta_iso_pages"]),
+            "meta_manufacturer_code": _first_non_empty(grp["meta_manufacturer_code"]),
+            "meta_model": _first_non_empty(grp["meta_model"]),
+            "meta_fits_models": _first_non_empty(grp["meta_fits_models"]),
+        }
+        rows.append(row)
+
+    combined = pd.DataFrame(rows)
     return combined[["article", "article_norm", "photo_url", "source_sheet", "meta_color", "meta_iso_pages", "meta_manufacturer_code", "meta_model", "meta_fits_models"]]
 
 
