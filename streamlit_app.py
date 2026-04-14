@@ -465,6 +465,25 @@ def build_compatible_price_lookup(compatible_df: pd.DataFrame | None) -> dict[st
     return lookup
 
 
+def merge_source_price_lookups(*lookups: dict[str, dict[str, set[float]]]) -> dict[str, dict[str, set[float]]]:
+    merged: dict[str, dict[str, set[float]]] = {}
+    for lookup in lookups:
+        for code, source_map in (lookup or {}).items():
+            code_norm = normalize_article(code)
+            if not code_norm or not isinstance(source_map, dict):
+                continue
+            bucket = merged.setdefault(code_norm, {})
+            for source, prices in source_map.items():
+                source_name = str(source or "")
+                if not source_name:
+                    continue
+                for price in prices or []:
+                    price_val = safe_float(price, 0.0)
+                    if price_val > 0:
+                        bucket.setdefault(source_name, set()).add(round(float(price_val), 2))
+    return merged
+
+
 def merge_blocked_source_prices(codes: list[str], compatible_lookup: dict[str, dict[str, set[float]]]) -> dict[str, list[float]]:
     out: dict[str, set[float]] = {}
     for code in codes or []:
@@ -699,6 +718,8 @@ def load_comparison_workbook(file_name: str, file_bytes: bytes) -> dict[str, pd.
     compatible_df = sheets.get("Совместимые")
     discount_df = sheets.get("Уценка")
     compatible_lookup = build_compatible_price_lookup(compatible_df)
+    discount_lookup = build_compatible_price_lookup(discount_df)
+    blocked_price_lookup = merge_source_price_lookups(compatible_lookup, discount_lookup)
     original_df = sheets.get("Сравнение")
     original_block_lookup = merge_code_reason_lookups(
         build_sheet_code_reason_lookup(discount_df, "Уценка"),
@@ -706,8 +727,8 @@ def load_comparison_workbook(file_name: str, file_bytes: bytes) -> dict[str, pd.
     )
     if isinstance(original_df, pd.DataFrame) and not original_df.empty:
         original_df = original_df.copy()
-        if compatible_lookup:
-            original_df["blocked_source_prices"] = original_df["row_codes"].apply(lambda codes: merge_blocked_source_prices(codes, compatible_lookup))
+        if blocked_price_lookup:
+            original_df["blocked_source_prices"] = original_df["row_codes"].apply(lambda codes: merge_blocked_source_prices(codes, blocked_price_lookup))
         original_df["original_block_reasons"] = original_df["row_codes"].apply(lambda codes: get_original_block_reasons(codes, original_block_lookup))
         original_df["blocked_in_original"] = original_df["original_block_reasons"].map(lambda x: isinstance(x, list) and len(x) > 0)
         sheets["Сравнение"] = original_df
@@ -2276,15 +2297,14 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
     series_df = sheet_df.copy() if isinstance(sheet_df, pd.DataFrame) else None
 
     if sheet_name == "Сравнение":
-        blocked_count = 0
+        flagged_count = 0
         if isinstance(sheet_df, pd.DataFrame) and "blocked_in_original" in sheet_df.columns:
-            blocked_count = int(sheet_df["blocked_in_original"].fillna(False).sum())
-            sheet_df = sheet_df[sheet_df["blocked_in_original"] != True].copy().reset_index(drop=True)
+            flagged_count = int(sheet_df["blocked_in_original"].fillna(False).sum())
         render_info_banner(
             "Защита от уценки и совместимки",
-            "Во вкладке Оригинал позиции целиком скрываются, если их OEM-код найден на листе Уценка или Совместимые. После этого дополнительно отсекаются мусорные экстремально низкие цены поставщиков.",
+            "Во вкладке Оригинал позиция остаётся видимой. Если её OEM-код найден на листе Уценка или Совместимые, приложение скрывает только совпавшие цены поставщиков, а не всю строку. Дополнительно отсекаются мусорные экстремально низкие цены.",
             icon="🛡️",
-            chips=[f"скрыто строк: {blocked_count}", "если код есть в Уценке — не показываем", "если код есть в Совместимых — не показываем"],
+            chips=[f"строк с совпадениями: {flagged_count}", "скрываем только цены поставщиков", "сама позиция остаётся"],
             tone="green",
         )
 
@@ -2315,7 +2335,7 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
         }
         hidden_in_original = [norm for norm in options if norm in blocked_map]
         if sheet_name == "Сравнение" and hidden_in_original:
-            st.info(f"В этой серии скрыто позиций во вкладке Оригинал: {len(hidden_in_original)}. Они найдены в Уценке и/или Совместимых, поэтому в рабочий поиск не добавляются.")
+            st.info(f"В этой серии есть позиций с совпадениями по OEM-коду: {len(hidden_in_original)}. Во вкладке Оригинал они остаются видимыми, но часть цен поставщиков по ним будет скрываться.")
             summary_html = original_reason_summary_html({norm: blocked_map[norm] for norm in hidden_in_original if norm in blocked_map})
             if summary_html:
                 st.markdown(summary_html, unsafe_allow_html=True)
@@ -2324,16 +2344,16 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
         <style>
         .series-preview-wrap {display:flex; flex-direction:column; gap:8px; margin:8px 0 12px 0;}
         .series-preview-row {display:flex; align-items:flex-start; justify-content:space-between; gap:10px; padding:10px 12px; border-radius:14px; border:1px solid #dbe5f1; background:linear-gradient(180deg,#ffffff 0%,#f8fbff 100%);}
-        .series-preview-row.series-hidden {background:linear-gradient(180deg,#f5f7fb 0%,#eef2f7 100%); border-color:#d7dde8; opacity:.72;}
+        .series-preview-row.series-hidden {background:linear-gradient(180deg,#fff8f0 0%,#fff3e2 100%); border-color:#f4d7a7; opacity:1;}
         .series-preview-main {min-width:0;}
         .series-preview-article {font-size:13px; font-weight:900; color:#0f172a; margin-bottom:3px;}
-        .series-preview-row.series-hidden .series-preview-article {color:#64748b;}
+        .series-preview-row.series-hidden .series-preview-article {color:#9a6700;}
         .series-preview-name {font-size:12px; line-height:1.45; color:#475569;}
-        .series-preview-row.series-hidden .series-preview-name {color:#7b8797;}
+        .series-preview-row.series-hidden .series-preview-name {color:#7c5a10;}
         .series-preview-meta {font-size:11px; color:#64748b; margin-top:5px;}
         .series-preview-tag {display:inline-flex; align-items:center; padding:5px 9px; border-radius:999px; font-size:11px; font-weight:900; white-space:nowrap;}
         .series-preview-tag.visible {background:#e8f7ee; color:#15803d;}
-        .series-preview-tag.hidden {background:#eef2f7; color:#64748b; border:1px solid #d7dde8;}
+        .series-preview-tag.hidden {background:#fff3e2; color:#9a6700; border:1px solid #f4d7a7;}
         </style>
         """, unsafe_allow_html=True)
         preview_rows = []
@@ -2341,7 +2361,7 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
             norm = str(c["article_norm"])
             reasons = blocked_map.get(norm, [])
             hidden = bool(reasons)
-            tag_text = original_reason_short_tag(reasons) if hidden else "[доступно]"
+            tag_text = ("есть совпадения: " + original_reason_short_tag(reasons)) if hidden else "[доступно]"
             tag_class = "hidden" if hidden else "visible"
             preview_rows.append((hidden, f"""
                 <div class='series-preview-row {'series-hidden' if hidden else ''}'>
@@ -2361,7 +2381,7 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
         for c in series_candidates:
             norm = str(c["article_norm"])
             reasons = blocked_map.get(norm, [])
-            prefix = "⚪ " if reasons else "🟢 "
+            prefix = "🟠 " if reasons else "🟢 "
             label = f"{prefix}{c['article']} — свободно: {fmt_qty(c['free_qty'])} • {fmt_price_with_rub(c['sale_price'])} • {c['name']}"
             if reasons:
                 label += f" • {original_reason_short_tag(reasons)}"
@@ -2378,28 +2398,18 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
         add_clicked = c_add.button("Добавить отмеченные в поиск", use_container_width=True, key=f"series_add_{prefix_key}")
         if add_clicked and selected_norms:
             selected_articles = []
-            skipped_articles = []
             selected_set = set(selected_norms)
             for c in series_candidates:
                 norm = str(c["article_norm"])
                 if norm not in selected_set:
                     continue
-                if sheet_name == "Сравнение" and blocked_map.get(norm):
-                    skipped_articles.append(str(c["article"]))
-                    continue
                 selected_articles.append(str(c["article"]))
-            if not selected_articles:
-                st.warning("Все отмеченные позиции этой серии сейчас скрыты во вкладке Оригинал из-за совпадений с Уценкой и/или Совместимыми.")
-            else:
+            if selected_articles:
                 normalized_query = "\n".join(unique_preserve_order(selected_articles))
                 st.session_state[search_key] = normalized_query
                 st.session_state[submitted_key] = normalized_query
                 st.session_state[result_key] = search_in_df(sheet_df, normalized_query, search_mode)
-                st.session_state[f"series_skip_msg_{prefix_key}"] = "Скрыты и не добавлены в поиск: " + ", ".join(unique_preserve_order(skipped_articles)) if skipped_articles else ""
                 st.rerun()
-        skip_msg = st.session_state.get(f"series_skip_msg_{prefix_key}", "")
-        if skip_msg:
-            st.caption(skip_msg)
         st.markdown('</div>', unsafe_allow_html=True)
 
     if not isinstance(sheet_df, pd.DataFrame):
