@@ -41,6 +41,14 @@ PHOTO_COLUMN_ALIASES = {
     ],
 }
 
+PHOTO_META_COLUMN_ALIASES = {
+    "color": ["czvet", "цвет", "color"],
+    "iso_pages": ["resurs-po-iso-str", "ресурс-по-iso-стр", "ресурс", "iso", "pages"],
+    "manufacturer_code": ["kod-proizvoditelya", "код-производителя", "код производителя"],
+    "model": ["model", "модель"],
+    "fits_models": ["podhodit-k-modelyam", "подходит-к-моделям", "подходит к моделям"],
+}
+
 AVITO_COLUMN_ALIASES = {
     "ad_id": ["Номер объявления", "ID объявления", "Номер"],
     "title": ["Название объявления", "Заголовок", "Название"],
@@ -211,6 +219,100 @@ def fmt_qty(value: Any) -> str:
     if float(val).is_integer():
         return str(int(val))
     return f"{val:,.2f}".replace(",", " ").replace(".", ",")
+
+
+
+COLOR_TEMPLATE_KEYWORDS = [
+    ("пурпур", "пурпурный"),
+    ("magenta", "пурпурный"),
+    ("голуб", "голубой"),
+    ("cyan", "голубой"),
+    ("желт", "желтый"),
+    ("yellow", "желтый"),
+    ("черн", "черный"),
+    ("black", "черный"),
+    ("син", "синий"),
+    ("blue", "синий"),
+    ("красн", "красный"),
+    ("red", "красный"),
+    ("зел", "зеленый"),
+    ("green", "зеленый"),
+    ("сер", "серый"),
+    ("grey", "серый"),
+    ("gray", "серый"),
+]
+
+
+def extract_color_from_text(value: object) -> str:
+    text = contains_text(value)
+    if not text:
+        return ""
+    for needle, label in COLOR_TEMPLATE_KEYWORDS:
+        if contains_text(needle) in text:
+            return label
+    return ""
+
+
+def extract_iso_pages_from_text(value: object) -> str:
+    raw = normalize_text(value)
+    if not raw:
+        return ""
+    m = re.search(r"(\d[\d\s]{1,})\s*(?:стр|страниц)", raw, flags=re.IGNORECASE)
+    if not m:
+        m = re.search(r"(\d[\d\s]{1,})\s*стр", raw, flags=re.IGNORECASE)
+    if not m:
+        return ""
+    digits = re.sub(r"\s+", "", m.group(1))
+    if not digits:
+        return ""
+    try:
+        return f"{int(digits):,}".replace(",", " ")
+    except Exception:
+        return digits
+
+
+def normalize_pages_value(value: object) -> str:
+    raw = normalize_text(value)
+    if not raw:
+        return ""
+    digits = re.sub(r"[^\d]", "", raw)
+    if digits:
+        try:
+            return f"{int(digits):,}".replace(",", " ")
+        except Exception:
+            return digits
+    return raw
+
+
+def compose_article_template_label(row: pd.Series) -> str:
+    article = normalize_text(row.get("article", ""))
+    color = normalize_text(row.get("meta_color", "")) or extract_color_from_text(row.get("name", ""))
+    pages = normalize_pages_value(row.get("meta_iso_pages", "")) or extract_iso_pages_from_text(row.get("name", ""))
+
+    details = []
+    if color:
+        details.append(color)
+    if pages:
+        details.append(f"{pages} стр")
+
+    if details:
+        return f"{article} ({', '.join(details)})"
+    return article
+
+
+def row_optional_template_lines(row: pd.Series) -> list[str]:
+    lines: list[str] = []
+    model = normalize_text(row.get("meta_model", ""))
+    manufacturer_code = normalize_text(row.get("meta_manufacturer_code", ""))
+    fits_models = normalize_text(row.get("meta_fits_models", ""))
+
+    if model:
+        lines.append(f"Модель - {model}")
+    if manufacturer_code:
+        lines.append(f"Код производителя - {manufacturer_code}")
+    if fits_models:
+        lines.append(f"Подходит к моделям - {fits_models}")
+    return lines
 
 
 def round_up_to_100(value: float) -> int:
@@ -738,6 +840,10 @@ def load_comparison_workbook(file_name: str, file_bytes: bytes) -> dict[str, pd.
 @st.cache_data(show_spinner=False)
 def load_photo_map_file(file_name: str, file_bytes: bytes) -> pd.DataFrame:
     suffix = Path(file_name).suffix.lower()
+    result_columns = [
+        "article", "article_norm", "photo_url", "source_sheet", "sheet_priority",
+        "meta_color", "meta_iso_pages", "meta_manufacturer_code", "meta_model", "meta_fits_models",
+    ]
 
     def _sheet_priority(sheet_name: str) -> int:
         name = contains_text(sheet_name)
@@ -747,10 +853,16 @@ def load_photo_map_file(file_name: str, file_bytes: bytes) -> pd.DataFrame:
             return 20
         return 10
 
+    def _safe_meta(raw: pd.DataFrame, mapping: dict[str, Optional[str]], key: str) -> pd.Series:
+        col = mapping.get(key)
+        if col and col in raw.columns:
+            return raw[col].map(normalize_text)
+        return pd.Series([""] * len(raw), index=raw.index, dtype=object)
+
     def _from_raw(raw: pd.DataFrame, sheet_name: str = "") -> pd.DataFrame:
         raw = raw.dropna(how="all")
         if raw.empty:
-            return pd.DataFrame(columns=["article", "article_norm", "photo_url", "source_sheet", "sheet_priority"])
+            return pd.DataFrame(columns=result_columns)
 
         raw = raw.copy()
         raw.columns = [normalize_text(c) for c in raw.columns]
@@ -783,17 +895,65 @@ def load_photo_map_file(file_name: str, file_bytes: bytes) -> pd.DataFrame:
             if best_col is not None and best_hits > 0:
                 mapping["photo_url"] = best_col
 
-        if not mapping.get("article") or not mapping.get("photo_url"):
-            return pd.DataFrame(columns=["article", "article_norm", "photo_url", "source_sheet", "sheet_priority"])
+        meta_mapping = detect_mapping(raw, PHOTO_META_COLUMN_ALIASES)
+
+        if not mapping.get("article"):
+            return pd.DataFrame(columns=result_columns)
 
         out = pd.DataFrame()
         out["article"] = raw[mapping["article"]].map(normalize_text)
         out["article_norm"] = raw[mapping["article"]].map(normalize_article)
-        out["photo_url"] = raw[mapping["photo_url"]].map(extract_first_url)
+        if mapping.get("photo_url"):
+            out["photo_url"] = raw[mapping["photo_url"]].map(extract_first_url)
+        else:
+            out["photo_url"] = ""
         out["source_sheet"] = sheet_name
         out["sheet_priority"] = _sheet_priority(sheet_name)
-        out = out[(out["article_norm"] != "") & (out["photo_url"] != "")].reset_index(drop=True)
-        return out
+        out["meta_color"] = _safe_meta(raw, meta_mapping, "color")
+        out["meta_iso_pages"] = _safe_meta(raw, meta_mapping, "iso_pages")
+        out["meta_manufacturer_code"] = _safe_meta(raw, meta_mapping, "manufacturer_code")
+        out["meta_model"] = _safe_meta(raw, meta_mapping, "model")
+        out["meta_fits_models"] = _safe_meta(raw, meta_mapping, "fits_models")
+
+        meta_any = (
+            out["meta_color"].ne("")
+            | out["meta_iso_pages"].ne("")
+            | out["meta_manufacturer_code"].ne("")
+            | out["meta_model"].ne("")
+            | out["meta_fits_models"].ne("")
+        )
+        out = out[(out["article_norm"] != "") & ((out["photo_url"] != "") | meta_any)].reset_index(drop=True)
+        return out[result_columns]
+
+    def _collapse_rows(df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty:
+            return pd.DataFrame(columns=result_columns[:-1])
+
+        sort_df = df.sort_values(["sheet_priority", "article_norm"]).reset_index(drop=True)
+
+        def _first_nonempty(series: pd.Series) -> str:
+            for value in series:
+                txt = normalize_text(value)
+                if txt:
+                    return txt
+            return ""
+
+        rows: list[dict[str, object]] = []
+        for article_norm, grp in sort_df.groupby("article_norm", sort=False):
+            grp = grp.sort_values(["sheet_priority"]).reset_index(drop=True)
+            first = grp.iloc[0]
+            rows.append({
+                "article": _first_nonempty(grp["article"]),
+                "article_norm": article_norm,
+                "photo_url": _first_nonempty(grp["photo_url"]),
+                "source_sheet": _first_nonempty(grp["source_sheet"]),
+                "meta_color": _first_nonempty(grp["meta_color"]),
+                "meta_iso_pages": _first_nonempty(grp["meta_iso_pages"]),
+                "meta_manufacturer_code": _first_nonempty(grp["meta_manufacturer_code"]),
+                "meta_model": _first_nonempty(grp["meta_model"]),
+                "meta_fits_models": _first_nonempty(grp["meta_fits_models"]),
+            })
+        return pd.DataFrame(rows)
 
     if suffix == ".csv":
         bio = io.BytesIO(file_bytes)
@@ -804,9 +964,8 @@ def load_photo_map_file(file_name: str, file_bytes: bytes) -> pd.DataFrame:
             raw = pd.read_csv(bio, encoding="cp1251")
         out = _from_raw(raw, "CSV")
         if out.empty:
-            raise ValueError("В файле фото нужны колонки с артикулом и ссылкой на фото.")
-        out = out.sort_values(["sheet_priority", "article_norm"]).drop_duplicates(subset=["article_norm"], keep="first").reset_index(drop=True)
-        return out[["article", "article_norm", "photo_url", "source_sheet"]]
+            raise ValueError("В файле фото нужны колонки с артикулом, а фото или метаданные могут подтягиваться из этого же файла.")
+        return _collapse_rows(out)
 
     sheets = pd.read_excel(io.BytesIO(file_bytes), sheet_name=None)
     parts: list[pd.DataFrame] = []
@@ -816,23 +975,38 @@ def load_photo_map_file(file_name: str, file_bytes: bytes) -> pd.DataFrame:
             parts.append(part)
 
     if not parts:
-        raise ValueError("В файле фото нужны колонки с артикулом и ссылкой на фото.")
+        raise ValueError("В файле фото нужны колонки с артикулом и хотя бы с фото или полезными полями из Worksheet.")
 
     combined = pd.concat(parts, ignore_index=True)
-    combined = combined.sort_values(["sheet_priority", "article_norm"]).drop_duplicates(subset=["article_norm"], keep="first").reset_index(drop=True)
-    return combined[["article", "article_norm", "photo_url", "source_sheet"]]
+    return _collapse_rows(combined)
 
 
 def apply_photo_map(df: pd.DataFrame | None, photo_df: pd.DataFrame | None) -> pd.DataFrame | None:
     if df is None:
         return None
     out = df.copy()
+    default_meta = {
+        "photo_url": "",
+        "photo_name": "",
+        "meta_color": "",
+        "meta_iso_pages": "",
+        "meta_manufacturer_code": "",
+        "meta_model": "",
+        "meta_fits_models": "",
+    }
     if photo_df is None or photo_df.empty:
-        out["photo_url"] = out.get("photo_url", "")
-        out["photo_name"] = out.get("photo_name", "")
+        for col, default in default_meta.items():
+            out[col] = out.get(col, default)
         return out
-    lookup = dict(zip(photo_df["article_norm"], photo_df["photo_url"]))
-    out["photo_url"] = out["article_norm"].map(lambda x: lookup.get(x, ""))
+
+    meta_cols = ["photo_url", "meta_color", "meta_iso_pages", "meta_manufacturer_code", "meta_model", "meta_fits_models"]
+    lookup_df = photo_df[["article_norm", *[c for c in meta_cols if c in photo_df.columns]]].drop_duplicates(subset=["article_norm"], keep="first")
+    out = out.merge(lookup_df, how="left", on="article_norm")
+
+    for col, default in default_meta.items():
+        if col not in out.columns:
+            out[col] = default
+        out[col] = out[col].fillna(default).map(normalize_text)
     out["photo_name"] = out["name"]
     return out
 
@@ -1388,14 +1562,16 @@ def build_offer_template(df: pd.DataFrame, query: str, round100: bool, footer_te
     lines: list[str] = []
     hashtags: list[str] = []
     for _, row in result_df.iterrows():
+        article_head = compose_article_template_label(row)
         if safe_float(row.get("free_qty"), 0.0) > 0:
             avito_raw = safe_float(row.get("sale_price"), 0.0) * (1 - DEFAULT_DISCOUNT_1 / 100)
             cash_raw = avito_raw * 0.90
             avito = round_up_to_100(avito_raw) if round100 else round(avito_raw)
             cash = round_to_nearest_100(cash_raw) if round100 else round(cash_raw)
-            lines.append(f"{row['article']} --- {fmt_price(avito)} руб. - Авито / {fmt_price(cash)} руб. за наличный расчет")
+            lines.append(f"{article_head} --- {fmt_price(avito)} руб. - Авито / {fmt_price(cash)} руб. за наличный расчет")
+            lines.extend(row_optional_template_lines(row))
         else:
-            lines.append(f"{row['article']} --- продан")
+            lines.append(f"{article_head} --- продан")
         hashtags.append(f"#{normalize_article(row['article'])}")
     footer = [normalize_text(x) for x in str(footer_text).splitlines() if normalize_text(x)]
     if footer:
