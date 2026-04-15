@@ -40,7 +40,7 @@ PERSISTED_COMPARISON_FILENAME = "comparison_latest.xlsx"
 PERSISTED_META_SUFFIX = ".meta.json"
 
 FALLBACK_PHOTO_DOMAINS = ["rashodniki.ru", "t-toner.ru", "interlink.ru", "mrimage.ru"]
-FALLBACK_SEARCH_LIMIT = 2
+FALLBACK_SEARCH_LIMIT = 6
 
 
 def get_server_data_dir() -> Path:
@@ -1790,15 +1790,132 @@ def extract_image_candidates_from_html(html_text: str, page_url: str, article: s
     return [u for _, u in candidates]
 
 
+def _clean_candidate_href(href: str, base_url: str, domain: str) -> str:
+    href = normalize_text(href)
+    if not href:
+        return ""
+    href = html.unescape(href)
+    href = urljoin(base_url, href)
+    if 'duckduckgo.com/l/?uddg=' in href:
+        m = re.search(r'uddg=([^&]+)', href)
+        if m:
+            href = unquote(m.group(1))
+    if domain not in href:
+        return ""
+    low = href.lower()
+    bad_bits = ['#', '/cart', '/checkout', '/compare', '/wishlist', '/login', '/register', '/blog', '/news', '/contacts', '/delivery', '/privacy', '/policy']
+    if any(bit in low for bit in bad_bits):
+        return ""
+    return href
+
+
+def _extract_product_links_from_html(html_text: str, base_url: str, article: str, domain: str) -> list[str]:
+    if not normalize_text(html_text):
+        return []
+    article = normalize_text(article)
+    article_norm = normalize_article(article)
+    found: list[tuple[int, str]] = []
+    seen: set[str] = set()
+
+    def _score(href: str, text: str) -> int:
+        href_low = href.lower()
+        text_norm = _normalized_page_text(text)
+        score = 0
+        if article_norm and article_norm in re.sub(r'[^A-Za-z0-9]', '', href_low).upper():
+            score += 25
+        if article_norm and article_norm in text_norm:
+            score += 20
+        if any(k in href_low for k in ['/product/', '/shop/', '/kartrid', '/kartridzhi/', '/internet-magazin/']):
+            score += 8
+        if any(k in href_low for k in ['original', 'detail', 'chern', 'black', 'pantum', 'brother', 'hp', 'canon', 'xerox']):
+            score += 3
+        if any(k in href_low for k in ['/search', '?s=', 'component/search']):
+            score -= 8
+        return score
+
+    if BeautifulSoup is not None:
+        soup = BeautifulSoup(html_text, 'html.parser')
+        for a in soup.find_all('a'):
+            href = _clean_candidate_href(a.get('href') or '', base_url, domain)
+            if not href or href in seen:
+                continue
+            text = normalize_text(a.get_text(' ', strip=True))
+            sc = _score(href, text)
+            if sc <= 0:
+                continue
+            seen.add(href)
+            found.append((sc, href))
+    for raw in re.findall(r"href=[\"']([^\"']+)[\"']", html_text, flags=re.IGNORECASE):
+        href = _clean_candidate_href(raw, base_url, domain)
+        if not href or href in seen:
+            continue
+        sc = _score(href, href)
+        if sc <= 0:
+            continue
+        seen.add(href)
+        found.append((sc, href))
+
+    found.sort(key=lambda x: (-x[0], x[1]))
+    return [u for _, u in found[:FALLBACK_SEARCH_LIMIT]]
+
+
+def _site_search_urls(article: str, domain: str) -> list[str]:
+    q = quote_plus(article)
+    if domain == 't-toner.ru':
+        return [
+            f'https://{domain}/?s={q}&post_type=product',
+            f'https://{domain}/?s={q}',
+        ]
+    if domain == 'interlink.ru':
+        return [
+            f'https://{domain}/?s={q}',
+            f'https://{domain}/search/?q={q}',
+        ]
+    if domain == 'mrimage.ru':
+        return [
+            f'https://{domain}/?s={q}',
+            f'https://{domain}/search?keyword={q}',
+        ]
+    if domain == 'rashodniki.ru':
+        return [
+            f'https://{domain}/component/search/?searchword={q}',
+            f'https://{domain}/search?searchword={q}',
+        ]
+    return []
+
+
 def discover_product_pages(article: str, domain: str) -> list[str]:
     article = normalize_text(article)
     if not article or requests is None:
         return []
+
+    found: list[str] = []
+    seen: set[str] = set()
+
+    def _append(urls: list[str]) -> None:
+        for u in urls:
+            if not u or u in seen:
+                continue
+            seen.add(u)
+            found.append(u)
+            if len(found) >= FALLBACK_SEARCH_LIMIT:
+                return
+
+    # 1) Сначала пробуем внутренний поиск сайта — он обычно точнее, чем общий web-search.
+    for search_url in _site_search_urls(article, domain):
+        html_text = fetch_url_text(search_url, timeout=12)
+        if not html_text:
+            continue
+        _append(_extract_product_links_from_html(html_text, search_url, article, domain))
+        if len(found) >= FALLBACK_SEARCH_LIMIT:
+            return found
+
+    # 2) Потом fallback через DuckDuckGo, если сайт сам ничего не отдал.
     queries = [
         f"site:{domain} {article}",
         f'site:{domain} "{article}"',
+        f'site:{domain} {article} оригинальный',
     ]
-    found: list[str] = []
     for q in queries:
         for search_url in [
             f"https://duckduckgo.com/html/?q={quote_plus(q)}",
@@ -1807,19 +1924,9 @@ def discover_product_pages(article: str, domain: str) -> list[str]:
             html_text = fetch_url_text(search_url, timeout=10)
             if not html_text:
                 continue
-            for raw in re.findall(r"href=[\"']([^\"']+)[\"']", html_text, flags=re.IGNORECASE):
-                href = html.unescape(raw)
-                href = urljoin(search_url, href)
-                if 'duckduckgo.com/l/?uddg=' in href:
-                    m = re.search(r'uddg=([^&]+)', href)
-                    if m:
-                        href = unquote(m.group(1))
-                if domain not in href:
-                    continue
-                if href not in found:
-                    found.append(href)
-                if len(found) >= FALLBACK_SEARCH_LIMIT:
-                    return found
+            _append(_extract_product_links_from_html(html_text, search_url, article, domain))
+            if len(found) >= FALLBACK_SEARCH_LIMIT:
+                return found
     return found
 
 
@@ -2788,7 +2895,11 @@ def render_results_table(df: pd.DataFrame, price_mode: str, round100: bool, cust
                 candidate_urls = [normalize_text(x) for x in raw_candidates if normalize_text(x)]
             if photo_url and photo_url not in candidate_urls:
                 candidate_urls.insert(0, photo_url)
-            candidate_urls = candidate_urls[:4]
+            # Убираем дубли, но сохраняем порядок: 1 сайт = 1 кандидат.
+            seen_c = set()
+            candidate_urls = [u for u in candidate_urls if not (u in seen_c or seen_c.add(u))][:4]
+            if not photo_url and candidate_urls:
+                photo_url = candidate_urls[0]
         if show_photos and photo_url:
             photo_html = f"""
             <a href="{html.escape(photo_url, quote=True)}" target="_blank" class="photo-wrap">
@@ -2804,7 +2915,7 @@ def render_results_table(df: pd.DataFrame, price_mode: str, round100: bool, cust
             thumbs = []
             for idx, c_url in enumerate(candidate_urls[:4]):
                 thumbs.append(
-                    f"<a href='{html.escape(c_url, quote=True)}' target='_blank' class='photo-thumb-wrap {'active' if idx == 0 else ''}'><img src='{html.escape(c_url, quote=True)}' class='photo-thumb' loading='lazy'></a>"
+                    f"<a href='{html.escape(c_url, quote=True)}' target='_blank' class='photo-thumb-wrap {'active' if idx == 0 else ''}' title='Кандидат {idx+1}'><img src='{html.escape(c_url, quote=True)}' class='photo-thumb' loading='lazy'></a>"
                 )
             candidate_html = "<div class='photo-candidates'>" + "".join(thumbs) + "</div>"
 
