@@ -1649,6 +1649,8 @@ def render_manual_photo_manager(display_result_df: pd.DataFrame | None, tab_key:
     )
     current_row = missing[missing["article"] == selected_article].iloc[0] if selected_article in set(missing["article"].astype(str).tolist()) else None
     st.caption(f"Сохраняем ссылку для артикула: {selected_article}")
+    if st.session_state.pop(f"manual_photo_clear_{tab_key}", False):
+        st.session_state.pop(f"manual_photo_url_{tab_key}", None)
     manual_url = st.text_input(
         "Ссылка на изображение",
         key=f"manual_photo_url_{tab_key}",
@@ -1659,7 +1661,7 @@ def render_manual_photo_manager(display_result_df: pd.DataFrame | None, tab_key:
         try:
             save_manual_photo_url(selected_article, manual_url)
             st.session_state[f"manual_photo_message_{tab_key}"] = f"Фото для {selected_article} сохранено."
-            st.session_state[f"manual_photo_url_{tab_key}"] = ""
+            st.session_state[f"manual_photo_clear_{tab_key}"] = True
             st.rerun()
         except Exception as exc:
             st.error(f"Не удалось сохранить фото: {exc}")
