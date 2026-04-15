@@ -1594,6 +1594,51 @@ def build_selected_price_template(df: pd.DataFrame, query: str, price_mode: str,
     return "\n\n".join(parts)
 
 
+
+
+def build_offer_template_from_result_df(result_df: pd.DataFrame, round100: bool, footer_text: str) -> str:
+    if result_df is None or result_df.empty:
+        return ""
+    lines: list[str] = []
+    hashtags: list[str] = []
+    for _, row in result_df.iterrows():
+        article_head = compose_article_template_label(row)
+        if safe_float(row.get("free_qty"), 0.0) > 0:
+            avito_raw = safe_float(row.get("sale_price"), 0.0) * (1 - DEFAULT_DISCOUNT_1 / 100)
+            cash_raw = avito_raw * 0.90
+            avito = round_up_to_100(avito_raw) if round100 else round(avito_raw)
+            cash = round_to_nearest_100(cash_raw) if round100 else round(cash_raw)
+            lines.append(f"{article_head} --- {fmt_price(avito)} руб. - Авито / {fmt_price(cash)} руб. за наличный расчет")
+        else:
+            lines.append(f"{article_head} --- продан")
+        hashtags.append(f"#{normalize_article(row['article'])}")
+
+    shared_lines = build_template_shared_lines(result_df)
+    footer = [normalize_text(x) for x in str(footer_text).splitlines() if normalize_text(x)]
+    out_lines: list[str] = []
+    out_lines.extend(lines)
+    if shared_lines:
+        out_lines.append("")
+        out_lines.extend(shared_lines)
+    if footer:
+        out_lines.extend(footer)
+    if hashtags:
+        out_lines.append(",".join(unique_preserve_order(hashtags)))
+    return "\n".join(out_lines)
+
+
+def build_selected_price_template_from_result_df(result_df: pd.DataFrame, price_mode: str, round100: bool, custom_discount: float) -> str:
+    if result_df is None or result_df.empty:
+        return ""
+    parts: list[str] = []
+    for _, row in result_df.iterrows():
+        if safe_float(row.get("free_qty"), 0.0) <= 0:
+            continue
+        selected_price = get_selected_price_raw(row, price_mode, round100, custom_discount)
+        parts.append(f"{normalize_text(row['name'])} --- {fmt_price(selected_price)} руб.")
+    return "\n\n".join(parts)
+
+
 def find_avito_ads(avito_df: pd.DataFrame, result_df: pd.DataFrame) -> pd.DataFrame:
     if avito_df is None or avito_df.empty or result_df is None or result_df.empty:
         return pd.DataFrame()
@@ -2520,25 +2565,7 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
         .series-preview-tag.hidden {background:#fff3e2; color:#9a6700; border:1px solid #f4d7a7;}
         </style>
         """, unsafe_allow_html=True)
-        preview_rows = []
-        for c in series_candidates:
-            norm = str(c["article_norm"])
-            reasons = []
-            hidden = False
-            tag_text = "[доступно]"
-            tag_class = "visible"
-            preview_rows.append((hidden, f"""
-                <div class='series-preview-row {'series-hidden' if hidden else ''}'>
-                  <div class='series-preview-main'>
-                    <div class='series-preview-article'>{html.escape(str(c['article']))}</div>
-                    <div class='series-preview-name'>{html.escape(str(c['name']))}</div>
-                    <div class='series-preview-meta'>Свободно: {html.escape(fmt_qty(c['free_qty']))} • {html.escape(fmt_price_with_rub(c['sale_price']))}</div>
-                  </div>
-                  <div class='series-preview-tag {tag_class}'>{html.escape(tag_text)}</div>
-                </div>
-            """))
-        preview_rows = sorted(preview_rows, key=lambda x: (x[0],))
-        st.markdown("<div class='series-preview-wrap'>" + "".join(row_html for _, row_html in preview_rows) + "</div>", unsafe_allow_html=True)
+        # Убрали визуальный preview-блок серии по просьбе пользователя: остаётся только выбор позиций.
 
         options = [str(c["article_norm"]) for c in sorted(series_candidates, key=series_sort_key)]
         format_map = {}
