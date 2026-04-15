@@ -20,6 +20,85 @@ import streamlit.components.v1 as components
 st.set_page_config(page_title="Мой Товар", page_icon="📦", layout="wide")
 
 APP_TITLE = "Мой Товар"
+
+
+SERVER_DATA_DIRNAME = "data"
+PERSISTED_PHOTO_FILENAME = "photo_catalog_latest.xlsx"
+PERSISTED_AVITO_FILENAME = "avito_latest.xlsx"
+PERSISTED_META_SUFFIX = ".meta.json"
+
+
+def get_server_data_dir() -> Path:
+    try:
+        base = Path(__file__).resolve().with_name(SERVER_DATA_DIRNAME)
+    except Exception:
+        base = Path.cwd() / SERVER_DATA_DIRNAME
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
+def get_persisted_photo_file_path() -> Path:
+    return get_server_data_dir() / PERSISTED_PHOTO_FILENAME
+
+
+def get_persisted_avito_file_path() -> Path:
+    return get_server_data_dir() / PERSISTED_AVITO_FILENAME
+
+
+def get_persisted_meta_path(file_path: Path) -> Path:
+    return file_path.with_suffix(file_path.suffix + PERSISTED_META_SUFFIX)
+
+
+def read_persisted_original_name(file_path: Path, default_name: str) -> str:
+    meta_path = get_persisted_meta_path(file_path)
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            name = normalize_text(meta.get("original_name", ""))
+            if name:
+                return name
+        except Exception:
+            pass
+    return default_name
+
+
+def save_uploaded_source_file(target_path: Path, file_bytes: bytes, original_name: str) -> None:
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    target_path.write_bytes(file_bytes)
+    meta_path = get_persisted_meta_path(target_path)
+    meta_path.write_text(json.dumps({
+        "original_name": normalize_text(original_name),
+        "saved_at": datetime.utcnow().isoformat(timespec="seconds"),
+        "size": len(file_bytes),
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def load_persisted_photo_source_into_state() -> bool:
+    target = get_persisted_photo_file_path()
+    if not target.exists():
+        return False
+    try:
+        raw = target.read_bytes()
+        df = load_photo_map_file(read_persisted_original_name(target, target.name), raw)
+        st.session_state.photo_df = df
+        st.session_state.photo_name = read_persisted_original_name(target, target.name) + " • из /data"
+        return True
+    except Exception:
+        return False
+
+
+def load_persisted_avito_source_into_state() -> bool:
+    target = get_persisted_avito_file_path()
+    if not target.exists():
+        return False
+    try:
+        raw = target.read_bytes()
+        st.session_state.avito_df = load_avito_file(read_persisted_original_name(target, target.name), raw)
+        st.session_state.avito_name = read_persisted_original_name(target, target.name) + " • из /data"
+        return True
+    except Exception:
+        return False
+
 DEFAULT_DISCOUNT_1 = 12.0
 DEFAULT_DISCOUNT_2 = 20.0
 DEFAULT_TEMPLATE1_FOOTER = (
@@ -1425,6 +1504,13 @@ def ensure_photo_registry_loaded() -> None:
             st.session_state.photo_name = "из реестра сервера"
 
 
+def ensure_persisted_source_files_loaded() -> None:
+    if (not isinstance(st.session_state.get("photo_df"), pd.DataFrame) or st.session_state.get("photo_df").empty) and get_persisted_photo_file_path().exists():
+        load_persisted_photo_source_into_state()
+    if (not isinstance(st.session_state.get("avito_df"), pd.DataFrame) or st.session_state.get("avito_df").empty) and get_persisted_avito_file_path().exists():
+        load_persisted_avito_source_into_state()
+
+
 def init_state() -> None:
     defaults = {
         "comparison_sheets": {},
@@ -1461,6 +1547,7 @@ def init_state() -> None:
 
 init_state()
 ensure_photo_registry_loaded()
+ensure_persisted_source_files_loaded()
 
 
 def rebuild_current_df() -> None:
@@ -2820,13 +2907,14 @@ with st.sidebar:
     if photo_uploaded is not None:
         try:
             photo_bytes = photo_uploaded.getvalue()
+            save_uploaded_source_file(get_persisted_photo_file_path(), photo_bytes, photo_uploaded.name)
             photo_sig = hashlib.md5(photo_bytes).hexdigest()
             loaded_photo_df = load_photo_map_file(photo_uploaded.name, photo_bytes)
             if st.session_state.get("photo_last_sync_sig", "") != photo_sig:
                 photo_stats = sync_photo_registry(loaded_photo_df, photo_uploaded.name)
                 st.session_state.photo_registry_stats = photo_stats
                 st.session_state.photo_registry_message = (
-                    f"Синхронизация фото: новых {photo_stats.get('new', 0)}, обновлённых {photo_stats.get('changed', 0)}, без изменений {photo_stats.get('unchanged', 0)}"
+                    f"Синхронизация фото: новых {photo_stats.get('new', 0)}, обновлённых {photo_stats.get('changed', 0)}, без изменений {photo_stats.get('unchanged', 0)}. Исходник сохранён в /data"
                 )
                 st.session_state.photo_last_sync_sig = photo_sig
             reg_df = load_photo_registry_df()
@@ -2838,14 +2926,16 @@ with st.sidebar:
                 ]].copy()
             else:
                 st.session_state.photo_df = loaded_photo_df
-            st.session_state.photo_name = photo_uploaded.name
+            st.session_state.photo_name = photo_uploaded.name + " • сохранён в /data"
             rebuild_current_df()
             refresh_all_search_results()
         except Exception as exc:
             st.error(f"Ошибка файла фото: {exc}")
     else:
-        ensure_photo_registry_loaded()
+        if not load_persisted_photo_source_into_state():
+            ensure_photo_registry_loaded()
     st.markdown(f'<div class="sidebar-status">Фото: {html.escape(st.session_state.get("photo_name", "ещё не загружен"))}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="sidebar-mini">Файл на сервере: {html.escape(str(get_persisted_photo_file_path()))}</div>', unsafe_allow_html=True)
     if st.session_state.get("photo_registry_message"):
         st.markdown(f'<div class="sidebar-mini">{html.escape(st.session_state.get("photo_registry_message"))}</div>', unsafe_allow_html=True)
     st.markdown(f'<div class="sidebar-mini">{html.escape(photo_registry_summary_text())}</div>', unsafe_allow_html=True)
@@ -2857,19 +2947,23 @@ with st.sidebar:
     if avito_uploaded is not None:
         try:
             avito_bytes = avito_uploaded.getvalue()
+            save_uploaded_source_file(get_persisted_avito_file_path(), avito_bytes, avito_uploaded.name)
             avito_sig = hashlib.md5(avito_bytes).hexdigest()
             st.session_state.avito_df = load_avito_file(avito_uploaded.name, avito_bytes)
-            st.session_state.avito_name = avito_uploaded.name
+            st.session_state.avito_name = avito_uploaded.name + " • сохранён в /data"
             if st.session_state.get("avito_last_sync_sig", "") != avito_sig:
                 sync_stats = sync_avito_registry(st.session_state.avito_df, avito_uploaded.name)
                 st.session_state.avito_registry_stats = sync_stats
                 st.session_state.avito_registry_message = (
-                    f"Синхронизация: новых {sync_stats.get('new', 0)}, изменённых {sync_stats.get('changed', 0)}, без изменений {sync_stats.get('unchanged', 0)}"
+                    f"Синхронизация: новых {sync_stats.get('new', 0)}, изменённых {sync_stats.get('changed', 0)}, без изменений {sync_stats.get('unchanged', 0)}. Исходник сохранён в /data"
                 )
                 st.session_state.avito_last_sync_sig = avito_sig
         except Exception as exc:
             st.error(f"Ошибка файла Авито: {exc}")
+    else:
+        load_persisted_avito_source_into_state()
     st.markdown(f'<div class="sidebar-status">Авито: {html.escape(st.session_state.get("avito_name", "ещё не загружен"))}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="sidebar-mini">Файл на сервере: {html.escape(str(get_persisted_avito_file_path()))}</div>', unsafe_allow_html=True)
     if st.session_state.get("avito_registry_message"):
         st.markdown(f'<div class="sidebar-mini">{html.escape(st.session_state.get("avito_registry_message"))}</div>', unsafe_allow_html=True)
     st.markdown(f'<div class="sidebar-mini">{html.escape(registry_summary_text())}</div>', unsafe_allow_html=True)
