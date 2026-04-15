@@ -1248,6 +1248,183 @@ def registry_summary_text() -> str:
     return f"В реестре: {len(df)} • активных: {active} • менялись: {changed}"
 
 
+
+def get_photo_registry_path() -> Path:
+    try:
+        return Path(__file__).resolve().with_name("photo_registry.sqlite")
+    except Exception:
+        return Path.cwd() / "photo_registry.sqlite"
+
+
+def ensure_photo_registry() -> None:
+    path = get_photo_registry_path()
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS photo_registry (
+                article_norm TEXT PRIMARY KEY,
+                article TEXT,
+                photo_url TEXT,
+                source_sheet TEXT,
+                meta_color TEXT,
+                meta_iso_pages TEXT,
+                meta_manufacturer_code TEXT,
+                meta_model TEXT,
+                meta_fits_models TEXT,
+                first_seen TEXT,
+                last_seen TEXT,
+                last_changed_at TEXT,
+                import_name TEXT,
+                change_count INTEGER DEFAULT 0
+            )
+            """
+        )
+        conn.commit()
+
+
+def load_photo_registry_df() -> pd.DataFrame:
+    path = get_photo_registry_path()
+    if not path.exists():
+        return pd.DataFrame()
+    with sqlite3.connect(path) as conn:
+        df = pd.read_sql_query("SELECT * FROM photo_registry", conn)
+    if df.empty:
+        return df
+    for col in [
+        "article", "article_norm", "photo_url", "source_sheet",
+        "meta_color", "meta_iso_pages", "meta_manufacturer_code",
+        "meta_model", "meta_fits_models", "first_seen", "last_seen",
+        "last_changed_at", "import_name",
+    ]:
+        if col in df.columns:
+            df[col] = df[col].fillna("").map(normalize_text)
+    return df
+
+
+def photo_registry_summary_text() -> str:
+    df = load_photo_registry_df()
+    if df.empty:
+        return "Реестр фото пуст"
+    with_photo = int(df.get("photo_url", pd.Series(dtype=object)).fillna("").map(lambda x: 1 if normalize_text(x) else 0).sum())
+    with_meta = int((
+        df.get("meta_model", pd.Series(dtype=object)).fillna("").map(bool)
+        | df.get("meta_fits_models", pd.Series(dtype=object)).fillna("").map(bool)
+        | df.get("meta_color", pd.Series(dtype=object)).fillna("").map(bool)
+        | df.get("meta_iso_pages", pd.Series(dtype=object)).fillna("").map(bool)
+    ).sum())
+    return f"В реестре: {len(df)} • с фото: {with_photo} • с метаданными: {with_meta}"
+
+
+def sync_photo_registry(photo_df: pd.DataFrame, import_name: str) -> dict[str, Any]:
+    ensure_photo_registry()
+    path = get_photo_registry_path()
+    now = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    work = photo_df.copy() if isinstance(photo_df, pd.DataFrame) else pd.DataFrame()
+    if work.empty:
+        return {"new": 0, "changed": 0, "unchanged": 0, "total": 0}
+
+    use_cols = [
+        "article", "article_norm", "photo_url", "source_sheet",
+        "meta_color", "meta_iso_pages", "meta_manufacturer_code",
+        "meta_model", "meta_fits_models",
+    ]
+    for col in use_cols:
+        if col not in work.columns:
+            work[col] = ""
+    work = work[use_cols].copy()
+    work = work[work["article_norm"].map(normalize_text) != ""].copy()
+    work = work.drop_duplicates(subset=["article_norm"], keep="first").reset_index(drop=True)
+
+    stats = {"new": 0, "changed": 0, "unchanged": 0, "total": len(work)}
+    tracked_cols = [
+        "article", "photo_url", "source_sheet",
+        "meta_color", "meta_iso_pages", "meta_manufacturer_code",
+        "meta_model", "meta_fits_models",
+    ]
+
+    with sqlite3.connect(path) as conn:
+        existing = {}
+        keys = work["article_norm"].tolist()
+        if keys:
+            placeholders = ",".join(["?"] * len(keys))
+            for row in conn.execute(f"SELECT * FROM photo_registry WHERE article_norm IN ({placeholders})", keys):
+                cols = [d[0] for d in conn.execute("SELECT * FROM photo_registry LIMIT 0").description]
+                existing[row[0]] = dict(zip(cols, row))
+
+        for _, rec in work.iterrows():
+            key = normalize_text(rec.get("article_norm", ""))
+            if not key:
+                continue
+            payload = {col: normalize_text(rec.get(col, "")) for col in tracked_cols}
+            old = existing.get(key)
+            if old is None:
+                conn.execute(
+                    """
+                    INSERT INTO photo_registry (
+                        article_norm, article, photo_url, source_sheet,
+                        meta_color, meta_iso_pages, meta_manufacturer_code, meta_model, meta_fits_models,
+                        first_seen, last_seen, last_changed_at, import_name, change_count
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                    """,
+                    (
+                        key, payload["article"], payload["photo_url"], payload["source_sheet"],
+                        payload["meta_color"], payload["meta_iso_pages"], payload["meta_manufacturer_code"], payload["meta_model"], payload["meta_fits_models"],
+                        now, now, now, normalize_text(import_name),
+                    ),
+                )
+                stats["new"] += 1
+            else:
+                changed = any(normalize_text(old.get(col, "")) != payload[col] for col in tracked_cols)
+                if changed:
+                    change_count = int(old.get("change_count") or 0) + 1
+                    conn.execute(
+                        """
+                        UPDATE photo_registry SET
+                            article=?,
+                            photo_url=?,
+                            source_sheet=?,
+                            meta_color=?,
+                            meta_iso_pages=?,
+                            meta_manufacturer_code=?,
+                            meta_model=?,
+                            meta_fits_models=?,
+                            last_seen=?,
+                            last_changed_at=?,
+                            import_name=?,
+                            change_count=?
+                        WHERE article_norm=?
+                        """,
+                        (
+                            payload["article"], payload["photo_url"], payload["source_sheet"],
+                            payload["meta_color"], payload["meta_iso_pages"], payload["meta_manufacturer_code"], payload["meta_model"], payload["meta_fits_models"],
+                            now, now, normalize_text(import_name), change_count, key,
+                        ),
+                    )
+                    stats["changed"] += 1
+                else:
+                    conn.execute(
+                        "UPDATE photo_registry SET last_seen=?, import_name=? WHERE article_norm=?",
+                        (now, normalize_text(import_name), key),
+                    )
+                    stats["unchanged"] += 1
+        conn.commit()
+    return stats
+
+
+def ensure_photo_registry_loaded() -> None:
+    if isinstance(st.session_state.get("photo_df"), pd.DataFrame) and not st.session_state.get("photo_df").empty:
+        return
+    reg = load_photo_registry_df()
+    if isinstance(reg, pd.DataFrame) and not reg.empty:
+        st.session_state.photo_df = reg[[
+            "article", "article_norm", "photo_url", "source_sheet",
+            "meta_color", "meta_iso_pages", "meta_manufacturer_code",
+            "meta_model", "meta_fits_models",
+        ]].copy()
+        if normalize_text(st.session_state.get("photo_name", "")) in {"", "ещё не загружен"}:
+            st.session_state.photo_name = "из реестра сервера"
+
+
 def init_state() -> None:
     defaults = {
         "comparison_sheets": {},
@@ -1256,6 +1433,9 @@ def init_state() -> None:
         "current_df": None,
         "photo_df": None,
         "photo_name": "ещё не загружен",
+        "photo_registry_message": "",
+        "photo_registry_stats": {},
+        "photo_last_sync_sig": "",
         "avito_df": None,
         "avito_name": "ещё не загружен",
         "avito_registry_message": "",
@@ -1280,6 +1460,7 @@ def init_state() -> None:
 
 
 init_state()
+ensure_photo_registry_loaded()
 
 
 def rebuild_current_df() -> None:
@@ -2634,17 +2815,40 @@ with st.sidebar:
     st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown('<div class="sidebar-card">', unsafe_allow_html=True)
-    render_sidebar_card_header("Фото товаров", "🖼️", "Файл с артикулами и ссылками на фото. Картинка показывается прямо в результатах поиска.")
+    render_sidebar_card_header("Фото товаров", "🖼️", "Файл с артикулами и ссылками на фото. Можно держать его в реестре на сервере и дозагружать только новинки/изменения.")
     photo_uploaded = st.file_uploader("Загрузить файл фото", type=["xlsx", "xls", "xlsm", "csv"], key="photo_uploader", label_visibility="collapsed")
     if photo_uploaded is not None:
         try:
-            st.session_state.photo_df = load_photo_map_file(photo_uploaded.name, photo_uploaded.getvalue())
+            photo_bytes = photo_uploaded.getvalue()
+            photo_sig = hashlib.md5(photo_bytes).hexdigest()
+            loaded_photo_df = load_photo_map_file(photo_uploaded.name, photo_bytes)
+            if st.session_state.get("photo_last_sync_sig", "") != photo_sig:
+                photo_stats = sync_photo_registry(loaded_photo_df, photo_uploaded.name)
+                st.session_state.photo_registry_stats = photo_stats
+                st.session_state.photo_registry_message = (
+                    f"Синхронизация фото: новых {photo_stats.get('new', 0)}, обновлённых {photo_stats.get('changed', 0)}, без изменений {photo_stats.get('unchanged', 0)}"
+                )
+                st.session_state.photo_last_sync_sig = photo_sig
+            reg_df = load_photo_registry_df()
+            if isinstance(reg_df, pd.DataFrame) and not reg_df.empty:
+                st.session_state.photo_df = reg_df[[
+                    "article", "article_norm", "photo_url", "source_sheet",
+                    "meta_color", "meta_iso_pages", "meta_manufacturer_code",
+                    "meta_model", "meta_fits_models",
+                ]].copy()
+            else:
+                st.session_state.photo_df = loaded_photo_df
             st.session_state.photo_name = photo_uploaded.name
             rebuild_current_df()
             refresh_all_search_results()
         except Exception as exc:
             st.error(f"Ошибка файла фото: {exc}")
+    else:
+        ensure_photo_registry_loaded()
     st.markdown(f'<div class="sidebar-status">Фото: {html.escape(st.session_state.get("photo_name", "ещё не загружен"))}</div>', unsafe_allow_html=True)
+    if st.session_state.get("photo_registry_message"):
+        st.markdown(f'<div class="sidebar-mini">{html.escape(st.session_state.get("photo_registry_message"))}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="sidebar-mini">{html.escape(photo_registry_summary_text())}</div>', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown('<div class="sidebar-card">', unsafe_allow_html=True)
