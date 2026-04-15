@@ -1515,6 +1515,7 @@ def init_state() -> None:
     defaults = {
         "comparison_sheets": {},
         "comparison_name": "ещё не загружен",
+        "comparison_version": "",
         "selected_sheet": "Сравнение",
         "current_df": None,
         "photo_df": None,
@@ -1563,7 +1564,6 @@ def rebuild_current_df() -> None:
 
 def refresh_all_search_results() -> None:
     sheets = st.session_state.get("comparison_sheets", {})
-    photo_df = st.session_state.get("photo_df")
     search_mode = st.session_state.get("search_mode", "Умный")
     tab_specs = [
         ("Сравнение", "original"),
@@ -1572,17 +1572,17 @@ def refresh_all_search_results() -> None:
     ]
     for sheet_name, tab_key in tab_specs:
         base_df = sheets.get(sheet_name) if isinstance(sheets, dict) else None
-        if isinstance(base_df, pd.DataFrame):
-            sheet_df = apply_photo_map(base_df, photo_df)
-        else:
-            sheet_df = None
         submitted_key = f"submitted_query_{tab_key}"
         result_key = f"last_result_{tab_key}"
+        sig_key = f"last_result_sig_{tab_key}"
         query = normalize_text(st.session_state.get(submitted_key, ""))
-        if query and isinstance(sheet_df, pd.DataFrame):
-            st.session_state[result_key] = search_in_df(sheet_df, query, search_mode)
+        desired_sig = (query, search_mode, sheet_name, st.session_state.get("comparison_version", ""))
+        if query and isinstance(base_df, pd.DataFrame):
+            st.session_state[result_key] = search_in_df(base_df, query, search_mode)
+            st.session_state[sig_key] = desired_sig
         else:
             st.session_state[result_key] = None
+            st.session_state[sig_key] = None
 
 
 def search_in_df(df: pd.DataFrame, query: str, search_mode: str) -> pd.DataFrame:
@@ -2895,6 +2895,7 @@ with st.sidebar:
         try:
             st.session_state.comparison_sheets = load_comparison_workbook(uploaded.name, uploaded.getvalue())
             st.session_state.comparison_name = uploaded.name
+            st.session_state.comparison_version = datetime.utcnow().isoformat()
             available = list(st.session_state.comparison_sheets.keys())
             if available and st.session_state.selected_sheet not in available:
                 st.session_state.selected_sheet = available[0]
@@ -2903,7 +2904,7 @@ with st.sidebar:
         except Exception as exc:
             st.error(f"Ошибка файла: {exc}")
     st.markdown(f'<div class="sidebar-status">Файл: {html.escape(st.session_state.get("comparison_name", "ещё не загружен"))}</div>', unsafe_allow_html=True)
-    st.markdown('<div class="sidebar-mini">Листы теперь открываются сверху как 3 отдельные вкладки: <b>Оригинал</b>, <b>Уценка</b>, <b>Совместимые</b>.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sidebar-mini">Рабочие разделы переключаются сверху: <b>Оригинал</b>, <b>Уценка</b>, <b>Совместимые</b>. Рендерится только активный раздел — это быстрее.</div>', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown('<div class="sidebar-card">', unsafe_allow_html=True)
@@ -2989,6 +2990,7 @@ with st.sidebar:
         if isinstance(sheets_state, dict) and sheets_state:
             updated_sheets, patch_message = apply_price_updates_to_sheets(sheets_state, st.session_state.price_patch_input)
             st.session_state.comparison_sheets = updated_sheets
+            st.session_state.comparison_version = datetime.utcnow().isoformat()
             rebuild_current_df()
             st.session_state.patch_message = patch_message
             refresh_all_search_results()
@@ -3039,27 +3041,27 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
     search_key = f"search_input_{tab_key}"
     submitted_key = f"submitted_query_{tab_key}"
     result_key = f"last_result_{tab_key}"
+    sig_key = f"last_result_sig_{tab_key}"
     if search_key not in st.session_state:
         st.session_state[search_key] = ""
     if submitted_key not in st.session_state:
         st.session_state[submitted_key] = ""
     if result_key not in st.session_state:
         st.session_state[result_key] = None
+    if sig_key not in st.session_state:
+        st.session_state[sig_key] = None
 
     base_sheet_df = sheets.get(sheet_name) if isinstance(sheets, dict) else None
     show_photos = bool(st.session_state.get("show_photos_global", True))
-    if isinstance(base_sheet_df, pd.DataFrame):
-        sheet_df = apply_photo_map(base_sheet_df, st.session_state.get("photo_df") if show_photos else None)
-    else:
-        sheet_df = None
-    source_pairs = get_source_pairs(sheet_df) if isinstance(sheet_df, pd.DataFrame) else []
+    photo_df = st.session_state.get("photo_df")
+    source_pairs = get_source_pairs(base_sheet_df) if isinstance(base_sheet_df, pd.DataFrame) else []
 
     st.markdown('<div class="toolbar">', unsafe_allow_html=True)
     render_block_header(
         f"{tab_label} — поиск товара",
-        f"Работа только по листу «{sheet_name}». Сначала артикул, потом название, если это разрешено режимом поиска.",
+        f"Работа только по листу «{sheet_name}». Рендерится только текущий раздел — это ускоряет приложение.",
         icon="🔎",
-        help_text="Приложение больше не читает сырые прайсы дистрибьюторов. Оно ищет внутри текущего листа comparison-файла и по найденным строкам пересчитывает лучшую цену поставщика по колонкам вида 'Источник цена' / 'Источник шт'.",
+        help_text="Поиск работает только по активному листу comparison-файла. Мы не рендерим все разделы сразу и не делаем лишний rerun после каждого клика.",
     )
 
     with st.form(f"search_form_{tab_key}", clear_on_submit=False):
@@ -3079,46 +3081,54 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
         )
     st.markdown('</div>', unsafe_allow_html=True)
 
+    result_df = st.session_state.get(result_key)
+
     if clear_clicked:
         st.session_state[search_key] = ""
         st.session_state[submitted_key] = ""
         st.session_state[result_key] = None
-        st.rerun()
-
-    if find_clicked:
+        st.session_state[sig_key] = None
+        result_df = None
+    elif find_clicked:
         normalized_query = normalize_query_for_display(search_value)
         st.session_state[search_key] = normalized_query
         st.session_state[submitted_key] = normalized_query
-        st.session_state[result_key] = search_in_df(sheet_df, normalized_query, search_mode) if isinstance(sheet_df, pd.DataFrame) else None
-        st.rerun()
+        desired_sig = (normalized_query, search_mode, sheet_name, st.session_state.get("comparison_version", ""))
+        if isinstance(base_sheet_df, pd.DataFrame) and normalize_text(normalized_query):
+            if st.session_state.get(sig_key) != desired_sig or result_df is None:
+                result_df = search_in_df(base_sheet_df, normalized_query, search_mode)
+                st.session_state[result_key] = result_df
+                st.session_state[sig_key] = desired_sig
+        else:
+            result_df = None
+            st.session_state[result_key] = None
+            st.session_state[sig_key] = desired_sig
 
     submitted_query = st.session_state.get(submitted_key, "")
-    result_df = st.session_state.get(result_key)
-    if isinstance(sheet_df, pd.DataFrame) and normalize_text(submitted_query):
-        refreshed_result_df = search_in_df(sheet_df, submitted_query, search_mode)
-        st.session_state[result_key] = refreshed_result_df
-        result_df = refreshed_result_df
+    desired_sig = (submitted_query, search_mode, sheet_name, st.session_state.get("comparison_version", ""))
+    if isinstance(base_sheet_df, pd.DataFrame) and normalize_text(submitted_query):
+        if st.session_state.get(sig_key) != desired_sig or result_df is None:
+            result_df = search_in_df(base_sheet_df, submitted_query, search_mode)
+            st.session_state[result_key] = result_df
+            st.session_state[sig_key] = desired_sig
+    else:
+        result_df = None
+
     min_dist_qty = float(st.session_state.get("distributor_min_qty", 1.0))
-    series_df = sheet_df.copy() if isinstance(sheet_df, pd.DataFrame) else None
+    series_df = base_sheet_df.copy() if isinstance(base_sheet_df, pd.DataFrame) else None
 
-    if sheet_name == "Сравнение":
-        render_info_banner(
-            "Оригинал — без искусственных блокировок",
-            "После правки comparison-файла приложение показывает цены поставщиков как есть. Ничего не скрываем по совпадениям с Уценкой или Совместимыми — сравнение строится напрямую по текущему файлу.",
-            icon="✅",
-            chips=["ограничения сняты", "цены считаются заново", "Merlion Pantum-исправление сохранено"],
-            tone="green",
-        )
-
-    series_info = get_series_candidates(series_df, submitted_query) if isinstance(sheet_df, pd.DataFrame) and normalize_text(submitted_query) else {"prefix": "", "candidates": []}
+    if isinstance(base_sheet_df, pd.DataFrame) and normalize_text(submitted_query):
+        series_info = get_series_candidates(series_df, submitted_query)
+    else:
+        series_info = {"prefix": "", "candidates": []}
     series_candidates = series_info.get("candidates", []) if isinstance(series_info, dict) else []
-    if isinstance(sheet_df, pd.DataFrame) and normalize_text(submitted_query) and series_candidates:
+    if isinstance(base_sheet_df, pd.DataFrame) and normalize_text(submitted_query) and series_candidates:
         st.markdown('<div class="result-wrap">', unsafe_allow_html=True)
         render_block_header(
             f"{tab_label} — серия / группа по части артикула",
             "Если вводишь только часть артикула, здесь можно быстро выбрать всю группу и одним кликом добавить нужные позиции в поиск.",
             icon="🎨",
-            help_text="Подходит для цветов, ёмкостей и серийных товаров: CE505, TK-8600, CTL-1100 и похожих групп. Сначала вводишь часть артикула, потом отмечаешь нужные позиции и добавляешь их в основной поиск текущей вкладки.",
+            help_text="Подходит для цветов, ёмкостей и серийных товаров: CE505, TK-8600, CTL-1100 и похожих групп.",
         )
         st.caption(f"По префиксу {series_info.get('prefix', '')} найдено позиций: {len(series_candidates)}")
         c_add, c_all, c_clear = st.columns(3)
@@ -3129,27 +3139,6 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
             st.session_state[f"series_selected_{prefix_key}"] = [str(c["article_norm"]) for c in series_candidates]
         if clear_all_clicked:
             st.session_state[f"series_selected_{prefix_key}"] = []
-        options = [str(c["article_norm"]) for c in series_candidates]
-        blocked_map = {}
-
-        st.markdown("""
-        <style>
-        .series-preview-wrap {display:flex; flex-direction:column; gap:8px; margin:8px 0 12px 0;}
-        .series-preview-row {display:flex; align-items:flex-start; justify-content:space-between; gap:10px; padding:10px 12px; border-radius:14px; border:1px solid #dbe5f1; background:linear-gradient(180deg,#ffffff 0%,#f8fbff 100%);}
-        .series-preview-row.series-hidden {background:linear-gradient(180deg,#fff8f0 0%,#fff3e2 100%); border-color:#f4d7a7; opacity:1;}
-        .series-preview-main {min-width:0;}
-        .series-preview-article {font-size:13px; font-weight:900; color:#0f172a; margin-bottom:3px;}
-        .series-preview-row.series-hidden .series-preview-article {color:#9a6700;}
-        .series-preview-name {font-size:12px; line-height:1.45; color:#475569;}
-        .series-preview-row.series-hidden .series-preview-name {color:#7c5a10;}
-        .series-preview-meta {font-size:11px; color:#64748b; margin-top:5px;}
-        .series-preview-tag {display:inline-flex; align-items:center; padding:5px 9px; border-radius:999px; font-size:11px; font-weight:900; white-space:nowrap;}
-        .series-preview-tag.visible {background:#e8f7ee; color:#15803d;}
-        .series-preview-tag.hidden {background:#fff3e2; color:#9a6700; border:1px solid #f4d7a7;}
-        </style>
-        """, unsafe_allow_html=True)
-        # Убрали визуальный preview-блок серии по просьбе пользователя: остаётся только выбор позиций.
-
         options = [str(c["article_norm"]) for c in sorted(series_candidates, key=series_sort_key)]
         format_map = {}
         for c in series_candidates:
@@ -3178,11 +3167,13 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
                 normalized_query = "\n".join(unique_preserve_order(selected_articles))
                 st.session_state[search_key] = normalized_query
                 st.session_state[submitted_key] = normalized_query
-                st.session_state[result_key] = search_in_df(sheet_df, normalized_query, search_mode)
-                st.rerun()
+                result_df = search_in_df(base_sheet_df, normalized_query, search_mode)
+                st.session_state[result_key] = result_df
+                st.session_state[sig_key] = (normalized_query, search_mode, sheet_name, st.session_state.get("comparison_version", ""))
+                submitted_query = normalized_query
         st.markdown('</div>', unsafe_allow_html=True)
 
-    if not isinstance(sheet_df, pd.DataFrame):
+    if not isinstance(base_sheet_df, pd.DataFrame):
         render_info_banner(
             f"Вкладка «{tab_label}» пока пуста",
             f"В comparison-файле не найден лист «{sheet_name}».",
@@ -3192,38 +3183,42 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
         )
         return
 
+    display_result_df = result_df
+    if isinstance(result_df, pd.DataFrame) and show_photos:
+        display_result_df = apply_photo_map(result_df, photo_df)
+
     if result_df is None:
         render_info_banner(
             f"{tab_label}: лист загружен",
             f"Теперь введите артикул или несколько артикулов для поиска по листу «{sheet_name}».",
             icon="✅",
-            chips=[f"строк: {len(sheet_df)}", "фото в таблице", "цены поставщиков считаются заново"],
+            chips=[f"строк: {len(base_sheet_df)}", "активен только один раздел", "тяжёлые блоки по запросу"],
             tone="green",
         )
     else:
         st.markdown('<div class="result-wrap">', unsafe_allow_html=True)
         render_block_header(
             f"{tab_label} — результаты поиска",
-            "Главная таблица по найденным позициям. Справа теперь фото, а не кнопка копирования цены.",
+            "Главная таблица по найденным позициям. Тяжёлые блоки ниже можно включать только когда они реально нужны.",
             icon="📋",
-            help_text="Если у товара есть фото по артикулу в отдельном файле, оно покажется прямо в строке результата. Если фото нет, будет заглушка.",
+            help_text="Поиск работает только по текущему разделу. Фото можно отключать глобально, а тяжёлые блоки вроде 'цены у всех', Авито и полного отчёта считаются только по запросу.",
         )
-        if result_df.empty:
+        if display_result_df.empty:
             st.warning("Ничего не найдено. Попробуйте другой артикул или часть названия.")
         else:
             compare_map = build_distributor_compare(result_df, min_qty=min_dist_qty)
             render_results_insight_dashboard(result_df, compare_map, source_pairs)
-            render_results_table(result_df.head(200), price_mode, round100, custom_discount, distributor_map=compare_map, show_photos=show_photos)
+            render_results_table(display_result_df.head(200), price_mode, round100, custom_discount, distributor_map=compare_map, show_photos=show_photos)
             st.download_button(
                 "⬇️ Скачать результаты в Excel",
-                to_excel_bytes(result_df, price_mode, round100, custom_discount, min_dist_qty),
+                to_excel_bytes(display_result_df, price_mode, round100, custom_discount, min_dist_qty),
                 file_name=f"moy_tovar_search_results_{tab_key}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
                 key=f"download_results_{tab_key}",
             )
             with st.expander("Показать техническую таблицу"):
-                tech = result_df.copy()
+                tech = display_result_df.copy()
                 tech["Наша цена"] = tech["sale_price"].map(fmt_price)
                 tech["Наш склад"] = tech["free_qty"].map(fmt_qty)
                 tech["Лучшая цена"] = tech.apply(lambda row: (get_best_offer(row, min_qty=min_dist_qty) or {}).get("price_fmt", ""), axis=1)
@@ -3231,43 +3226,8 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
                 tech["Фото"] = tech.get("photo_url", "")
                 tech = tech[["article", "name", "Наша цена", "Наш склад", "Лучший поставщик", "Лучшая цена", "Фото"]].rename(columns={"article": "Артикул", "name": "Название"})
                 st.dataframe(tech, use_container_width=True, hide_index=True)
-        st.markdown('</div>', unsafe_allow_html=True)
 
-        if not result_df.empty:
-            st.markdown('<div class="result-wrap">', unsafe_allow_html=True)
-            render_block_header(
-                f"{tab_label} — показать цены у всех",
-                "Здесь для каждой найденной позиции показываются все доступные поставщики из колонок текущего comparison-листа.",
-                icon="🏷️",
-            )
-            render_info_banner(
-                "Что здесь важно",
-                "Берём только пары колонок 'Источник цена' и 'Источник шт'. Готовые поля 'Мин. у конкурентов' и 'Разница' из Excel не используются вообще.",
-                icon="🧠",
-                chips=["свои расчёты", "динамические источники", "работает и для новых колонок"],
-                tone="green",
-            )
-            render_all_prices_block(result_df, min_dist_qty, price_mode, round100, custom_discount, widget_key_prefix=tab_key)
-            st.markdown('</div>', unsafe_allow_html=True)
-
-            st.markdown('<div class="result-wrap">', unsafe_allow_html=True)
-            render_info_banner(
-                "Файл для согласования с руководителем",
-                "Этот экспорт собирает базовую аналитику по найденным товарам: ваш текущий прод, лучшую цену поставщика и поля, которые удобно дозаполнить вручную перед обсуждением новых цен.",
-                icon="🗂️",
-                chips=["артикул и количество уже заполнены", "лучшая цена дистрибьютора уже внутри", "готово для обсуждения"],
-                tone="blue",
-            )
-            st.download_button(
-                "⬇️ Скачать анализ товара",
-                build_product_analysis_workbook_bytes(result_df, min_qty=min_dist_qty),
-                file_name=f"analysis_for_manager_{tab_key}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=False,
-                key=f"download_analysis_{tab_key}",
-            )
-            st.markdown('</div>', unsafe_allow_html=True)
-
+            result_enriched_for_templates = apply_photo_map(result_df, photo_df) if isinstance(result_df, pd.DataFrame) else result_df
             st.markdown('<div class="result-wrap">', unsafe_allow_html=True)
             render_block_header(
                 f"{tab_label} — шаблоны",
@@ -3276,16 +3236,58 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
             )
             t1, t2 = st.columns(2)
             with t1:
-                template1 = build_offer_template_from_result_df(result_df, round100, st.session_state.template1_footer)
+                template1 = build_offer_template_from_result_df(result_enriched_for_templates, round100, st.session_state.template1_footer)
                 st.session_state[f"template1_{tab_key}"] = template1
                 st.text_area("Шаблон 1", height=300, key=f"template1_{tab_key}")
             with t2:
-                template2 = build_selected_price_template_from_result_df(result_df, price_mode, round100, custom_discount)
+                template2 = build_selected_price_template_from_result_df(result_enriched_for_templates, price_mode, round100, custom_discount)
                 st.session_state[f"template2_{tab_key}"] = template2
                 st.text_area("Шаблон 2", height=300, key=f"template2_{tab_key}")
             st.markdown('</div>', unsafe_allow_html=True)
 
-            if isinstance(st.session_state.get("avito_df"), pd.DataFrame) and not st.session_state.avito_df.empty:
+            lazy_c1, lazy_c2, lazy_c3, lazy_c4 = st.columns(4)
+            lazy_c1.checkbox("Показать цены у всех", key=f"lazy_all_prices_{tab_key}")
+            lazy_c2.checkbox("Файл для руководителя", key=f"lazy_analysis_{tab_key}")
+            lazy_c3.checkbox("Показать Авито", key=f"lazy_avito_{tab_key}")
+            lazy_c4.checkbox("Считать отчёт по листу", key=f"lazy_report_{tab_key}")
+
+            if st.session_state.get(f"lazy_all_prices_{tab_key}", False):
+                st.markdown('<div class="result-wrap">', unsafe_allow_html=True)
+                render_block_header(
+                    f"{tab_label} — показать цены у всех",
+                    "Здесь для каждой найденной позиции показываются все доступные поставщики из колонок текущего comparison-листа.",
+                    icon="🏷️",
+                )
+                render_info_banner(
+                    "Что здесь важно",
+                    "Берём только пары колонок 'Источник цена' и 'Источник шт'. Готовые поля 'Мин. у конкурентов' и 'Разница' из Excel не используются вообще.",
+                    icon="🧠",
+                    chips=["свои расчёты", "динамические источники", "работает и для новых колонок"],
+                    tone="green",
+                )
+                render_all_prices_block(result_df, min_dist_qty, price_mode, round100, custom_discount, widget_key_prefix=tab_key)
+                st.markdown('</div>', unsafe_allow_html=True)
+
+            if st.session_state.get(f"lazy_analysis_{tab_key}", False):
+                st.markdown('<div class="result-wrap">', unsafe_allow_html=True)
+                render_info_banner(
+                    "Файл для согласования с руководителем",
+                    "Этот экспорт собирает базовую аналитику по найденным товарам: ваш текущий прод, лучшую цену поставщика и поля, которые удобно дозаполнить вручную перед обсуждением новых цен.",
+                    icon="🗂️",
+                    chips=["артикул и количество уже заполнены", "лучшая цена дистрибьютора уже внутри", "готово для обсуждения"],
+                    tone="blue",
+                )
+                st.download_button(
+                    "⬇️ Скачать анализ товара",
+                    build_product_analysis_workbook_bytes(result_df, min_qty=min_dist_qty),
+                    file_name=f"analysis_for_manager_{tab_key}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=False,
+                    key=f"download_analysis_{tab_key}",
+                )
+                st.markdown('</div>', unsafe_allow_html=True)
+
+            if st.session_state.get(f"lazy_avito_{tab_key}", False) and isinstance(st.session_state.get("avito_df"), pd.DataFrame) and not st.session_state.avito_df.empty:
                 st.markdown('<div class="result-wrap">', unsafe_allow_html=True)
                 render_block_header(
                     f"{tab_label} — Авито",
@@ -3295,31 +3297,34 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
                 render_avito_block(st.session_state.avito_df, result_df)
                 st.markdown('</div>', unsafe_allow_html=True)
 
-    st.markdown('<div class="result-wrap">', unsafe_allow_html=True)
-    render_block_header(
-        f"{tab_label} — отчёт по листу",
-        "Полный отчёт по выбранному листу: где поставщик реально дешевле нас на заданный процент.",
-        icon="📊",
-        help_text="Отчёт строится по всему текущему листу, а не только по поисковой выдаче. Порог и минимальный остаток меняются в sidebar.",
-    )
-    report_df = build_report_df(sheet_df, st.session_state.distributor_threshold, st.session_state.distributor_min_qty)
-    if report_df.empty:
-        st.info("По текущему листу нет позиций, которые проходят ваш порог выгоды.")
-    else:
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Строк в отчёте", len(report_df))
-        c2.metric("Порог", f"{fmt_qty(st.session_state.distributor_threshold)}%")
-        c3.metric("Источников", len(source_pairs))
-        st.dataframe(report_df, use_container_width=True, hide_index=True, height=420)
-        st.download_button(
-            "⬇️ Скачать отчёт по листу",
-            report_to_excel_bytes(report_df),
-            file_name=f"moy_tovar_report_{tab_key}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-            key=f"download_report_{tab_key}",
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    if st.session_state.get(f"lazy_report_{tab_key}", False):
+        st.markdown('<div class="result-wrap">', unsafe_allow_html=True)
+        render_block_header(
+            f"{tab_label} — отчёт по листу",
+            "Полный отчёт по выбранному листу: где поставщик реально дешевле нас на заданный процент.",
+            icon="📊",
+            help_text="Отчёт строится по всему текущему листу, а не только по поисковой выдаче. Порог и минимальный остаток меняются в sidebar.",
         )
-    st.markdown('</div>', unsafe_allow_html=True)
+        report_df = build_report_df(base_sheet_df, st.session_state.distributor_threshold, st.session_state.distributor_min_qty)
+        if report_df.empty:
+            st.info("По текущему листу нет позиций, которые проходят ваш порог выгоды.")
+        else:
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Строк в отчёте", len(report_df))
+            c2.metric("Порог", f"{fmt_qty(st.session_state.distributor_threshold)}%")
+            c3.metric("Источников", len(source_pairs))
+            st.dataframe(report_df, use_container_width=True, hide_index=True, height=420)
+            st.download_button(
+                "⬇️ Скачать отчёт по листу",
+                report_to_excel_bytes(report_df),
+                file_name=f"moy_tovar_report_{tab_key}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key=f"download_report_{tab_key}",
+            )
+        st.markdown('</div>', unsafe_allow_html=True)
 
 
 if not isinstance(sheets, dict) or not sheets:
@@ -3334,16 +3339,24 @@ else:
     if "show_photos_global" not in st.session_state:
         st.session_state["show_photos_global"] = True
 
-    toggle_l, toggle_r = st.columns([4, 1.25])
-    toggle_l.caption("Показать фото — общий переключатель для всех вкладок. Когда фото выключены, поиск и таблицы обычно работают быстрее.")
-    toggle_r.checkbox("Показать фото", key="show_photos_global")
-
     tab_specs = [
         ("Сравнение", "Оригинал", "original"),
         ("Уценка", "Уценка", "discount"),
         ("Совместимые", "Совместимые", "compatible"),
     ]
-    tabs = st.tabs([label for _, label, _ in tab_specs])
-    for tab, (sheet_name, tab_label, tab_key) in zip(tabs, tab_specs):
-        with tab:
-            render_sheet_workspace(sheet_name, tab_label, tab_key)
+    label_to_spec = {label: (sheet_name, label, tab_key) for sheet_name, label, tab_key in tab_specs}
+    if "active_workspace_label" not in st.session_state:
+        st.session_state["active_workspace_label"] = "Оригинал"
+
+    switch_l, switch_r = st.columns([4, 1.25])
+    switch_l.radio(
+        "Раздел",
+        options=[label for _, label, _ in tab_specs],
+        key="active_workspace_label",
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+    switch_r.checkbox("Показать фото", key="show_photos_global")
+
+    active_sheet_name, active_tab_label, active_tab_key = label_to_spec[st.session_state.get("active_workspace_label", "Оригинал")]
+    render_sheet_workspace(active_sheet_name, active_tab_label, active_tab_key)
