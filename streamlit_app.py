@@ -3227,29 +3227,31 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
                 tech = tech[["article", "name", "Наша цена", "Наш склад", "Лучший поставщик", "Лучшая цена", "Фото"]].rename(columns={"article": "Артикул", "name": "Название"})
                 st.dataframe(tech, use_container_width=True, hide_index=True)
 
-            result_enriched_for_templates = apply_photo_map(result_df, photo_df) if isinstance(result_df, pd.DataFrame) else result_df
-            st.markdown('<div class="result-wrap">', unsafe_allow_html=True)
-            render_block_header(
-                f"{tab_label} — шаблоны",
-                "Два быстрых шаблона для ответа или публикации по найденным позициям.",
-                icon="🧾",
-            )
-            t1, t2 = st.columns(2)
-            with t1:
-                template1 = build_offer_template_from_result_df(result_enriched_for_templates, round100, st.session_state.template1_footer)
-                st.session_state[f"template1_{tab_key}"] = template1
-                st.text_area("Шаблон 1", height=300, key=f"template1_{tab_key}")
-            with t2:
-                template2 = build_selected_price_template_from_result_df(result_enriched_for_templates, price_mode, round100, custom_discount)
-                st.session_state[f"template2_{tab_key}"] = template2
-                st.text_area("Шаблон 2", height=300, key=f"template2_{tab_key}")
-            st.markdown('</div>', unsafe_allow_html=True)
-
-            lazy_c1, lazy_c2, lazy_c3, lazy_c4 = st.columns(4)
+            lazy_c0, lazy_c1, lazy_c2, lazy_c3, lazy_c4 = st.columns(5)
+            lazy_c0.checkbox("Показать шаблоны", key=f"lazy_templates_{tab_key}")
             lazy_c1.checkbox("Показать цены у всех", key=f"lazy_all_prices_{tab_key}")
             lazy_c2.checkbox("Файл для руководителя", key=f"lazy_analysis_{tab_key}")
             lazy_c3.checkbox("Показать Авито", key=f"lazy_avito_{tab_key}")
             lazy_c4.checkbox("Считать отчёт по листу", key=f"lazy_report_{tab_key}")
+
+            if st.session_state.get(f"lazy_templates_{tab_key}", False):
+                result_enriched_for_templates = apply_photo_map(result_df, photo_df) if isinstance(result_df, pd.DataFrame) else result_df
+                st.markdown('<div class="result-wrap">', unsafe_allow_html=True)
+                render_block_header(
+                    f"{tab_label} — шаблоны",
+                    "Два быстрых шаблона для ответа или публикации по найденным позициям.",
+                    icon="🧾",
+                )
+                t1, t2 = st.columns(2)
+                with t1:
+                    template1 = build_offer_template_from_result_df(result_enriched_for_templates, round100, st.session_state.template1_footer)
+                    st.session_state[f"template1_{tab_key}"] = template1
+                    st.text_area("Шаблон 1", height=300, key=f"template1_{tab_key}")
+                with t2:
+                    template2 = build_selected_price_template_from_result_df(result_enriched_for_templates, price_mode, round100, custom_discount)
+                    st.session_state[f"template2_{tab_key}"] = template2
+                    st.text_area("Шаблон 2", height=300, key=f"template2_{tab_key}")
+                st.markdown('</div>', unsafe_allow_html=True)
 
             if st.session_state.get(f"lazy_all_prices_{tab_key}", False):
                 st.markdown('<div class="result-wrap">', unsafe_allow_html=True)
