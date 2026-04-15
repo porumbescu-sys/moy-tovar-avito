@@ -2260,7 +2260,7 @@ def status_visual_class(status: str) -> str:
 
 
 
-def render_results_table(df: pd.DataFrame, price_mode: str, round100: bool, custom_discount: float, distributor_map: Optional[dict[str, dict[str, Any]]] = None) -> None:
+def render_results_table(df: pd.DataFrame, price_mode: str, round100: bool, custom_discount: float, distributor_map: Optional[dict[str, dict[str, Any]]] = None, show_photos: bool = True) -> None:
     selected_label = current_price_label(price_mode, custom_discount)
     distributor_map = distributor_map or {}
     rows_html = []
@@ -2309,22 +2309,26 @@ def render_results_table(df: pd.DataFrame, price_mode: str, round100: bool, cust
             </div>
             """
 
-        photo_url = normalize_text(row.get("photo_url", ""))
-        if photo_url:
+        photo_url = normalize_text(row.get("photo_url", "")) if show_photos else ""
+        if show_photos and photo_url:
             photo_html = f"""
             <a href="{html.escape(photo_url, quote=True)}" target="_blank" class="photo-wrap">
               <img src="{html.escape(photo_url, quote=True)}" class="result-photo" loading="lazy" onerror="this.style.display='none'; this.parentNode.innerHTML='<div class=&quot;photo-empty photo-empty-small&quot;>нет фото</div>';">
             </a>
             """
-        else:
+        elif show_photos:
             photo_html = "<div class='photo-empty photo-empty-small'>нет фото</div>"
+        else:
+            photo_html = ""
+
+        item_photo_html = f"<div class='item-photo'>{photo_html}</div>" if show_photos else ""
 
         rows_html.append(
             f"""
             <tr>
               <td class='item-col'>
                 <div class='item-wrap'>
-                  <div class='item-photo'>{photo_html}</div>
+                  {item_photo_html}
                   <div class='item-main'>
                     <div class='item-top'><span class='article-pill'>{html.escape(str(row['article']))}</span></div>
                     <div class='name-cell'>{html.escape(str(row['name']))}</div>
@@ -3089,6 +3093,10 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
 
     submitted_query = st.session_state.get(submitted_key, "")
     result_df = st.session_state.get(result_key)
+    if isinstance(sheet_df, pd.DataFrame) and normalize_text(submitted_query):
+        refreshed_result_df = search_in_df(sheet_df, submitted_query, search_mode)
+        st.session_state[result_key] = refreshed_result_df
+        result_df = refreshed_result_df
     min_dist_qty = float(st.session_state.get("distributor_min_qty", 1.0))
     series_df = sheet_df.copy() if isinstance(sheet_df, pd.DataFrame) else None
 
@@ -3204,7 +3212,7 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
         else:
             compare_map = build_distributor_compare(result_df, min_qty=min_dist_qty)
             render_results_insight_dashboard(result_df, compare_map, source_pairs)
-            render_results_table(result_df.head(200), price_mode, round100, custom_discount, distributor_map=compare_map)
+            render_results_table(result_df.head(200), price_mode, round100, custom_discount, distributor_map=compare_map, show_photos=show_photos)
             st.download_button(
                 "⬇️ Скачать результаты в Excel",
                 to_excel_bytes(result_df, price_mode, round100, custom_discount, min_dist_qty),
