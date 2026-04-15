@@ -11,6 +11,12 @@ import hashlib
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import quote_plus, unquote, urljoin, urlparse
+
+try:
+    import requests
+except Exception:
+    requests = None
 
 import openpyxl
 import pandas as pd
@@ -25,7 +31,11 @@ APP_TITLE = "Мой Товар"
 SERVER_DATA_DIRNAME = "data"
 PERSISTED_PHOTO_FILENAME = "photo_catalog_latest.xlsx"
 PERSISTED_AVITO_FILENAME = "avito_latest.xlsx"
+PERSISTED_COMPARISON_FILENAME = "comparison_latest.xlsx"
 PERSISTED_META_SUFFIX = ".meta.json"
+
+FALLBACK_PHOTO_DOMAINS = ["rashodniki.ru", "t-toner.ru", "interlink.ru", "mrimage.ru"]
+FALLBACK_SEARCH_LIMIT = 2
 
 
 def get_server_data_dir() -> Path:
@@ -43,6 +53,10 @@ def get_persisted_photo_file_path() -> Path:
 
 def get_persisted_avito_file_path() -> Path:
     return get_server_data_dir() / PERSISTED_AVITO_FILENAME
+
+
+def get_persisted_comparison_file_path() -> Path:
+    return get_server_data_dir() / PERSISTED_COMPARISON_FILENAME
 
 
 def get_persisted_meta_path(file_path: Path) -> Path:
@@ -95,6 +109,26 @@ def load_persisted_avito_source_into_state() -> bool:
         raw = target.read_bytes()
         st.session_state.avito_df = load_avito_file(read_persisted_original_name(target, target.name), raw)
         st.session_state.avito_name = read_persisted_original_name(target, target.name) + " • из /data"
+        return True
+    except Exception:
+        return False
+
+
+def load_persisted_comparison_source_into_state() -> bool:
+    target = get_persisted_comparison_file_path()
+    if not target.exists():
+        return False
+    try:
+        raw = target.read_bytes()
+        wb = load_comparison_workbook(read_persisted_original_name(target, target.name), raw)
+        st.session_state.comparison_sheets = wb
+        st.session_state.comparison_name = read_persisted_original_name(target, target.name) + " • из /data"
+        st.session_state.comparison_version = datetime.utcnow().isoformat()
+        available = list(wb.keys())
+        if available and st.session_state.get("selected_sheet", "Сравнение") not in available:
+            st.session_state.selected_sheet = available[0]
+        rebuild_current_df()
+        refresh_all_search_results()
         return True
     except Exception:
         return False
@@ -1505,11 +1539,237 @@ def ensure_photo_registry_loaded() -> None:
 
 
 def ensure_persisted_source_files_loaded() -> None:
+    if (not isinstance(st.session_state.get("comparison_sheets"), dict) or not st.session_state.get("comparison_sheets")) and get_persisted_comparison_file_path().exists():
+        load_persisted_comparison_source_into_state()
     if (not isinstance(st.session_state.get("photo_df"), pd.DataFrame) or st.session_state.get("photo_df").empty) and get_persisted_photo_file_path().exists():
         load_persisted_photo_source_into_state()
     if (not isinstance(st.session_state.get("avito_df"), pd.DataFrame) or st.session_state.get("avito_df").empty) and get_persisted_avito_file_path().exists():
         load_persisted_avito_source_into_state()
 
+
+
+
+def ensure_photo_web_cache_table() -> None:
+    path = get_photo_registry_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS photo_web_cache (
+                article_norm TEXT PRIMARY KEY,
+                article TEXT,
+                photo_url TEXT,
+                source_page TEXT,
+                source_domain TEXT,
+                status TEXT,
+                checked_at TEXT
+            )
+            """
+        )
+        conn.commit()
+
+
+def get_photo_web_cache(article_norm: str) -> dict[str, Any] | None:
+    article_norm = normalize_article(article_norm)
+    if not article_norm:
+        return None
+    ensure_photo_web_cache_table()
+    with sqlite3.connect(get_photo_registry_path()) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM photo_web_cache WHERE article_norm=?",
+            (article_norm,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def save_photo_web_cache(article_norm: str, article: str, photo_url: str, source_page: str, source_domain: str, status: str) -> None:
+    article_norm = normalize_article(article_norm)
+    if not article_norm:
+        return
+    ensure_photo_web_cache_table()
+    with sqlite3.connect(get_photo_registry_path()) as conn:
+        conn.execute(
+            """
+            INSERT INTO photo_web_cache (article_norm, article, photo_url, source_page, source_domain, status, checked_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(article_norm) DO UPDATE SET
+                article=excluded.article,
+                photo_url=excluded.photo_url,
+                source_page=excluded.source_page,
+                source_domain=excluded.source_domain,
+                status=excluded.status,
+                checked_at=excluded.checked_at
+            """,
+            (article_norm, normalize_text(article), normalize_text(photo_url), normalize_text(source_page), normalize_text(source_domain), normalize_text(status), datetime.utcnow().isoformat(timespec="seconds")),
+        )
+        conn.commit()
+
+
+def fetch_url_text(url: str, timeout: int = 12) -> str:
+    if not normalize_text(url):
+        return ""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36",
+        "Accept-Language": "ru,en;q=0.9",
+    }
+    try:
+        if requests is not None:
+            r = requests.get(url, headers=headers, timeout=timeout)
+            if r.ok:
+                r.encoding = r.encoding or r.apparent_encoding or "utf-8"
+                return r.text
+            return ""
+    except Exception:
+        return ""
+    return ""
+
+
+def extract_image_candidates_from_html(html_text: str, page_url: str, article_norm: str = "") -> list[str]:
+    if not normalize_text(html_text):
+        return []
+    attrs = ["content", "src", "data-src", "data-large_image", "data-zoom-image", "data-original", "href"]
+    patterns = []
+    for attr in attrs:
+        patterns.append(rf"{attr}=[\"']([^\"']+)[\"']")
+    urls: list[str] = []
+    for pat in patterns:
+        for match in re.findall(pat, html_text, flags=re.IGNORECASE):
+            url = normalize_text(match)
+            if not url:
+                continue
+            abs_url = urljoin(page_url, url)
+            low = abs_url.lower()
+            if not any(ext in low for ext in [".jpg", ".jpeg", ".png", ".webp", ".gif"]) and not any(k in low for k in ["image", "images", "product", "uploads", "cache"]):
+                continue
+            if any(k in low for k in ["logo", "icon", "favicon", "sprite", "placeholder", "blank.gif", "1x1", "captcha"]):
+                continue
+            urls.append(abs_url)
+    seen = set()
+    scored: list[tuple[int, str]] = []
+    for url in urls:
+        if url in seen:
+            continue
+        seen.add(url)
+        score = 0
+        low = url.lower()
+        if article_norm and article_norm.lower() in re.sub(r'[^a-z0-9]', '', low):
+            score += 10
+        if any(k in low for k in ["product", "goods", "item", "kartrid", "cartridge", "uploads"]):
+            score += 3
+        if low.endswith((".jpg", ".jpeg", ".png", ".webp")):
+            score += 2
+        scored.append((score, url))
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    return [u for _, u in scored]
+
+
+def discover_product_pages(article: str, domain: str) -> list[str]:
+    article = normalize_text(article)
+    if not article or requests is None:
+        return []
+    queries = [
+        f"site:{domain} {article}",
+        f'site:{domain} "{article}"',
+    ]
+    found: list[str] = []
+    for q in queries:
+        for search_url in [
+            f"https://duckduckgo.com/html/?q={quote_plus(q)}",
+            f"https://html.duckduckgo.com/html/?q={quote_plus(q)}",
+        ]:
+            html_text = fetch_url_text(search_url, timeout=10)
+            if not html_text:
+                continue
+            for raw in re.findall(r"href=[\"']([^\"']+)[\"']", html_text, flags=re.IGNORECASE):
+                href = html.unescape(raw)
+                href = urljoin(search_url, href)
+                if 'duckduckgo.com/l/?uddg=' in href:
+                    m = re.search(r'uddg=([^&]+)', href)
+                    if m:
+                        href = unquote(m.group(1))
+                if domain not in href:
+                    continue
+                if href not in found:
+                    found.append(href)
+                if len(found) >= FALLBACK_SEARCH_LIMIT:
+                    return found
+    return found
+
+
+def discover_photo_url_for_article(article: str) -> tuple[str, str, str]:
+    article_norm = normalize_article(article)
+    cached = get_photo_web_cache(article_norm)
+    if cached and normalize_text(cached.get("status", "")) in {"found", "not_found"}:
+        return (normalize_text(cached.get("photo_url", "")), normalize_text(cached.get("source_page", "")), normalize_text(cached.get("source_domain", "")))
+
+    if requests is None:
+        save_photo_web_cache(article_norm, article, "", "", "", "not_found")
+        return "", "", ""
+
+    for domain in FALLBACK_PHOTO_DOMAINS:
+        for page_url in discover_product_pages(article, domain):
+            html_text = fetch_url_text(page_url, timeout=12)
+            if not html_text:
+                continue
+            imgs = extract_image_candidates_from_html(html_text, page_url, article_norm=article_norm)
+            if imgs:
+                best = imgs[0]
+                save_photo_web_cache(article_norm, article, best, page_url, domain, "found")
+                return best, page_url, domain
+    save_photo_web_cache(article_norm, article, "", "", "", "not_found")
+    return "", "", ""
+
+
+def inject_web_photos_into_registry(found_rows: list[dict[str, str]], import_name: str = "web-fallback") -> None:
+    if not found_rows:
+        return
+    payload = pd.DataFrame(found_rows)
+    for col in ["article", "article_norm", "photo_url", "source_sheet", "meta_color", "meta_iso_pages", "meta_manufacturer_code", "meta_model", "meta_fits_models"]:
+        if col not in payload.columns:
+            payload[col] = ""
+    sync_photo_registry(payload[["article", "article_norm", "photo_url", "source_sheet", "meta_color", "meta_iso_pages", "meta_manufacturer_code", "meta_model", "meta_fits_models"]], import_name)
+
+
+def try_fill_missing_photos(df: pd.DataFrame | None, enabled: bool = False, limit: int = 12) -> pd.DataFrame | None:
+    if df is None or df.empty or not enabled:
+        return df
+    work = df.copy()
+    missing = work[work.get("photo_url", pd.Series(dtype=object)).fillna("").map(lambda x: not bool(normalize_text(x)))].head(limit)
+    if missing.empty:
+        return work
+    found_rows: list[dict[str, str]] = []
+    article_to_url: dict[str, str] = {}
+    for _, row in missing.iterrows():
+        article = normalize_text(row.get("article", ""))
+        article_norm = normalize_article(row.get("article_norm", article))
+        if not article_norm:
+            continue
+        url, source_page, domain = discover_photo_url_for_article(article)
+        if url:
+            article_to_url[article_norm] = url
+            found_rows.append({
+                "article": article or article_norm,
+                "article_norm": article_norm,
+                "photo_url": url,
+                "source_sheet": f"web:{domain}",
+                "meta_color": normalize_text(row.get("meta_color", "")),
+                "meta_iso_pages": normalize_text(row.get("meta_iso_pages", "")),
+                "meta_manufacturer_code": normalize_text(row.get("meta_manufacturer_code", "")),
+                "meta_model": normalize_text(row.get("meta_model", "")),
+                "meta_fits_models": normalize_text(row.get("meta_fits_models", "")),
+            })
+    if found_rows:
+        inject_web_photos_into_registry(found_rows)
+        work["photo_url"] = work.apply(lambda r: article_to_url.get(normalize_article(r.get("article_norm", r.get("article", ""))), normalize_text(r.get("photo_url", ""))), axis=1)
+        reg_df = load_photo_registry_df()
+        if isinstance(reg_df, pd.DataFrame) and not reg_df.empty:
+            st.session_state.photo_df = reg_df[[
+                "article", "article_norm", "photo_url", "source_sheet",
+                "meta_color", "meta_iso_pages", "meta_manufacturer_code",
+                "meta_model", "meta_fits_models",
+            ]].copy()
+    return work
 
 def init_state() -> None:
     defaults = {
@@ -1540,6 +1800,7 @@ def init_state() -> None:
         "patch_message": "",
         "distributor_threshold": 20.0,
         "distributor_min_qty": 1.0,
+        "enable_fallback_photo_parser": False,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -2889,12 +3150,14 @@ with st.sidebar:
     )
 
     st.markdown('<div class="sidebar-card">', unsafe_allow_html=True)
-    render_sidebar_card_header("Comparison-файл", "📘", "Главный файл приложения. Содержит листы Сравнение, Уценка, Совместимые.")
+    render_sidebar_card_header("Comparison-файл", "📘", "Главный файл приложения. Содержит листы Сравнение, Уценка, Совместимые. Можно хранить последний файл на сервере в /data.")
     uploaded = st.file_uploader("Загрузить comparison-файл", type=["xlsx", "xlsm"], label_visibility="collapsed")
     if uploaded is not None:
         try:
-            st.session_state.comparison_sheets = load_comparison_workbook(uploaded.name, uploaded.getvalue())
-            st.session_state.comparison_name = uploaded.name
+            comp_bytes = uploaded.getvalue()
+            save_uploaded_source_file(get_persisted_comparison_file_path(), comp_bytes, uploaded.name)
+            st.session_state.comparison_sheets = load_comparison_workbook(uploaded.name, comp_bytes)
+            st.session_state.comparison_name = uploaded.name + " • сохранён в /data"
             st.session_state.comparison_version = datetime.utcnow().isoformat()
             available = list(st.session_state.comparison_sheets.keys())
             if available and st.session_state.selected_sheet not in available:
@@ -2903,7 +3166,10 @@ with st.sidebar:
             refresh_all_search_results()
         except Exception as exc:
             st.error(f"Ошибка файла: {exc}")
+    else:
+        load_persisted_comparison_source_into_state()
     st.markdown(f'<div class="sidebar-status">Файл: {html.escape(st.session_state.get("comparison_name", "ещё не загружен"))}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="sidebar-mini">Файл на сервере: {html.escape(str(get_persisted_comparison_file_path()))}</div>', unsafe_allow_html=True)
     st.markdown('<div class="sidebar-mini">Рабочие разделы переключаются сверху: <b>Оригинал</b>, <b>Уценка</b>, <b>Совместимые</b>. Рендерится только активный раздел — это быстрее.</div>', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
@@ -2942,6 +3208,8 @@ with st.sidebar:
             ensure_photo_registry_loaded()
     st.markdown(f'<div class="sidebar-status">Фото: {html.escape(st.session_state.get("photo_name", "ещё не загружен"))}</div>', unsafe_allow_html=True)
     st.markdown(f'<div class="sidebar-mini">Файл на сервере: {html.escape(str(get_persisted_photo_file_path()))}</div>', unsafe_allow_html=True)
+    st.checkbox("Резервно искать фото на сайтах, если в нашем каталоге фото нет", key="enable_fallback_photo_parser")
+    st.markdown('<div class="sidebar-mini">Экспериментально и медленнее: если фото не найдено в нашем каталоге, приложение может попробовать найти картинку на внешних сайтах и сохранить ссылку в реестр.</div>', unsafe_allow_html=True)
     if st.session_state.get("photo_registry_message"):
         st.markdown(f'<div class="sidebar-mini">{html.escape(st.session_state.get("photo_registry_message"))}</div>', unsafe_allow_html=True)
     st.markdown(f'<div class="sidebar-mini">{html.escape(photo_registry_summary_text())}</div>', unsafe_allow_html=True)
@@ -3186,6 +3454,7 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
     display_result_df = result_df
     if isinstance(result_df, pd.DataFrame) and show_photos:
         display_result_df = apply_photo_map(result_df, photo_df)
+        display_result_df = try_fill_missing_photos(display_result_df, enabled=bool(st.session_state.get("enable_fallback_photo_parser", False)), limit=12)
 
     if result_df is None:
         render_info_banner(
