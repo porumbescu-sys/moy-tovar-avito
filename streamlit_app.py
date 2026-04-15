@@ -1566,6 +1566,109 @@ def ensure_persisted_source_files_loaded() -> None:
         load_persisted_comparison_source_into_state()
     if (not isinstance(st.session_state.get("photo_df"), pd.DataFrame) or st.session_state.get("photo_df").empty) and get_persisted_photo_file_path().exists():
         load_persisted_photo_source_into_state()
+
+
+
+def save_manual_photo_url(article: str, photo_url: str) -> dict[str, Any]:
+    article = normalize_text(article)
+    photo_url = normalize_text(photo_url)
+    if not article:
+        raise ValueError("Не указан артикул.")
+    if not photo_url or not re.match(r"^https?://", photo_url, flags=re.IGNORECASE):
+        raise ValueError("Нужна полная ссылка на фото, начиная с http:// или https://")
+
+    article_norm = normalize_article(article)
+    existing_meta: dict[str, str] = {}
+    photo_df = st.session_state.get("photo_df")
+    if isinstance(photo_df, pd.DataFrame) and not photo_df.empty and "article_norm" in photo_df.columns:
+        hit = photo_df[photo_df["article_norm"] == article_norm]
+        if not hit.empty:
+            rec = hit.iloc[0]
+            existing_meta = {
+                "meta_color": normalize_text(rec.get("meta_color", "")),
+                "meta_iso_pages": normalize_text(rec.get("meta_iso_pages", "")),
+                "meta_manufacturer_code": normalize_text(rec.get("meta_manufacturer_code", "")),
+                "meta_model": normalize_text(rec.get("meta_model", "")),
+                "meta_fits_models": normalize_text(rec.get("meta_fits_models", "")),
+            }
+
+    row = pd.DataFrame([
+        {
+            "article": article,
+            "article_norm": article_norm,
+            "photo_url": photo_url,
+            "source_sheet": "manual",
+            "meta_color": existing_meta.get("meta_color", ""),
+            "meta_iso_pages": existing_meta.get("meta_iso_pages", ""),
+            "meta_manufacturer_code": existing_meta.get("meta_manufacturer_code", ""),
+            "meta_model": existing_meta.get("meta_model", ""),
+            "meta_fits_models": existing_meta.get("meta_fits_models", ""),
+        }
+    ])
+    stats = sync_photo_registry(row, "manual-photo-ui")
+    reg_df = load_photo_registry_df()
+    if isinstance(reg_df, pd.DataFrame) and not reg_df.empty:
+        st.session_state.photo_df = reg_df[[
+            "article", "article_norm", "photo_url", "source_sheet",
+            "meta_color", "meta_iso_pages", "meta_manufacturer_code",
+            "meta_model", "meta_fits_models",
+        ]].copy()
+        st.session_state.photo_name = "из реестра сервера"
+    rebuild_current_df()
+    refresh_all_search_results()
+    return stats
+
+
+def render_manual_photo_manager(display_result_df: pd.DataFrame | None, tab_key: str) -> None:
+    if display_result_df is None or display_result_df.empty:
+        return
+    work = display_result_df.copy()
+    if "photo_url" not in work.columns:
+        work["photo_url"] = ""
+    missing = work[work["photo_url"].fillna("").map(lambda x: normalize_text(x) == "")].copy()
+    if missing.empty:
+        return
+
+    missing = missing.drop_duplicates(subset=["article_norm"], keep="first").reset_index(drop=True)
+    st.markdown('<div id="manual-photo-' + tab_key + '"></div>', unsafe_allow_html=True)
+    st.markdown('<div class="result-wrap">', unsafe_allow_html=True)
+    render_block_header(
+        "Фото нет — добавить вручную",
+        "Если по позиции нет фото, вставь прямую ссылку на картинку и сохрани. Она попадёт в реестр и дальше будет подставляться автоматически.",
+        icon="🖼️",
+        help_text="Это ручной режим вместо автопарсера. Сохраняем только ту ссылку, которую ты вставил сам, и используем её дальше как основную.",
+    )
+    options = missing["article"].astype(str).tolist()
+    labels = {str(r["article"]): f"{r['article']} — {normalize_text(r.get('name',''))[:110]}" for _, r in missing.iterrows()}
+    default_article = options[0] if options else ""
+    selected_article = st.selectbox(
+        "Позиция без фото",
+        options=options,
+        format_func=lambda x: labels.get(x, x),
+        key=f"manual_photo_article_{tab_key}",
+    )
+    current_row = missing[missing["article"] == selected_article].iloc[0] if selected_article in set(missing["article"].astype(str).tolist()) else None
+    st.caption(f"Сохраняем ссылку для артикула: {selected_article}")
+    manual_url = st.text_input(
+        "Ссылка на изображение",
+        key=f"manual_photo_url_{tab_key}",
+        placeholder="https://...jpg или https://...png",
+    )
+    c1, c2 = st.columns([1, 2])
+    if c1.button("Сохранить фото", key=f"manual_photo_save_{tab_key}", use_container_width=True):
+        try:
+            save_manual_photo_url(selected_article, manual_url)
+            st.session_state[f"manual_photo_message_{tab_key}"] = f"Фото для {selected_article} сохранено."
+            st.session_state[f"manual_photo_url_{tab_key}"] = ""
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Не удалось сохранить фото: {exc}")
+    if c2.button("Открыть ссылку", key=f"manual_photo_open_{tab_key}", use_container_width=True, disabled=not normalize_text(manual_url)):
+        st.markdown(f"[Открыть изображение]({manual_url})")
+    msg = normalize_text(st.session_state.get(f"manual_photo_message_{tab_key}", ""))
+    if msg:
+        st.success(msg)
+    st.markdown('</div>', unsafe_allow_html=True)
     if (not isinstance(st.session_state.get("avito_df"), pd.DataFrame) or st.session_state.get("avito_df").empty) and get_persisted_avito_file_path().exists():
         load_persisted_avito_source_into_state()
 
@@ -2963,7 +3066,7 @@ def status_visual_class(status: str) -> str:
 
 
 
-def render_results_table(df: pd.DataFrame, price_mode: str, round100: bool, custom_discount: float, distributor_map: Optional[dict[str, dict[str, Any]]] = None, show_photos: bool = True) -> None:
+def render_results_table(df: pd.DataFrame, price_mode: str, round100: bool, custom_discount: float, distributor_map: Optional[dict[str, dict[str, Any]]] = None, show_photos: bool = True, manual_anchor_id: str = "") -> None:
     selected_label = current_price_label(price_mode, custom_discount)
     distributor_map = distributor_map or {}
     rows_html = []
@@ -3031,7 +3134,10 @@ def render_results_table(df: pd.DataFrame, price_mode: str, round100: bool, cust
               <img src="{html.escape(photo_url, quote=True)}" class="result-photo" loading="lazy" onerror="this.style.display='none'; this.parentNode.innerHTML='<div class=&quot;photo-empty photo-empty-small&quot;>нет фото</div>';"></a>
             """
         elif show_photos:
-            photo_html = "<div class='photo-empty photo-empty-small'>нет фото</div>"
+            if manual_anchor_id:
+                photo_html = f"<a href='#{html.escape(manual_anchor_id, quote=True)}' class='photo-empty photo-empty-small photo-empty-link'>нет фото</a>"
+            else:
+                photo_html = "<div class='photo-empty photo-empty-small'>нет фото</div>"
         else:
             photo_html = ""
 
@@ -3671,8 +3777,7 @@ with st.sidebar:
             ensure_photo_registry_loaded()
     st.markdown(f'<div class="sidebar-status">Фото: {html.escape(st.session_state.get("photo_name", "ещё не загружен"))}</div>', unsafe_allow_html=True)
     st.markdown(f'<div class="sidebar-mini">Файл на сервере: {html.escape(str(get_persisted_photo_file_path()))}</div>', unsafe_allow_html=True)
-    st.checkbox("Резервно искать фото на сайтах, если в нашем каталоге фото нет", key="enable_fallback_photo_parser")
-    st.markdown('<div class="sidebar-mini">Экспериментально и медленнее: если фото не найдено в нашем каталоге, приложение может попробовать найти картинку на внешних сайтах и сохранить ссылку в реестр.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sidebar-mini">Автопоиск фото по сайтам отключён. Если у позиции нет фото, его можно добавить вручную прямо из результатов поиска — ссылка сохранится в реестр и будет использоваться дальше автоматически.</div>', unsafe_allow_html=True)
     if st.session_state.get("photo_registry_message"):
         st.markdown(f'<div class="sidebar-mini">{html.escape(st.session_state.get("photo_registry_message"))}</div>', unsafe_allow_html=True)
     st.markdown(f'<div class="sidebar-mini">{html.escape(photo_registry_summary_text())}</div>', unsafe_allow_html=True)
@@ -3917,7 +4022,6 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
     display_result_df = result_df
     if isinstance(result_df, pd.DataFrame) and show_photos:
         display_result_df = apply_photo_map(result_df, photo_df)
-        display_result_df = try_fill_missing_photos(display_result_df, enabled=bool(st.session_state.get("enable_fallback_photo_parser", False)), limit=12)
 
     if result_df is None:
         render_info_banner(
@@ -3940,7 +4044,7 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
         else:
             compare_map = build_distributor_compare(result_df, min_qty=min_dist_qty)
             render_results_insight_dashboard(result_df, compare_map, source_pairs)
-            render_results_table(display_result_df.head(200), price_mode, round100, custom_discount, distributor_map=compare_map, show_photos=show_photos)
+            render_results_table(display_result_df.head(200), price_mode, round100, custom_discount, distributor_map=compare_map, show_photos=show_photos, manual_anchor_id=f'manual-photo-{tab_key}')
             st.download_button(
                 "⬇️ Скачать результаты в Excel",
                 to_excel_bytes(display_result_df, price_mode, round100, custom_discount, min_dist_qty),
@@ -3949,6 +4053,7 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
                 use_container_width=True,
                 key=f"download_results_{tab_key}",
             )
+            render_manual_photo_manager(display_result_df.head(200) if isinstance(display_result_df, pd.DataFrame) else display_result_df, tab_key)
             with st.expander("Показать техническую таблицу"):
                 tech = display_result_df.copy()
                 tech["Наша цена"] = tech["sale_price"].map(fmt_price)
