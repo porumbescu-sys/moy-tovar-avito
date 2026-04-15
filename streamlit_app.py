@@ -6,6 +6,9 @@ import io
 import json
 import math
 import re
+import sqlite3
+import hashlib
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
@@ -51,6 +54,7 @@ AVITO_COLUMN_ALIASES = {
     "title": ["Название объявления", "Заголовок", "Название"],
     "price": ["Цена"],
     "url": ["Ссылка", "URL", "Ссылка на объявление", "Link"],
+    "account": ["Аккаунт", "account", "Кабинет", "Профиль"],
 }
 
 CYRILLIC_ARTICLE_TRANSLATION = str.maketrans({
@@ -987,9 +991,11 @@ def load_avito_file(file_name: str, file_bytes: bytes) -> pd.DataFrame:
                 "title": normalize_text(r[mapping["title"]]) if mapping.get("title") else "",
                 "price": normalize_text(r[mapping["price"]]) if mapping.get("price") else "",
                 "url": normalize_text(r[mapping["url"]]) if mapping.get("url") else "",
+                "account": normalize_text(r[mapping["account"]]) if mapping.get("account") else "",
             })
         out = pd.DataFrame(rows)
         out["title_norm"] = out["title"].map(contains_text)
+        out["registry_key"] = out.apply(build_avito_registry_key, axis=1)
         return out
 
     wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=False)
@@ -1013,6 +1019,7 @@ def load_avito_file(file_name: str, file_bytes: bytes) -> pd.DataFrame:
     title_col = find_header_index(AVITO_COLUMN_ALIASES["title"])
     price_col = find_header_index(AVITO_COLUMN_ALIASES["price"])
     url_col = find_header_index(AVITO_COLUMN_ALIASES["url"])
+    account_col = find_header_index(AVITO_COLUMN_ALIASES["account"])
     if not title_col:
         raise ValueError("Не удалось определить колонку 'Название объявления' в файле Авито.")
 
@@ -1022,6 +1029,7 @@ def load_avito_file(file_name: str, file_bytes: bytes) -> pd.DataFrame:
         title_display, title_url = cell_display_and_url(ws.cell(r, title_col))
         explicit_url = normalize_text(ws.cell(r, url_col).value) if url_col else ""
         price_value = normalize_text(ws.cell(r, price_col).value) if price_col else ""
+        account_value = normalize_text(ws.cell(r, account_col).value) if account_col else ""
         final_url = explicit_url or title_url or ad_url
         if not ad_display and not title_display:
             continue
@@ -1030,10 +1038,214 @@ def load_avito_file(file_name: str, file_bytes: bytes) -> pd.DataFrame:
             "title": title_display,
             "price": price_value,
             "url": final_url,
+            "account": account_value,
         })
     out = pd.DataFrame(rows)
     out["title_norm"] = out["title"].map(contains_text)
+    out["registry_key"] = out.apply(build_avito_registry_key, axis=1)
     return out
+
+
+def get_avito_registry_path() -> Path:
+    try:
+        return Path(__file__).resolve().with_name("avito_registry.sqlite")
+    except Exception:
+        return Path.cwd() / "avito_registry.sqlite"
+
+
+def avito_now_str() -> str:
+    return datetime.now().replace(microsecond=0).isoformat(sep=" ")
+
+
+def build_avito_registry_key(row: pd.Series | dict[str, Any]) -> str:
+    ad_id = normalize_text(row.get("ad_id", ""))
+    if ad_id:
+        return f"ad:{ad_id}"
+    seed = "|".join([
+        normalize_text(row.get("title", "")),
+        normalize_text(row.get("url", "")),
+    ])
+    return "hash:" + hashlib.md5(seed.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def ensure_avito_registry() -> None:
+    path = get_avito_registry_path()
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS avito_registry (
+                registry_key TEXT PRIMARY KEY,
+                ad_id TEXT,
+                title TEXT,
+                title_norm TEXT,
+                price_raw TEXT,
+                url TEXT,
+                account TEXT,
+                first_seen TEXT,
+                last_seen TEXT,
+                last_changed_at TEXT,
+                previous_price_raw TEXT,
+                change_count INTEGER DEFAULT 0,
+                status TEXT,
+                last_import_name TEXT
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def sync_avito_registry(avito_df: pd.DataFrame, import_name: str) -> dict[str, Any]:
+    ensure_avito_registry()
+    path = get_avito_registry_path()
+    now = avito_now_str()
+    stats = {"new": 0, "changed": 0, "unchanged": 0, "missing": 0, "total": 0}
+    if avito_df is None or avito_df.empty:
+        return stats
+
+    work = avito_df.copy()
+    work["registry_key"] = work.apply(build_avito_registry_key, axis=1)
+    work = work.drop_duplicates(subset=["registry_key"], keep="first").reset_index(drop=True)
+    stats["total"] = len(work)
+
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    try:
+        current_keys = work["registry_key"].tolist()
+        placeholders = ",".join(["?"] * len(current_keys)) if current_keys else "''"
+        existing = {}
+        if current_keys:
+            for row in conn.execute(f"SELECT * FROM avito_registry WHERE registry_key IN ({placeholders})", current_keys):
+                existing[row["registry_key"]] = dict(row)
+
+        for _, row in work.iterrows():
+            key = row["registry_key"]
+            payload = {
+                "registry_key": key,
+                "ad_id": normalize_text(row.get("ad_id", "")),
+                "title": normalize_text(row.get("title", "")),
+                "title_norm": contains_text(row.get("title", "")),
+                "price_raw": normalize_text(row.get("price", "")),
+                "url": normalize_text(row.get("url", "")),
+                "account": normalize_text(row.get("account", "")),
+                "last_import_name": normalize_text(import_name),
+            }
+            old = existing.get(key)
+            if old is None:
+                conn.execute(
+                    """
+                    INSERT INTO avito_registry
+                    (registry_key, ad_id, title, title_norm, price_raw, url, account, first_seen, last_seen, last_changed_at, previous_price_raw, change_count, status, last_import_name)
+                    VALUES (:registry_key, :ad_id, :title, :title_norm, :price_raw, :url, :account, :first_seen, :last_seen, :last_changed_at, :previous_price_raw, :change_count, :status, :last_import_name)
+                    """,
+                    {
+                        **payload,
+                        "first_seen": now,
+                        "last_seen": now,
+                        "last_changed_at": now,
+                        "previous_price_raw": "",
+                        "change_count": 0,
+                        "status": "active",
+                    },
+                )
+                stats["new"] += 1
+            else:
+                changed = any([
+                    payload["title"] != normalize_text(old.get("title", "")),
+                    payload["price_raw"] != normalize_text(old.get("price_raw", "")),
+                    payload["url"] != normalize_text(old.get("url", "")),
+                    payload["account"] != normalize_text(old.get("account", "")),
+                ])
+                if changed:
+                    conn.execute(
+                        """
+                        UPDATE avito_registry SET
+                            ad_id=:ad_id,
+                            title=:title,
+                            title_norm=:title_norm,
+                            previous_price_raw=:previous_price_raw,
+                            price_raw=:price_raw,
+                            url=:url,
+                            account=:account,
+                            last_seen=:last_seen,
+                            last_changed_at=:last_changed_at,
+                            change_count=:change_count,
+                            status='active',
+                            last_import_name=:last_import_name
+                        WHERE registry_key=:registry_key
+                        """,
+                        {
+                            **payload,
+                            "previous_price_raw": normalize_text(old.get("price_raw", "")),
+                            "last_seen": now,
+                            "last_changed_at": now,
+                            "change_count": int(old.get("change_count", 0) or 0) + 1,
+                        },
+                    )
+                    stats["changed"] += 1
+                else:
+                    conn.execute(
+                        """
+                        UPDATE avito_registry SET
+                            ad_id=:ad_id,
+                            title=:title,
+                            title_norm=:title_norm,
+                            price_raw=:price_raw,
+                            url=:url,
+                            account=:account,
+                            last_seen=:last_seen,
+                            status='active',
+                            last_import_name=:last_import_name
+                        WHERE registry_key=:registry_key
+                        """,
+                        {**payload, "last_seen": now},
+                    )
+                    stats["unchanged"] += 1
+
+        if current_keys:
+            placeholders = ",".join(["?"] * len(current_keys))
+            cur = conn.execute(
+                f"UPDATE avito_registry SET status='missing_in_latest_export' WHERE registry_key NOT IN ({placeholders}) AND status='active'",
+                current_keys,
+            )
+            stats["missing"] = cur.rowcount if cur.rowcount is not None else 0
+        conn.commit()
+    finally:
+        conn.close()
+    return stats
+
+
+def load_avito_registry_df() -> pd.DataFrame:
+    path = get_avito_registry_path()
+    if not path.exists():
+        return pd.DataFrame()
+    conn = sqlite3.connect(path)
+    try:
+        df = pd.read_sql_query("SELECT * FROM avito_registry", conn)
+    except Exception:
+        conn.close()
+        return pd.DataFrame()
+    finally:
+        conn.close()
+    if df.empty:
+        return df
+    for col in ["ad_id", "title", "price_raw", "url", "account", "status", "first_seen", "last_seen", "last_changed_at", "previous_price_raw", "last_import_name"]:
+        if col in df.columns:
+            df[col] = df[col].fillna("").map(normalize_text)
+    if "title" in df.columns:
+        df["title_norm"] = df["title"].map(contains_text)
+    return df
+
+
+def registry_summary_text() -> str:
+    df = load_avito_registry_df()
+    if df.empty:
+        return "Реестр пуст"
+    active = int((df.get("status", pd.Series(dtype=object)) == "active").sum()) if "status" in df.columns else len(df)
+    changed = int((pd.to_numeric(df.get("change_count", pd.Series(dtype=float)), errors="coerce").fillna(0) > 0).sum()) if "change_count" in df.columns else 0
+    return f"В реестре: {len(df)} • активных: {active} • менялись: {changed}"
 
 
 def init_state() -> None:
@@ -1046,6 +1258,9 @@ def init_state() -> None:
         "photo_name": "ещё не загружен",
         "avito_df": None,
         "avito_name": "ещё не загружен",
+        "avito_registry_message": "",
+        "avito_registry_stats": {},
+        "avito_last_sync_sig": "",
         "search_input": "",
         "submitted_query": "",
         "last_result": None,
@@ -1640,7 +1855,10 @@ def build_selected_price_template_from_result_df(result_df: pd.DataFrame, price_
 
 
 def find_avito_ads(avito_df: pd.DataFrame, result_df: pd.DataFrame) -> pd.DataFrame:
-    if avito_df is None or avito_df.empty or result_df is None or result_df.empty:
+    registry_df = load_avito_registry_df()
+    if (avito_df is None or avito_df.empty) and registry_df.empty:
+        return pd.DataFrame()
+    if result_df is None or result_df.empty:
         return pd.DataFrame()
     tokens = []
     for _, row in result_df.iterrows():
@@ -1650,8 +1868,17 @@ def find_avito_ads(avito_df: pd.DataFrame, result_df: pd.DataFrame) -> pd.DataFr
     tokens = unique_preserve_order(tokens)
     if not tokens:
         return pd.DataFrame()
+
+    base_df = avito_df.copy() if isinstance(avito_df, pd.DataFrame) and not avito_df.empty else registry_df.copy()
+    if base_df.empty:
+        return pd.DataFrame()
+    if "title_norm" not in base_df.columns:
+        base_df["title_norm"] = base_df["title"].map(contains_text)
+    if "registry_key" not in base_df.columns:
+        base_df["registry_key"] = base_df.apply(build_avito_registry_key, axis=1)
+
     matches = []
-    for _, row in avito_df.iterrows():
+    for _, row in base_df.iterrows():
         title_norm = contains_text(row.get("title", ""))
         hit_tokens = [t for t in tokens if t and t in compact_text(title_norm)]
         if hit_tokens:
@@ -1660,7 +1887,18 @@ def find_avito_ads(avito_df: pd.DataFrame, result_df: pd.DataFrame) -> pd.DataFr
             matches.append(item)
     if not matches:
         return pd.DataFrame()
-    return pd.DataFrame(matches).drop_duplicates(subset=["title", "url"]).reset_index(drop=True)
+
+    out = pd.DataFrame(matches).drop_duplicates(subset=["registry_key"], keep="first").reset_index(drop=True)
+    if not registry_df.empty:
+        reg = registry_df.copy()
+        if "registry_key" not in reg.columns:
+            reg["registry_key"] = reg.apply(build_avito_registry_key, axis=1)
+        reg_cols = [c for c in ["registry_key", "first_seen", "last_seen", "last_changed_at", "previous_price_raw", "change_count", "status", "account", "last_import_name"] if c in reg.columns]
+        out = out.merge(reg[reg_cols], on="registry_key", how="left", suffixes=("", "_reg"))
+        if "account_reg" in out.columns:
+            out["account"] = out["account"].where(out["account"].astype(str).str.len() > 0, out["account_reg"])
+            out = out.drop(columns=["account_reg"])
+    return out
 
 
 def render_sidebar_card_header(title: str, icon: str = "📁", help_text: str = "") -> None:
@@ -1992,7 +2230,16 @@ def render_avito_block(avito_df: pd.DataFrame, result_df: pd.DataFrame) -> None:
     for _, row in ads.head(20).iterrows():
         title = normalize_text(row.get("title", ""))
         url = normalize_text(row.get("url", ""))
-        st.markdown(f"**{html.escape(title)}**", unsafe_allow_html=True)
+        account = normalize_text(row.get("account", ""))
+        left, right = st.columns([6, 2])
+        with left:
+            st.markdown(f"**{html.escape(title)}**", unsafe_allow_html=True)
+        with right:
+            if account:
+                st.markdown(
+                    f"<div style='text-align:right;'><span style='display:inline-block;padding:6px 10px;border-radius:999px;background:#eef4ff;border:1px solid #d8e5ff;color:#315efb;font-weight:800;font-size:12px;'>{html.escape(account)}</span></div>",
+                    unsafe_allow_html=True,
+                )
         meta = []
         if normalize_text(row.get("ad_id", "")):
             meta.append(f"ID: {normalize_text(row.get('ad_id'))}")
@@ -2002,6 +2249,17 @@ def render_avito_block(avito_df: pd.DataFrame, result_df: pd.DataFrame) -> None:
             meta.append(f"Совпадения: {normalize_text(row.get('matched_tokens'))}")
         if meta:
             st.caption(" • ".join(meta))
+        hist = []
+        if normalize_text(row.get("first_seen", "")):
+            hist.append(f"Впервые: {normalize_text(row.get('first_seen'))}")
+        if normalize_text(row.get("last_seen", "")):
+            hist.append(f"Последняя выгрузка: {normalize_text(row.get('last_seen'))}")
+        if normalize_text(row.get("last_changed_at", "")):
+            hist.append(f"Изменение: {normalize_text(row.get('last_changed_at'))}")
+        if normalize_text(row.get("previous_price_raw", "")) and normalize_text(row.get("price", "")) and normalize_text(row.get("previous_price_raw", "")) != normalize_text(row.get("price", "")):
+            hist.append(f"Было: {normalize_text(row.get('previous_price_raw'))}")
+        if hist:
+            st.caption(" • ".join(hist))
         if url:
             st.link_button("Открыть объявление", url, use_container_width=False)
         st.markdown("---")
@@ -2390,15 +2648,27 @@ with st.sidebar:
     st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown('<div class="sidebar-card">', unsafe_allow_html=True)
-    render_sidebar_card_header("Авито", "🛒", "Необязательный файл. Помогает быстро найти действующие объявления по найденным артикулам.")
+    render_sidebar_card_header("Авито", "🛒", "Загруженный файл Авито помогает найти действующие объявления. Параллельно ведём локальный реестр: новые объявления добавляются, изменившиеся обновляются.")
     avito_uploaded = st.file_uploader("Загрузить файл Авито", type=["xlsx", "xlsm", "csv"], key="avito_uploader", label_visibility="collapsed")
     if avito_uploaded is not None:
         try:
-            st.session_state.avito_df = load_avito_file(avito_uploaded.name, avito_uploaded.getvalue())
+            avito_bytes = avito_uploaded.getvalue()
+            avito_sig = hashlib.md5(avito_bytes).hexdigest()
+            st.session_state.avito_df = load_avito_file(avito_uploaded.name, avito_bytes)
             st.session_state.avito_name = avito_uploaded.name
+            if st.session_state.get("avito_last_sync_sig", "") != avito_sig:
+                sync_stats = sync_avito_registry(st.session_state.avito_df, avito_uploaded.name)
+                st.session_state.avito_registry_stats = sync_stats
+                st.session_state.avito_registry_message = (
+                    f"Синхронизация: новых {sync_stats.get('new', 0)}, изменённых {sync_stats.get('changed', 0)}, без изменений {sync_stats.get('unchanged', 0)}"
+                )
+                st.session_state.avito_last_sync_sig = avito_sig
         except Exception as exc:
             st.error(f"Ошибка файла Авито: {exc}")
     st.markdown(f'<div class="sidebar-status">Авито: {html.escape(st.session_state.get("avito_name", "ещё не загружен"))}</div>', unsafe_allow_html=True)
+    if st.session_state.get("avito_registry_message"):
+        st.markdown(f'<div class="sidebar-mini">{html.escape(st.session_state.get("avito_registry_message"))}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="sidebar-mini">{html.escape(registry_summary_text())}</div>', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown('<div class="sidebar-card">', unsafe_allow_html=True)
