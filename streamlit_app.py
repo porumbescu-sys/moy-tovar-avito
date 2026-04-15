@@ -3031,9 +3031,6 @@ st.markdown(f"""
 
 
 def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> None:
-    base_sheet_df = sheets.get(sheet_name) if isinstance(sheets, dict) else None
-    sheet_df = apply_photo_map(base_sheet_df, st.session_state.get("photo_df")) if isinstance(base_sheet_df, pd.DataFrame) else None
-    source_pairs = get_source_pairs(sheet_df) if isinstance(sheet_df, pd.DataFrame) else []
     search_key = f"search_input_{tab_key}"
     submitted_key = f"submitted_query_{tab_key}"
     result_key = f"last_result_{tab_key}"
@@ -3044,6 +3041,14 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
     if result_key not in st.session_state:
         st.session_state[result_key] = None
 
+    base_sheet_df = sheets.get(sheet_name) if isinstance(sheets, dict) else None
+    show_photos = bool(st.session_state.get("show_photos_global", True))
+    if isinstance(base_sheet_df, pd.DataFrame):
+        sheet_df = apply_photo_map(base_sheet_df, st.session_state.get("photo_df") if show_photos else None)
+    else:
+        sheet_df = None
+    source_pairs = get_source_pairs(sheet_df) if isinstance(sheet_df, pd.DataFrame) else []
+
     st.markdown('<div class="toolbar">', unsafe_allow_html=True)
     render_block_header(
         f"{tab_label} — поиск товара",
@@ -3051,6 +3056,7 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
         icon="🔎",
         help_text="Приложение больше не читает сырые прайсы дистрибьюторов. Оно ищет внутри текущего листа comparison-файла и по найденным строкам пересчитывает лучшую цену поставщика по колонкам вида 'Источник цена' / 'Источник шт'.",
     )
+
     with st.form(f"search_form_{tab_key}", clear_on_submit=False):
         search_value = st.text_area(
             "Поисковый запрос",
@@ -3316,6 +3322,13 @@ if not isinstance(sheets, dict) or not sheets:
         tone="purple",
     )
 else:
+    if "show_photos_global" not in st.session_state:
+        st.session_state["show_photos_global"] = True
+
+    toggle_l, toggle_r = st.columns([4, 1.25])
+    toggle_l.caption("Показать фото — общий переключатель для всех вкладок. Когда фото выключены, поиск и таблицы обычно работают быстрее.")
+    toggle_r.checkbox("Показать фото", key="show_photos_global")
+
     tab_specs = [
         ("Сравнение", "Оригинал", "original"),
         ("Уценка", "Уценка", "discount"),
