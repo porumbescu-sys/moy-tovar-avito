@@ -1069,7 +1069,7 @@ def apply_photo_map(df: pd.DataFrame | None, photo_df: pd.DataFrame | None) -> p
     if df is None:
         return None
     out = df.copy()
-    for col in ["photo_url", "photo_name", "meta_color", "meta_iso_pages", "meta_manufacturer_code", "meta_model", "meta_fits_models"]:
+    for col in ["photo_url", "photo_name", "meta_color", "meta_iso_pages", "meta_manufacturer_code", "meta_model", "meta_fits_models", "photo_candidates"]:
         if col not in out.columns:
             out[col] = ""
     if photo_df is None or photo_df.empty:
@@ -1080,6 +1080,7 @@ def apply_photo_map(df: pd.DataFrame | None, photo_df: pd.DataFrame | None) -> p
         row = lookup.get(norm, {})
         return normalize_text(row.get(key, ""))
     out["photo_url"] = out["article_norm"].map(lambda x: _meta(x, "photo_url"))
+    out["photo_candidates"] = [[] for _ in range(len(out))]
     out["photo_name"] = out["name"]
     out["meta_color"] = out["article_norm"].map(lambda x: _meta(x, "meta_color"))
     out["meta_iso_pages"] = out["article_norm"].map(lambda x: _meta(x, "meta_iso_pages"))
@@ -1584,10 +1585,14 @@ def ensure_photo_web_cache_table() -> None:
                 source_page TEXT,
                 source_domain TEXT,
                 status TEXT,
-                checked_at TEXT
+                checked_at TEXT,
+                candidate_urls_json TEXT DEFAULT '[]'
             )
             """
         )
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(photo_web_cache)")}
+        if "candidate_urls_json" not in cols:
+            conn.execute("ALTER TABLE photo_web_cache ADD COLUMN candidate_urls_json TEXT DEFAULT '[]'")
         conn.commit()
 
 
@@ -1605,30 +1610,45 @@ def get_photo_web_cache(article_norm: str) -> dict[str, Any] | None:
     if not row:
         return None
     payload = dict(row)
+    try:
+        payload["candidate_urls"] = json.loads(payload.get("candidate_urls_json") or "[]")
+    except Exception:
+        payload["candidate_urls"] = []
     if normalize_text(payload.get("status", "")) == "found" and is_bad_fallback_photo_url(str(payload.get("photo_url", ""))):
         return None
     return payload
 
 
-def save_photo_web_cache(article_norm: str, article: str, photo_url: str, source_page: str, source_domain: str, status: str) -> None:
+def save_photo_web_cache(article_norm: str, article: str, photo_url: str, source_page: str, source_domain: str, status: str, candidate_urls: Optional[list[str]] = None) -> None:
     article_norm = normalize_article(article_norm)
     if not article_norm:
         return
     ensure_photo_web_cache_table()
+    candidate_urls = [normalize_text(x) for x in (candidate_urls or []) if normalize_text(x)]
     with sqlite3.connect(get_photo_registry_path()) as conn:
         conn.execute(
             """
-            INSERT INTO photo_web_cache (article_norm, article, photo_url, source_page, source_domain, status, checked_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO photo_web_cache (article_norm, article, photo_url, source_page, source_domain, status, checked_at, candidate_urls_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(article_norm) DO UPDATE SET
                 article=excluded.article,
                 photo_url=excluded.photo_url,
                 source_page=excluded.source_page,
                 source_domain=excluded.source_domain,
                 status=excluded.status,
-                checked_at=excluded.checked_at
+                checked_at=excluded.checked_at,
+                candidate_urls_json=excluded.candidate_urls_json
             """,
-            (article_norm, normalize_text(article), normalize_text(photo_url), normalize_text(source_page), normalize_text(source_domain), normalize_text(status), datetime.utcnow().isoformat(timespec="seconds")),
+            (
+                article_norm,
+                normalize_text(article),
+                normalize_text(photo_url),
+                normalize_text(source_page),
+                normalize_text(source_domain),
+                normalize_text(status),
+                datetime.utcnow().isoformat(timespec="seconds"),
+                json.dumps(candidate_urls, ensure_ascii=False),
+            ),
         )
         conn.commit()
 
@@ -1803,31 +1823,84 @@ def discover_product_pages(article: str, domain: str) -> list[str]:
     return found
 
 
-def discover_photo_url_for_article(article: str) -> tuple[str, str, str]:
+def _validate_cached_web_payload(payload: dict[str, Any] | None, article: str, article_norm: str) -> bool:
+    if not payload or normalize_text(payload.get("status", "")) != "found":
+        return False
+    source_page = normalize_text(payload.get("source_page", ""))
+    photo_url = normalize_text(payload.get("photo_url", ""))
+    if not source_page or not photo_url or is_bad_fallback_photo_url(photo_url):
+        return False
+    html_text = fetch_url_text(source_page, timeout=10)
+    if not html_text or not page_mentions_article(html_text, article, article_norm):
+        return False
+    imgs = extract_image_candidates_from_html(html_text, source_page, article=article, article_norm=article_norm)
+    return photo_url in imgs[:6]
+
+
+def discover_photo_candidates_for_article(article: str, max_candidates: int = 4) -> list[dict[str, str]]:
     article_norm = normalize_article(article)
     cached = get_photo_web_cache(article_norm)
-    if cached and normalize_text(cached.get("status", "")) in {"found", "not_found"}:
-        return (normalize_text(cached.get("photo_url", "")), normalize_text(cached.get("source_page", "")), normalize_text(cached.get("source_domain", "")))
+    if _validate_cached_web_payload(cached, article, article_norm):
+        candidate_urls = [normalize_text(x) for x in (cached.get("candidate_urls") or []) if normalize_text(x)]
+        if not candidate_urls:
+            candidate_urls = [normalize_text(cached.get("photo_url", ""))]
+        return [
+            {
+                "url": url,
+                "source_page": normalize_text(cached.get("source_page", "")),
+                "source_domain": normalize_text(cached.get("source_domain", "")),
+            }
+            for url in candidate_urls[:max_candidates]
+            if normalize_text(url)
+        ]
 
     if requests is None:
-        save_photo_web_cache(article_norm, article, "", "", "", "not_found")
-        return "", "", ""
+        save_photo_web_cache(article_norm, article, "", "", "", "not_found", [])
+        return []
 
+    results: list[dict[str, str]] = []
+    seen_urls: set[str] = set()
     for domain in FALLBACK_PHOTO_DOMAINS:
+        domain_best: dict[str, str] | None = None
         for page_url in discover_product_pages(article, domain):
             html_text = fetch_url_text(page_url, timeout=12)
-            if not html_text:
-                continue
-            if not page_mentions_article(html_text, article, article_norm):
+            if not html_text or not page_mentions_article(html_text, article, article_norm):
                 continue
             imgs = extract_image_candidates_from_html(html_text, page_url, article=article, article_norm=article_norm)
-            if imgs:
-                best = imgs[0]
-                if is_bad_fallback_photo_url(best):
+            for img_url in imgs:
+                if is_bad_fallback_photo_url(img_url) or img_url in seen_urls:
                     continue
-                save_photo_web_cache(article_norm, article, best, page_url, domain, "found")
-                return best, page_url, domain
-    save_photo_web_cache(article_norm, article, "", "", "", "not_found")
+                domain_best = {"url": img_url, "source_page": page_url, "source_domain": domain}
+                break
+            if domain_best:
+                break
+        if domain_best:
+            seen_urls.add(domain_best["url"])
+            results.append(domain_best)
+        if len(results) >= max_candidates:
+            break
+
+    if results:
+        save_photo_web_cache(
+            article_norm,
+            article,
+            results[0]["url"],
+            results[0]["source_page"],
+            results[0]["source_domain"],
+            "found",
+            [r["url"] for r in results],
+        )
+        return results
+
+    save_photo_web_cache(article_norm, article, "", "", "", "not_found", [])
+    return []
+
+
+def discover_photo_url_for_article(article: str) -> tuple[str, str, str]:
+    candidates = discover_photo_candidates_for_article(article, max_candidates=4)
+    if candidates:
+        first = candidates[0]
+        return normalize_text(first.get("url", "")), normalize_text(first.get("source_page", "")), normalize_text(first.get("source_domain", ""))
     return "", "", ""
 
 
@@ -1835,6 +1908,9 @@ def row_needs_fallback_photo(row: pd.Series) -> bool:
     url = normalize_text(row.get("photo_url", ""))
     source_sheet = normalize_text(row.get("source_sheet", "")).lower()
     if not url:
+        return True
+    # web-fallback фото можно обновлять заново: если раньше поймался мусор, даём парсеру пройти по всем сайтам ещё раз
+    if source_sheet.startswith("web:"):
         return True
     if source_sheet.startswith("web:") and is_bad_fallback_photo_url(url):
         return True
@@ -1859,36 +1935,43 @@ def try_fill_missing_photos(df: pd.DataFrame | None, enabled: bool = False, limi
         work["source_sheet"] = ""
     if "photo_url" not in work.columns:
         work["photo_url"] = ""
+    if "photo_candidates" not in work.columns:
+        work["photo_candidates"] = [[] for _ in range(len(work))]
     missing = work[work.apply(row_needs_fallback_photo, axis=1)].head(limit)
     if missing.empty:
         return work
     found_rows: list[dict[str, str]] = []
     article_to_url: dict[str, str] = {}
     article_to_source: dict[str, str] = {}
+    article_to_candidates: dict[str, list[str]] = {}
     for _, row in missing.iterrows():
         article = normalize_text(row.get("article", ""))
         article_norm = normalize_article(row.get("article_norm", article))
         if not article_norm:
             continue
-        url, source_page, domain = discover_photo_url_for_article(article)
-        if url and not is_bad_fallback_photo_url(url):
-            article_to_url[article_norm] = url
-            article_to_source[article_norm] = f"web:{domain}"
-            found_rows.append({
-                "article": article or article_norm,
-                "article_norm": article_norm,
-                "photo_url": url,
-                "source_sheet": f"web:{domain}",
-                "meta_color": normalize_text(row.get("meta_color", "")),
-                "meta_iso_pages": normalize_text(row.get("meta_iso_pages", "")),
-                "meta_manufacturer_code": normalize_text(row.get("meta_manufacturer_code", "")),
-                "meta_model": normalize_text(row.get("meta_model", "")),
-                "meta_fits_models": normalize_text(row.get("meta_fits_models", "")),
-            })
+        candidates = discover_photo_candidates_for_article(article, max_candidates=4)
+        if candidates:
+            urls = [normalize_text(c.get("url", "")) for c in candidates if normalize_text(c.get("url", ""))]
+            if urls:
+                article_to_url[article_norm] = urls[0]
+                article_to_source[article_norm] = f"web:{normalize_text(candidates[0].get('source_domain', ''))}"
+                article_to_candidates[article_norm] = urls
+                found_rows.append({
+                    "article": article or article_norm,
+                    "article_norm": article_norm,
+                    "photo_url": urls[0],
+                    "source_sheet": article_to_source[article_norm],
+                    "meta_color": normalize_text(row.get("meta_color", "")),
+                    "meta_iso_pages": normalize_text(row.get("meta_iso_pages", "")),
+                    "meta_manufacturer_code": normalize_text(row.get("meta_manufacturer_code", "")),
+                    "meta_model": normalize_text(row.get("meta_model", "")),
+                    "meta_fits_models": normalize_text(row.get("meta_fits_models", "")),
+                })
     if found_rows:
         inject_web_photos_into_registry(found_rows)
         work["photo_url"] = work.apply(lambda r: article_to_url.get(normalize_article(r.get("article_norm", r.get("article", ""))), normalize_text(r.get("photo_url", ""))), axis=1)
         work["source_sheet"] = work.apply(lambda r: article_to_source.get(normalize_article(r.get("article_norm", r.get("article", ""))), normalize_text(r.get("source_sheet", ""))), axis=1)
+        work["photo_candidates"] = work.apply(lambda r: article_to_candidates.get(normalize_article(r.get("article_norm", r.get("article", ""))), r.get("photo_candidates", []) if isinstance(r.get("photo_candidates", []), list) else []), axis=1)
         reg_df = load_photo_registry_df()
         if isinstance(reg_df, pd.DataFrame) and not reg_df.empty:
             st.session_state.photo_df = reg_df[[
@@ -2698,18 +2781,35 @@ def render_results_table(df: pd.DataFrame, price_mode: str, round100: bool, cust
             """
 
         photo_url = normalize_text(row.get("photo_url", "")) if show_photos else ""
+        candidate_urls = []
+        if show_photos:
+            raw_candidates = row.get("photo_candidates", [])
+            if isinstance(raw_candidates, list):
+                candidate_urls = [normalize_text(x) for x in raw_candidates if normalize_text(x)]
+            if photo_url and photo_url not in candidate_urls:
+                candidate_urls.insert(0, photo_url)
+            candidate_urls = candidate_urls[:4]
         if show_photos and photo_url:
             photo_html = f"""
             <a href="{html.escape(photo_url, quote=True)}" target="_blank" class="photo-wrap">
-              <img src="{html.escape(photo_url, quote=True)}" class="result-photo" loading="lazy" onerror="this.style.display='none'; this.parentNode.innerHTML='<div class=&quot;photo-empty photo-empty-small&quot;>нет фото</div>';">
-            </a>
+              <img src="{html.escape(photo_url, quote=True)}" class="result-photo" loading="lazy" onerror="this.style.display='none'; this.parentNode.innerHTML='<div class=&quot;photo-empty photo-empty-small&quot;>нет фото</div>';"></a>
             """
         elif show_photos:
             photo_html = "<div class='photo-empty photo-empty-small'>нет фото</div>"
         else:
             photo_html = ""
 
-        item_photo_html = f"<div class='item-photo'>{photo_html}</div>" if show_photos else ""
+        candidate_html = ""
+        if show_photos and len(candidate_urls) > 1:
+            thumbs = []
+            for idx, c_url in enumerate(candidate_urls[:4]):
+                thumbs.append(
+                    f"<a href='{html.escape(c_url, quote=True)}' target='_blank' class='photo-thumb-wrap {'active' if idx == 0 else ''}'><img src='{html.escape(c_url, quote=True)}' class='photo-thumb' loading='lazy'></a>"
+                )
+            candidate_html = "<div class='photo-candidates'>" + "".join(thumbs) + "</div>"
+
+        item_photo_html = f"<div class='item-photo'>{photo_html}{candidate_html}</div>" if show_photos else ""
+
 
         rows_html.append(
             f"""
