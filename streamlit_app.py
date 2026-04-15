@@ -99,8 +99,28 @@ def load_persisted_photo_source_into_state() -> bool:
     try:
         raw = target.read_bytes()
         df = load_photo_map_file(read_persisted_original_name(target, target.name), raw)
+        reg_df = load_photo_registry_df()
+        if isinstance(reg_df, pd.DataFrame) and not reg_df.empty:
+            base = df.copy()
+            for col in ["article", "article_norm", "photo_url", "source_sheet", "meta_color", "meta_iso_pages", "meta_manufacturer_code", "meta_model", "meta_fits_models"]:
+                if col not in base.columns:
+                    base[col] = ""
+            reg = reg_df[[c for c in ["article", "article_norm", "photo_url", "source_sheet", "meta_color", "meta_iso_pages", "meta_manufacturer_code", "meta_model", "meta_fits_models"] if c in reg_df.columns]].copy()
+            merged = base.set_index("article_norm")
+            reg = reg.set_index("article_norm")
+            for norm, row in reg.iterrows():
+                if norm not in merged.index:
+                    merged.loc[norm, [c for c in reg.columns if c != "article_norm"]] = ""
+                for col in reg.columns:
+                    val = normalize_text(row.get(col, ""))
+                    if val:
+                        merged.loc[norm, col] = val
+            if "article" not in merged.columns:
+                merged["article"] = merged.index
+            merged = merged.reset_index()
+            df = merged[[c for c in ["article", "article_norm", "photo_url", "source_sheet", "meta_color", "meta_iso_pages", "meta_manufacturer_code", "meta_model", "meta_fits_models"] if c in merged.columns]].copy()
         st.session_state.photo_df = df
-        st.session_state.photo_name = read_persisted_original_name(target, target.name) + " • из /data"
+        st.session_state.photo_name = read_persisted_original_name(target, target.name) + " • из /data + registry"
         return True
     except Exception:
         return False
