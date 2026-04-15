@@ -18,6 +18,11 @@ try:
 except Exception:
     requests = None
 
+try:
+    from bs4 import BeautifulSoup
+except Exception:
+    BeautifulSoup = None
+
 import openpyxl
 import pandas as pd
 import streamlit as st
@@ -1395,6 +1400,18 @@ def ensure_photo_registry() -> None:
         conn.commit()
 
 
+def is_bad_fallback_photo_url(url: str) -> bool:
+    low = normalize_text(url).lower()
+    if not low:
+        return False
+    bad_markers = [
+        "logo", "logos", "icon", "icons", "favicon", "sprite", "placeholder", "blank",
+        "no-photo", "no_photo", "noimage", "no-image", "notfound", "watermark", "brand",
+        "loader", "thumbs/default", "default-image"
+    ]
+    return any(marker in low for marker in bad_markers)
+
+
 def load_photo_registry_df() -> pd.DataFrame:
     path = get_photo_registry_path()
     if not path.exists():
@@ -1411,6 +1428,11 @@ def load_photo_registry_df() -> pd.DataFrame:
     ]:
         if col in df.columns:
             df[col] = df[col].fillna("").map(normalize_text)
+    if "source_sheet" in df.columns and "photo_url" in df.columns:
+        web_mask = df["source_sheet"].fillna("").map(lambda x: normalize_text(x).lower().startswith("web:"))
+        bad_mask = df["photo_url"].fillna("").map(is_bad_fallback_photo_url)
+        if (web_mask & bad_mask).any():
+            df.loc[web_mask & bad_mask, "photo_url"] = ""
     return df
 
 
@@ -1580,7 +1602,12 @@ def get_photo_web_cache(article_norm: str) -> dict[str, Any] | None:
             "SELECT * FROM photo_web_cache WHERE article_norm=?",
             (article_norm,),
         ).fetchone()
-    return dict(row) if row else None
+    if not row:
+        return None
+    payload = dict(row)
+    if normalize_text(payload.get("status", "")) == "found" and is_bad_fallback_photo_url(str(payload.get("photo_url", ""))):
+        return None
+    return payload
 
 
 def save_photo_web_cache(article_norm: str, article: str, photo_url: str, source_page: str, source_domain: str, status: str) -> None:
@@ -1625,43 +1652,122 @@ def fetch_url_text(url: str, timeout: int = 12) -> str:
     return ""
 
 
-def extract_image_candidates_from_html(html_text: str, page_url: str, article_norm: str = "") -> list[str]:
+def _normalized_page_text(text: str) -> str:
+    text = normalize_text(text)
+    if not text:
+        return ""
+    return re.sub(r"[^A-Za-z0-9А-Яа-я]+", "", text).upper()
+
+
+def page_mentions_article(html_text: str, article: str, article_norm: str) -> bool:
+    norm_article = normalize_article(article_norm or article)
+    if not norm_article or not normalize_text(html_text):
+        return False
+    page_norm = _normalized_page_text(html_text)
+    return norm_article in page_norm
+
+
+def extract_image_candidates_from_html(html_text: str, page_url: str, article: str = "", article_norm: str = "") -> list[str]:
     if not normalize_text(html_text):
         return []
-    attrs = ["content", "src", "data-src", "data-large_image", "data-zoom-image", "data-original", "href"]
-    patterns = []
-    for attr in attrs:
-        patterns.append(rf"{attr}=[\"']([^\"']+)[\"']")
-    urls: list[str] = []
-    for pat in patterns:
-        for match in re.findall(pat, html_text, flags=re.IGNORECASE):
-            url = normalize_text(match)
-            if not url:
-                continue
-            abs_url = urljoin(page_url, url)
-            low = abs_url.lower()
-            if not any(ext in low for ext in [".jpg", ".jpeg", ".png", ".webp", ".gif"]) and not any(k in low for k in ["image", "images", "product", "uploads", "cache"]):
-                continue
-            if any(k in low for k in ["logo", "icon", "favicon", "sprite", "placeholder", "blank.gif", "1x1", "captcha"]):
-                continue
-            urls.append(abs_url)
-    seen = set()
-    scored: list[tuple[int, str]] = []
-    for url in urls:
-        if url in seen:
-            continue
-        seen.add(url)
-        score = 0
+    if BeautifulSoup is None:
+        return []
+
+    article_norm = normalize_article(article_norm or article)
+    if not article_norm:
+        return []
+
+    soup = BeautifulSoup(html_text, "html.parser")
+    page_title = normalize_text(soup.title.get_text(" ", strip=True) if soup.title else "")
+    page_title_norm = _normalized_page_text(page_title)
+
+    candidates: list[tuple[int, str]] = []
+    seen: set[str] = set()
+
+    def _score_url(url: str, extra_text: str = "", css_text: str = "", width: int = 0, height: int = 0) -> int:
         low = url.lower()
-        if article_norm and article_norm.lower() in re.sub(r'[^a-z0-9]', '', low):
-            score += 10
-        if any(k in low for k in ["product", "goods", "item", "kartrid", "cartridge", "uploads"]):
-            score += 3
+        score = 0
+        if is_bad_fallback_photo_url(low):
+            return -999
         if low.endswith((".jpg", ".jpeg", ".png", ".webp")):
+            score += 5
+        if any(k in low for k in ["product", "products", "goods", "item", "catalog", "uploads", "cache", "large", "zoom", "original"]):
+            score += 3
+        if width >= 250 or height >= 250:
+            score += 4
+        elif width and height and min(width, height) < 90:
+            score -= 6
+        css_low = normalize_text(css_text).lower()
+        if any(k in css_low for k in ["product", "gallery", "zoom", "main", "detail", "big", "image", "photo", "woocommerce"]):
+            score += 6
+        if any(k in css_low for k in ["logo", "icon", "brand", "sprite", "header", "footer", "menu"]):
+            score -= 12
+        extra_norm = _normalized_page_text(extra_text)
+        if article_norm and article_norm in extra_norm:
+            score += 20
+        if article_norm and article_norm in re.sub(r"[^A-Za-z0-9]", "", low).upper():
+            score += 12
+        if page_title_norm and extra_norm and any(token and token in extra_norm for token in re.findall(r"[A-Z0-9]{3,}", page_title_norm)[:4]):
             score += 2
-        scored.append((score, url))
-    scored.sort(key=lambda x: (-x[0], x[1]))
-    return [u for _, u in scored]
+        return score
+
+    # Prefer og:image when page itself mentions the article.
+    for meta in soup.find_all("meta"):
+        key = normalize_text(meta.get("property") or meta.get("name")).lower()
+        if key not in {"og:image", "twitter:image", "twitter:image:src"}:
+            continue
+        raw = normalize_text(meta.get("content"))
+        if not raw:
+            continue
+        abs_url = urljoin(page_url, raw)
+        sc = _score_url(abs_url, extra_text=page_title, css_text=key) + 8
+        if sc > 0 and abs_url not in seen:
+            seen.add(abs_url)
+            candidates.append((sc, abs_url))
+
+    for img in soup.find_all("img"):
+        raw = normalize_text(img.get("data-large_image") or img.get("data-zoom-image") or img.get("data-original") or img.get("data-src") or img.get("src"))
+        if not raw:
+            continue
+        abs_url = urljoin(page_url, raw)
+        if abs_url in seen:
+            continue
+        attrs = [
+            normalize_text(img.get("alt")),
+            normalize_text(img.get("title")),
+            normalize_text(img.get("class")),
+            normalize_text(img.get("id")),
+        ]
+        parent = img.parent
+        for _ in range(3):
+            if not parent:
+                break
+            attrs.extend([
+                normalize_text(parent.get("class")),
+                normalize_text(parent.get("id")),
+                normalize_text(parent.get_text(" ", strip=True)[:240]),
+            ])
+            parent = parent.parent
+        extra_text = " ".join(a for a in attrs if a)
+        css_text = " ".join(a for a in attrs[:4] if a)
+        width = 0
+        height = 0
+        try:
+            width = int(float(img.get("width") or 0))
+        except Exception:
+            width = 0
+        try:
+            height = int(float(img.get("height") or 0))
+        except Exception:
+            height = 0
+        sc = _score_url(abs_url, extra_text=extra_text, css_text=css_text, width=width, height=height)
+        if sc <= 0:
+            continue
+        seen.add(abs_url)
+        candidates.append((sc, abs_url))
+
+    candidates.sort(key=lambda x: (-x[0], x[1]))
+    return [u for _, u in candidates]
 
 
 def discover_product_pages(article: str, domain: str) -> list[str]:
@@ -1712,13 +1818,27 @@ def discover_photo_url_for_article(article: str) -> tuple[str, str, str]:
             html_text = fetch_url_text(page_url, timeout=12)
             if not html_text:
                 continue
-            imgs = extract_image_candidates_from_html(html_text, page_url, article_norm=article_norm)
+            if not page_mentions_article(html_text, article, article_norm):
+                continue
+            imgs = extract_image_candidates_from_html(html_text, page_url, article=article, article_norm=article_norm)
             if imgs:
                 best = imgs[0]
+                if is_bad_fallback_photo_url(best):
+                    continue
                 save_photo_web_cache(article_norm, article, best, page_url, domain, "found")
                 return best, page_url, domain
     save_photo_web_cache(article_norm, article, "", "", "", "not_found")
     return "", "", ""
+
+
+def row_needs_fallback_photo(row: pd.Series) -> bool:
+    url = normalize_text(row.get("photo_url", ""))
+    source_sheet = normalize_text(row.get("source_sheet", "")).lower()
+    if not url:
+        return True
+    if source_sheet.startswith("web:") and is_bad_fallback_photo_url(url):
+        return True
+    return False
 
 
 def inject_web_photos_into_registry(found_rows: list[dict[str, str]], import_name: str = "web-fallback") -> None:
@@ -1735,19 +1855,25 @@ def try_fill_missing_photos(df: pd.DataFrame | None, enabled: bool = False, limi
     if df is None or df.empty or not enabled:
         return df
     work = df.copy()
-    missing = work[work.get("photo_url", pd.Series(dtype=object)).fillna("").map(lambda x: not bool(normalize_text(x)))].head(limit)
+    if "source_sheet" not in work.columns:
+        work["source_sheet"] = ""
+    if "photo_url" not in work.columns:
+        work["photo_url"] = ""
+    missing = work[work.apply(row_needs_fallback_photo, axis=1)].head(limit)
     if missing.empty:
         return work
     found_rows: list[dict[str, str]] = []
     article_to_url: dict[str, str] = {}
+    article_to_source: dict[str, str] = {}
     for _, row in missing.iterrows():
         article = normalize_text(row.get("article", ""))
         article_norm = normalize_article(row.get("article_norm", article))
         if not article_norm:
             continue
         url, source_page, domain = discover_photo_url_for_article(article)
-        if url:
+        if url and not is_bad_fallback_photo_url(url):
             article_to_url[article_norm] = url
+            article_to_source[article_norm] = f"web:{domain}"
             found_rows.append({
                 "article": article or article_norm,
                 "article_norm": article_norm,
@@ -1762,6 +1888,7 @@ def try_fill_missing_photos(df: pd.DataFrame | None, enabled: bool = False, limi
     if found_rows:
         inject_web_photos_into_registry(found_rows)
         work["photo_url"] = work.apply(lambda r: article_to_url.get(normalize_article(r.get("article_norm", r.get("article", ""))), normalize_text(r.get("photo_url", ""))), axis=1)
+        work["source_sheet"] = work.apply(lambda r: article_to_source.get(normalize_article(r.get("article_norm", r.get("article", ""))), normalize_text(r.get("source_sheet", ""))), axis=1)
         reg_df = load_photo_registry_df()
         if isinstance(reg_df, pd.DataFrame) and not reg_df.empty:
             st.session_state.photo_df = reg_df[[
