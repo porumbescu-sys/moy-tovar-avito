@@ -1687,10 +1687,46 @@ def page_mentions_article(html_text: str, article: str, article_norm: str) -> bo
     return norm_article in page_norm
 
 
+def _collect_json_ld_images(soup: BeautifulSoup, page_url: str) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for tag in soup.find_all("script", attrs={"type": re.compile(r"ld\+json", re.I)}):
+        raw = (tag.string or tag.get_text(" ", strip=True) or "").strip()
+        if not raw:
+            continue
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            continue
+        stack = [payload]
+        while stack:
+            cur = stack.pop()
+            if isinstance(cur, dict):
+                for key, val in cur.items():
+                    if key == "image":
+                        vals = val if isinstance(val, list) else [val]
+                        for item in vals:
+                            if isinstance(item, str):
+                                abs_url = urljoin(page_url, item)
+                                if abs_url not in seen:
+                                    seen.add(abs_url)
+                                    out.append(abs_url)
+                            elif isinstance(item, dict):
+                                for sub in [item.get("url"), item.get("contentUrl")]:
+                                    if isinstance(sub, str) and normalize_text(sub):
+                                        abs_url = urljoin(page_url, sub)
+                                        if abs_url not in seen:
+                                            seen.add(abs_url)
+                                            out.append(abs_url)
+                    elif isinstance(val, (dict, list)):
+                        stack.append(val)
+            elif isinstance(cur, list):
+                stack.extend(cur)
+    return out
+
+
 def extract_image_candidates_from_html(html_text: str, page_url: str, article: str = "", article_norm: str = "") -> list[str]:
-    if not normalize_text(html_text):
-        return []
-    if BeautifulSoup is None:
+    if not normalize_text(html_text) or BeautifulSoup is None:
         return []
 
     article_norm = normalize_article(article_norm or article)
@@ -1700,38 +1736,97 @@ def extract_image_candidates_from_html(html_text: str, page_url: str, article: s
     soup = BeautifulSoup(html_text, "html.parser")
     page_title = normalize_text(soup.title.get_text(" ", strip=True) if soup.title else "")
     page_title_norm = _normalized_page_text(page_title)
+    domain = (urlparse(page_url).netloc or "").replace("www.", "").lower()
 
     candidates: list[tuple[int, str]] = []
     seen: set[str] = set()
 
+    def _push(url: str, score: int) -> None:
+        url = normalize_text(url)
+        if not url:
+            return
+        abs_url = urljoin(page_url, url)
+        if score <= 0 or is_bad_fallback_photo_url(abs_url.lower()) or abs_url in seen:
+            return
+        seen.add(abs_url)
+        candidates.append((score, abs_url))
+
     def _score_url(url: str, extra_text: str = "", css_text: str = "", width: int = 0, height: int = 0) -> int:
         low = url.lower()
-        score = 0
         if is_bad_fallback_photo_url(low):
             return -999
+        score = 0
         if low.endswith((".jpg", ".jpeg", ".png", ".webp")):
             score += 5
-        if any(k in low for k in ["product", "products", "goods", "item", "catalog", "uploads", "cache", "large", "zoom", "original"]):
-            score += 3
+        if any(k in low for k in ["product", "products", "goods", "item", "catalog", "uploads", "cache", "large", "zoom", "original", "wp-content", "woocommerce"]):
+            score += 4
         if width >= 250 or height >= 250:
             score += 4
         elif width and height and min(width, height) < 90:
-            score -= 6
+            score -= 8
         css_low = normalize_text(css_text).lower()
-        if any(k in css_low for k in ["product", "gallery", "zoom", "main", "detail", "big", "image", "photo", "woocommerce"]):
-            score += 6
-        if any(k in css_low for k in ["logo", "icon", "brand", "sprite", "header", "footer", "menu"]):
-            score -= 12
+        if any(k in css_low for k in ["product", "gallery", "zoom", "main", "detail", "big", "image", "photo", "woocommerce", "thumb"]):
+            score += 8
+        if any(k in css_low for k in ["logo", "icon", "brand", "sprite", "header", "footer", "menu", "avatar"]):
+            score -= 14
         extra_norm = _normalized_page_text(extra_text)
         if article_norm and article_norm in extra_norm:
-            score += 20
+            score += 22
         if article_norm and article_norm in re.sub(r"[^A-Za-z0-9]", "", low).upper():
-            score += 12
+            score += 14
         if page_title_norm and extra_norm and any(token and token in extra_norm for token in re.findall(r"[A-Z0-9]{3,}", page_title_norm)[:4]):
             score += 2
         return score
 
-    # Prefer og:image when page itself mentions the article.
+    # Site-specific selectors for the 4 target sites.
+    site_selectors = {
+        "t-toner.ru": [
+            ".woocommerce-product-gallery__image a[href]",
+            ".woocommerce-product-gallery__wrapper a[href]",
+            ".woocommerce-product-gallery__wrapper img[data-large_image]",
+            ".woocommerce-product-gallery__wrapper img[src]",
+            "img.wp-post-image",
+        ],
+        "interlink.ru": [
+            ".product-gallery a[href]",
+            ".product-gallery img[src]",
+            ".product__images a[href]",
+            ".product__images img[src]",
+            "img[itemprop='image']",
+        ],
+        "mrimage.ru": [
+            ".product-images a[href]",
+            ".product-images img[src]",
+            ".fotorama__stage__shaft img[src]",
+            "img[itemprop='image']",
+        ],
+        "rashodniki.ru": [
+            ".productdetails-view a[href]",
+            ".productdetails-view img[src]",
+            ".images a[href]",
+            ".images img[src]",
+        ],
+    }
+    for sel in site_selectors.get(domain, []):
+        for node in soup.select(sel):
+            raw = normalize_text(node.get('href') or node.get('data-large_image') or node.get('data-zoom-image') or node.get('data-original') or node.get('data-src') or node.get('src') or node.get('content'))
+            if not raw:
+                continue
+            extra = " ".join([
+                normalize_text(node.get('alt')),
+                normalize_text(node.get('title')),
+                normalize_text(node.get('class')),
+                normalize_text(node.get('id')),
+                page_title,
+            ])
+            score = _score_url(raw, extra_text=extra, css_text=f"{domain} {sel}") + 15
+            _push(raw, score)
+
+    for raw in _collect_json_ld_images(soup, page_url):
+        score = _score_url(raw, extra_text=page_title, css_text=f"{domain} jsonld") + 10
+        _push(raw, score)
+
+    # Generic fallback extraction.
     for meta in soup.find_all("meta"):
         key = normalize_text(meta.get("property") or meta.get("name")).lower()
         if key not in {"og:image", "twitter:image", "twitter:image:src"}:
@@ -1739,18 +1834,11 @@ def extract_image_candidates_from_html(html_text: str, page_url: str, article: s
         raw = normalize_text(meta.get("content"))
         if not raw:
             continue
-        abs_url = urljoin(page_url, raw)
-        sc = _score_url(abs_url, extra_text=page_title, css_text=key) + 8
-        if sc > 0 and abs_url not in seen:
-            seen.add(abs_url)
-            candidates.append((sc, abs_url))
+        _push(raw, _score_url(raw, extra_text=page_title, css_text=key) + 8)
 
     for img in soup.find_all("img"):
         raw = normalize_text(img.get("data-large_image") or img.get("data-zoom-image") or img.get("data-original") or img.get("data-src") or img.get("src"))
         if not raw:
-            continue
-        abs_url = urljoin(page_url, raw)
-        if abs_url in seen:
             continue
         attrs = [
             normalize_text(img.get("alt")),
@@ -1770,8 +1858,7 @@ def extract_image_candidates_from_html(html_text: str, page_url: str, article: s
             parent = parent.parent
         extra_text = " ".join(a for a in attrs if a)
         css_text = " ".join(a for a in attrs[:4] if a)
-        width = 0
-        height = 0
+        width = height = 0
         try:
             width = int(float(img.get("width") or 0))
         except Exception:
@@ -1780,15 +1867,10 @@ def extract_image_candidates_from_html(html_text: str, page_url: str, article: s
             height = int(float(img.get("height") or 0))
         except Exception:
             height = 0
-        sc = _score_url(abs_url, extra_text=extra_text, css_text=css_text, width=width, height=height)
-        if sc <= 0:
-            continue
-        seen.add(abs_url)
-        candidates.append((sc, abs_url))
+        _push(raw, _score_url(raw, extra_text=extra_text, css_text=css_text, width=width, height=height))
 
     candidates.sort(key=lambda x: (-x[0], x[1]))
     return [u for _, u in candidates]
-
 
 def _clean_candidate_href(href: str, base_url: str, domain: str) -> str:
     href = normalize_text(href)
@@ -1859,32 +1941,67 @@ def _extract_product_links_from_html(html_text: str, base_url: str, article: str
     return [u for _, u in found[:FALLBACK_SEARCH_LIMIT]]
 
 
-def _site_search_urls(article: str, domain: str) -> list[str]:
-    q = quote_plus(article)
+def _extract_brand_hint(context_text: str) -> str:
+    text = contains_text(context_text)
+    for brand in ["PANTUM", "BROTHER", "CANON", "HP", "XEROX", "KYOCERA", "RICOH", "SAMSUNG", "SHARP", "OKI", "LEXMARK", "KONICA", "PANASONIC", "AVISION"]:
+        if brand in text:
+            return brand.title().replace("Hp", "HP")
+    return ""
+
+
+def _site_search_urls(article: str, domain: str, context_text: str = "") -> list[str]:
+    brand = _extract_brand_hint(context_text)
+    queries = [article]
+    if brand:
+        queries.append(f"{article} {brand}")
+    urls: list[str] = []
+    for q_text in queries:
+        q = quote_plus(q_text)
+        if domain == 't-toner.ru':
+            urls.extend([
+                f'https://{domain}/?s={q}&post_type=product',
+                f'https://{domain}/?s={q}',
+            ])
+        elif domain == 'interlink.ru':
+            urls.extend([
+                f'https://{domain}/?s={q}',
+                f'https://{domain}/search/?q={q}',
+            ])
+        elif domain == 'mrimage.ru':
+            urls.extend([
+                f'https://{domain}/?s={q}',
+                f'https://{domain}/search?keyword={q}',
+            ])
+        elif domain == 'rashodniki.ru':
+            urls.extend([
+                f'https://{domain}/component/search/?searchword={q}',
+                f'https://{domain}/search?searchword={q}',
+            ])
+    seen: set[str] = set()
+    return [u for u in urls if not (u in seen or seen.add(u))]
+
+
+def _site_direct_product_guesses(article: str, domain: str, context_text: str = "") -> list[str]:
+    article = normalize_text(article)
+    if not article:
+        return []
+    slug = article.lower().replace("/", "-").replace("_", "-")
+    slug = re.sub(r"[^a-z0-9-]+", "-", slug)
+    slug = re.sub(r"-+", "-", slug).strip("-")
+    brand = _extract_brand_hint(context_text).lower().replace(" ", "-")
+    guesses: list[str] = []
     if domain == 't-toner.ru':
-        return [
-            f'https://{domain}/?s={q}&post_type=product',
-            f'https://{domain}/?s={q}',
-        ]
-    if domain == 'interlink.ru':
-        return [
-            f'https://{domain}/?s={q}',
-            f'https://{domain}/search/?q={q}',
-        ]
-    if domain == 'mrimage.ru':
-        return [
-            f'https://{domain}/?s={q}',
-            f'https://{domain}/search?keyword={q}',
-        ]
-    if domain == 'rashodniki.ru':
-        return [
-            f'https://{domain}/component/search/?searchword={q}',
-            f'https://{domain}/search?searchword={q}',
-        ]
-    return []
+        if brand:
+            guesses.append(f'https://{domain}/product/{brand}-{slug}-original/')
+            guesses.append(f'https://{domain}/product/{brand}-{slug}/')
+        guesses.extend([
+            f'https://{domain}/product/{slug}-original/',
+            f'https://{domain}/product/{slug}/',
+        ])
+    return guesses
 
 
-def discover_product_pages(article: str, domain: str) -> list[str]:
+def discover_product_pages(article: str, domain: str, context_text: str = "") -> list[str]:
     article = normalize_text(article)
     if not article or requests is None:
         return []
@@ -1901,8 +2018,14 @@ def discover_product_pages(article: str, domain: str) -> list[str]:
             if len(found) >= FALLBACK_SEARCH_LIMIT:
                 return
 
-    # 1) Сначала пробуем внутренний поиск сайта — он обычно точнее, чем общий web-search.
-    for search_url in _site_search_urls(article, domain):
+    for guess in _site_direct_product_guesses(article, domain, context_text):
+        html_text = fetch_url_text(guess, timeout=10)
+        if html_text and page_mentions_article(html_text, article, normalize_article(article)):
+            _append([guess])
+            if len(found) >= FALLBACK_SEARCH_LIMIT:
+                return found
+
+    for search_url in _site_search_urls(article, domain, context_text):
         html_text = fetch_url_text(search_url, timeout=12)
         if not html_text:
             continue
@@ -1910,12 +2033,14 @@ def discover_product_pages(article: str, domain: str) -> list[str]:
         if len(found) >= FALLBACK_SEARCH_LIMIT:
             return found
 
-    # 2) Потом fallback через DuckDuckGo, если сайт сам ничего не отдал.
     queries = [
         f"site:{domain} {article}",
         f'site:{domain} "{article}"',
         f'site:{domain} {article} оригинальный',
     ]
+    brand = _extract_brand_hint(context_text)
+    if brand:
+        queries.append(f'site:{domain} "{article}" {brand}')
     for q in queries:
         for search_url in [
             f"https://duckduckgo.com/html/?q={quote_plus(q)}",
@@ -1928,7 +2053,6 @@ def discover_product_pages(article: str, domain: str) -> list[str]:
             if len(found) >= FALLBACK_SEARCH_LIMIT:
                 return found
     return found
-
 
 def _validate_cached_web_payload(payload: dict[str, Any] | None, article: str, article_norm: str) -> bool:
     if not payload or normalize_text(payload.get("status", "")) != "found":
@@ -1944,7 +2068,7 @@ def _validate_cached_web_payload(payload: dict[str, Any] | None, article: str, a
     return photo_url in imgs[:6]
 
 
-def discover_photo_candidates_for_article(article: str, max_candidates: int = 4) -> list[dict[str, str]]:
+def discover_photo_candidates_for_article(article: str, context_text: str = "", max_candidates: int = 4) -> list[dict[str, str]]:
     article_norm = normalize_article(article)
     cached = get_photo_web_cache(article_norm)
     if _validate_cached_web_payload(cached, article, article_norm):
@@ -1969,7 +2093,7 @@ def discover_photo_candidates_for_article(article: str, max_candidates: int = 4)
     seen_urls: set[str] = set()
     for domain in FALLBACK_PHOTO_DOMAINS:
         domain_best: dict[str, str] | None = None
-        for page_url in discover_product_pages(article, domain):
+        for page_url in discover_product_pages(article, domain, context_text=context_text):
             html_text = fetch_url_text(page_url, timeout=12)
             if not html_text or not page_mentions_article(html_text, article, article_norm):
                 continue
@@ -2003,8 +2127,8 @@ def discover_photo_candidates_for_article(article: str, max_candidates: int = 4)
     return []
 
 
-def discover_photo_url_for_article(article: str) -> tuple[str, str, str]:
-    candidates = discover_photo_candidates_for_article(article, max_candidates=4)
+def discover_photo_url_for_article(article: str, context_text: str = "") -> tuple[str, str, str]:
+    candidates = discover_photo_candidates_for_article(article, context_text=context_text, max_candidates=4)
     if candidates:
         first = candidates[0]
         return normalize_text(first.get("url", "")), normalize_text(first.get("source_page", "")), normalize_text(first.get("source_domain", ""))
@@ -2056,7 +2180,8 @@ def try_fill_missing_photos(df: pd.DataFrame | None, enabled: bool = False, limi
         article_norm = normalize_article(row.get("article_norm", article))
         if not article_norm:
             continue
-        candidates = discover_photo_candidates_for_article(article, max_candidates=4)
+        context_text = normalize_text(row.get("name", ""))
+        candidates = discover_photo_candidates_for_article(article, context_text=context_text, max_candidates=4)
         if candidates:
             urls = [normalize_text(c.get("url", "")) for c in candidates if normalize_text(c.get("url", ""))]
             if urls:
