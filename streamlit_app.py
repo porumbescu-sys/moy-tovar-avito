@@ -498,12 +498,8 @@ def merge_code_reason_lookups(*lookups: dict[str, set[str]]) -> dict[str, list[s
 
 
 def get_original_block_reasons(codes: list[str], block_lookup: dict[str, list[str]]) -> list[str]:
-    reasons: set[str] = set()
-    for code in codes or []:
-        for reason in block_lookup.get(normalize_article(code), []) or []:
-            if reason:
-                reasons.add(str(reason))
-    return sorted(reasons)
+    # Ограничения по Уценке/Совместимым отключены: comparison-файл считается уже поправленным.
+    return []
 
 def original_reason_badge_text(reasons: list[str]) -> str:
     if not isinstance(reasons, list) or not reasons:
@@ -608,44 +604,13 @@ def merge_blocked_source_prices(codes: list[str], compatible_lookup: dict[str, d
 
 
 def is_blocked_by_compatible_price(row: pd.Series, source: str, price: float) -> bool:
-    blocked_map = row.get("blocked_source_prices", {})
-    if not isinstance(blocked_map, dict) or not blocked_map:
-        return False
-    blocked_prices = blocked_map.get(str(source), [])
-    if not blocked_prices:
-        return False
-    price_key = round(float(price), 2)
-    return any(abs(float(blocked) - price_key) < 0.01 for blocked in blocked_prices)
+    # Ограничения по совпадениям с Уценкой/Совместимыми сняты.
+    return False
 
 
 def filter_suspicious_low_offers(row: pd.Series, offers: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
-    sheet_name = normalize_text(row.get("sheet_name", ""))
-    own_price = safe_float(row.get("sale_price"), 0.0)
-    if sheet_name != "Сравнение" or len(offers) < 3:
-        return offers, []
-
-    prices = sorted(float(offer["price"]) for offer in offers if float(offer["price"]) > 0)
-    if len(prices) < 3:
-        return offers, []
-
-    upper_half = prices[len(prices) // 2 :]
-    if not upper_half:
-        return offers, []
-
-    ref_price = upper_half[len(upper_half) // 2]
-    outlier_limit = ref_price * 0.35
-    if own_price > 0:
-        outlier_limit = min(outlier_limit, own_price * 0.35)
-
-    kept: list[dict[str, Any]] = []
-    hidden: list[str] = []
-    for offer in offers:
-        price = float(offer["price"])
-        if price < outlier_limit:
-            hidden.append(f"{offer['source']} {fmt_price(price)}")
-            continue
-        kept.append(offer)
-    return kept, hidden
+    # Дополнительный outlier-фильтр отключён: после правки comparison-файла показываем все цены как есть.
+    return offers, []
 
 
 def unique_preserve_order(items: list[str]) -> list[str]:
@@ -1239,6 +1204,44 @@ def apply_price_updates(df: pd.DataFrame, updates_text: str) -> tuple[pd.DataFra
     if missed:
         msg += " | Не найдено: " + ", ".join(missed[:10])
     return out, msg
+
+
+def apply_price_updates_to_sheets(sheets: dict[str, pd.DataFrame], updates_text: str) -> tuple[dict[str, pd.DataFrame], str]:
+    updates = parse_price_updates(updates_text)
+    if not updates:
+        return sheets, "Не нашёл строк для правки цен."
+    if not isinstance(sheets, dict) or not sheets:
+        return sheets, "Сначала загрузите comparison-файл."
+
+    updated_sheets: dict[str, pd.DataFrame] = {}
+    total_updated = 0
+    hits_by_sheet: list[str] = []
+    found_articles: set[str] = set()
+
+    for sheet_name, df in sheets.items():
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            updated_sheets[sheet_name] = df
+            continue
+        out = df.copy()
+        sheet_hits = 0
+        for article_norm, new_price in updates:
+            mask = out["article_norm"] == article_norm
+            if mask.any():
+                out.loc[mask, "sale_price"] = float(new_price)
+                sheet_hits += int(mask.sum())
+                found_articles.add(article_norm)
+        updated_sheets[sheet_name] = out
+        if sheet_hits:
+            total_updated += sheet_hits
+            hits_by_sheet.append(f"{sheet_name}: {sheet_hits}")
+
+    missed = [article for article, _ in updates if article not in found_articles]
+    msg = f"Обновлено цен: {total_updated}"
+    if hits_by_sheet:
+        msg += " | По листам: " + "; ".join(hits_by_sheet)
+    if missed:
+        msg += " | Не найдено: " + ", ".join(missed[:10])
+    return updated_sheets, msg
 
 
 def get_source_pairs(df: pd.DataFrame) -> list[dict[str, str]]:
@@ -2361,13 +2364,14 @@ with st.sidebar:
     st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown('<div class="sidebar-card">', unsafe_allow_html=True)
-    render_sidebar_card_header("Быстрая правка цен", "✏️", "Меняет Наша цена в загруженном листе. Полезно для локальной проверки без правки исходного Excel.")
+    render_sidebar_card_header("Быстрая правка цен", "✏️", "Меняет Наша цена по всем листам comparison-файла. Полезно для локальной проверки без правки исходного Excel.")
     st.text_area("Правка цен", key="price_patch_input", height=110, label_visibility="collapsed", placeholder="CE278A 8900\nCF364A - 29700")
-    if st.button("Править цены в листе", use_container_width=True):
-        current_df = st.session_state.get("current_df")
-        if isinstance(current_df, pd.DataFrame) and not current_df.empty:
-            updated_df, patch_message = apply_price_updates(current_df, st.session_state.price_patch_input)
-            st.session_state.current_df = updated_df
+    if st.button("Править цены в файле", use_container_width=True):
+        sheets_state = st.session_state.get("comparison_sheets")
+        if isinstance(sheets_state, dict) and sheets_state:
+            updated_sheets, patch_message = apply_price_updates_to_sheets(sheets_state, st.session_state.price_patch_input)
+            st.session_state.comparison_sheets = updated_sheets
+            rebuild_current_df()
             st.session_state.patch_message = patch_message
             refresh_all_search_results()
         else:
@@ -2470,14 +2474,11 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
     series_df = sheet_df.copy() if isinstance(sheet_df, pd.DataFrame) else None
 
     if sheet_name == "Сравнение":
-        flagged_count = 0
-        if isinstance(sheet_df, pd.DataFrame) and "blocked_in_original" in sheet_df.columns:
-            flagged_count = int(sheet_df["blocked_in_original"].fillna(False).sum())
         render_info_banner(
-            "Защита от уценки и совместимки",
-            "Во вкладке Оригинал позиция остаётся видимой. Если её OEM-код найден на листе Уценка или Совместимые, приложение скрывает только совпавшие цены поставщиков, а не всю строку. Дополнительно отсекаются мусорные экстремально низкие цены.",
-            icon="🛡️",
-            chips=[f"строк с совпадениями: {flagged_count}", "скрываем только цены поставщиков", "сама позиция остаётся"],
+            "Оригинал — без искусственных блокировок",
+            "После правки comparison-файла приложение показывает цены поставщиков как есть. Ничего не скрываем по совпадениям с Уценкой или Совместимыми — сравнение строится напрямую по текущему файлу.",
+            icon="✅",
+            chips=["ограничения сняты", "цены считаются заново", "Merlion Pantum-исправление сохранено"],
             tone="green",
         )
 
@@ -2501,17 +2502,7 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
         if clear_all_clicked:
             st.session_state[f"series_selected_{prefix_key}"] = []
         options = [str(c["article_norm"]) for c in series_candidates]
-        blocked_map = {
-            str(c["article_norm"]): list(c.get("original_block_reasons", []) or [])
-            for c in series_candidates
-            if isinstance(c.get("original_block_reasons", []), list) and c.get("original_block_reasons")
-        }
-        hidden_in_original = [norm for norm in options if norm in blocked_map]
-        if sheet_name == "Сравнение" and hidden_in_original:
-            st.info(f"В этой серии есть позиций с совпадениями по OEM-коду: {len(hidden_in_original)}. Во вкладке Оригинал они остаются видимыми, но часть цен поставщиков по ним будет скрываться.")
-            summary_html = original_reason_summary_html({norm: blocked_map[norm] for norm in hidden_in_original if norm in blocked_map})
-            if summary_html:
-                st.markdown(summary_html, unsafe_allow_html=True)
+        blocked_map = {}
 
         st.markdown("""
         <style>
@@ -2532,10 +2523,10 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
         preview_rows = []
         for c in series_candidates:
             norm = str(c["article_norm"])
-            reasons = blocked_map.get(norm, [])
-            hidden = bool(reasons)
-            tag_text = ("есть совпадения: " + original_reason_short_tag(reasons)) if hidden else "[доступно]"
-            tag_class = "hidden" if hidden else "visible"
+            reasons = []
+            hidden = False
+            tag_text = "[доступно]"
+            tag_class = "visible"
             preview_rows.append((hidden, f"""
                 <div class='series-preview-row {'series-hidden' if hidden else ''}'>
                   <div class='series-preview-main'>
@@ -2549,15 +2540,11 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
         preview_rows = sorted(preview_rows, key=lambda x: (x[0],))
         st.markdown("<div class='series-preview-wrap'>" + "".join(row_html for _, row_html in preview_rows) + "</div>", unsafe_allow_html=True)
 
-        options = [str(c["article_norm"]) for c in sorted(series_candidates, key=lambda c: (str(c["article_norm"]) in blocked_map, series_sort_key(c)))]
+        options = [str(c["article_norm"]) for c in sorted(series_candidates, key=series_sort_key)]
         format_map = {}
         for c in series_candidates:
             norm = str(c["article_norm"])
-            reasons = blocked_map.get(norm, [])
-            prefix = "🟠 " if reasons else "🟢 "
-            label = f"{prefix}{c['article']} — свободно: {fmt_qty(c['free_qty'])} • {fmt_price_with_rub(c['sale_price'])} • {c['name']}"
-            if reasons:
-                label += f" • {original_reason_short_tag(reasons)}"
+            label = f"🟢 {c['article']} — свободно: {fmt_qty(c['free_qty'])} • {fmt_price_with_rub(c['sale_price'])} • {c['name']}"
             format_map[norm] = label
         selected_norms = st.multiselect(
             "Выберите позиции серии",
@@ -2679,11 +2666,13 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
             )
             t1, t2 = st.columns(2)
             with t1:
-                template1 = build_offer_template(sheet_df, submitted_query, round100, st.session_state.template1_footer, search_mode)
-                st.text_area("Шаблон 1", value=template1, height=300, key=f"template1_{tab_key}")
+                template1 = build_offer_template_from_result_df(result_df, round100, st.session_state.template1_footer)
+                st.session_state[f"template1_{tab_key}"] = template1
+                st.text_area("Шаблон 1", height=300, key=f"template1_{tab_key}")
             with t2:
-                template2 = build_selected_price_template(sheet_df, submitted_query, price_mode, round100, custom_discount, search_mode)
-                st.text_area("Шаблон 2", value=template2, height=300, key=f"template2_{tab_key}")
+                template2 = build_selected_price_template_from_result_df(result_df, price_mode, round100, custom_discount)
+                st.session_state[f"template2_{tab_key}"] = template2
+                st.text_area("Шаблон 2", height=300, key=f"template2_{tab_key}")
             st.markdown('</div>', unsafe_allow_html=True)
 
             if isinstance(st.session_state.get("avito_df"), pd.DataFrame) and not st.session_state.avito_df.empty:
