@@ -2401,7 +2401,7 @@ def render_results_table(df: pd.DataFrame, price_mode: str, round100: bool, cust
     components.html(table_html, height=height, scrolling=True)
 
 
-def render_all_prices_block(result_df: pd.DataFrame, min_qty: float, price_mode: str, round100: bool, custom_discount: float) -> None:
+def render_all_prices_block(result_df: pd.DataFrame, min_qty: float, price_mode: str, round100: bool, custom_discount: float, widget_key_prefix: str = "main") -> None:
     all_prices_df = build_all_prices_df(result_df, min_qty, price_mode, round100, custom_discount)
     if all_prices_df.empty:
         st.info("Для текущего результата нет данных по всем ценам.")
@@ -2464,9 +2464,10 @@ def render_all_prices_block(result_df: pd.DataFrame, min_qty: float, price_mode:
     st.download_button(
         "⬇️ Скачать все цены в Excel",
         all_prices_to_excel_bytes(all_prices_df),
-        file_name="moy_tovar_all_prices.xlsx",
+        file_name=f"moy_tovar_all_prices_{widget_key_prefix}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
+        key=f"download_all_prices_{widget_key_prefix}",
     )
 
 
@@ -3246,7 +3247,7 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
                 chips=["свои расчёты", "динамические источники", "работает и для новых колонок"],
                 tone="green",
             )
-            render_all_prices_block(result_df, min_dist_qty, price_mode, round100, custom_discount)
+            render_all_prices_block(result_df, min_dist_qty, price_mode, round100, custom_discount, widget_key_prefix=tab_key)
             st.markdown('</div>', unsafe_allow_html=True)
 
             st.markdown('<div class="result-wrap">', unsafe_allow_html=True)
