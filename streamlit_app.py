@@ -3536,6 +3536,7 @@ st.markdown(f"""
 def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> None:
     search_key = f"search_input_{tab_key}"
     search_widget_key = f"search_input_widget_{tab_key}"
+    search_widget_pending_key = f"search_input_widget_pending_{tab_key}"
     clear_flag_key = f"search_clear_requested_{tab_key}"
     submitted_key = f"submitted_query_{tab_key}"
     result_key = f"last_result_{tab_key}"
@@ -3552,6 +3553,9 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
         st.session_state[search_widget_key] = st.session_state[search_key]
     if clear_flag_key not in st.session_state:
         st.session_state[clear_flag_key] = False
+    pending_search_value = st.session_state.pop(search_widget_pending_key, None)
+    if pending_search_value is not None:
+        st.session_state[search_widget_key] = pending_search_value
     if st.session_state.get(clear_flag_key):
         st.session_state[search_key] = ""
         st.session_state[search_widget_key] = ""
@@ -3573,7 +3577,7 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
     with st.form(f"search_form_{tab_key}", clear_on_submit=False):
         search_value = st.text_area(
             "Поисковый запрос",
-            value=st.session_state[search_key],
+            key=search_widget_key,
             placeholder="Например:\nCE278A CE285A\nили\n001R00600 / 006R01464",
             height=90,
             label_visibility="collapsed",
@@ -3591,15 +3595,15 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
 
     if clear_clicked:
         st.session_state[search_key] = ""
-        st.session_state[search_widget_key] = ""
         st.session_state[submitted_key] = ""
         st.session_state[result_key] = None
         st.session_state[sig_key] = None
+        st.session_state[search_widget_pending_key] = ""
         st.session_state[clear_flag_key] = True
         result_df = None
+        st.rerun()
     elif find_clicked:
         normalized_query = normalize_query_for_display(search_value)
-        st.session_state[search_widget_key] = normalized_query
         st.session_state[search_key] = normalized_query
         st.session_state[submitted_key] = normalized_query
         desired_sig = (normalized_query, search_mode, sheet_name, st.session_state.get("comparison_version", ""))
@@ -3675,12 +3679,13 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
             if selected_articles:
                 normalized_query = "\n".join(unique_preserve_order(selected_articles))
                 st.session_state[search_key] = normalized_query
-                st.session_state[search_widget_key] = normalized_query
+                st.session_state[search_widget_pending_key] = normalized_query
                 st.session_state[submitted_key] = normalized_query
                 result_df = search_in_df(base_sheet_df, normalized_query, search_mode, sheet_name=sheet_name)
                 st.session_state[result_key] = result_df
                 st.session_state[sig_key] = (normalized_query, search_mode, sheet_name, st.session_state.get("comparison_version", ""))
                 submitted_query = normalized_query
+                st.rerun()
         st.markdown('</div>', unsafe_allow_html=True)
 
     if not isinstance(base_sheet_df, pd.DataFrame):
