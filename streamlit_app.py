@@ -18,6 +18,11 @@ try:
 except Exception:
     requests = None
 
+try:
+    from bs4 import BeautifulSoup
+except Exception:
+    BeautifulSoup = None
+
 import openpyxl
 import pandas as pd
 import streamlit as st
@@ -35,7 +40,7 @@ PERSISTED_COMPARISON_FILENAME = "comparison_latest.xlsx"
 PERSISTED_META_SUFFIX = ".meta.json"
 
 FALLBACK_PHOTO_DOMAINS = ["rashodniki.ru", "t-toner.ru", "interlink.ru", "mrimage.ru"]
-FALLBACK_SEARCH_LIMIT = 2
+FALLBACK_SEARCH_LIMIT = 6
 
 
 def get_server_data_dir() -> Path:
@@ -87,6 +92,50 @@ def save_uploaded_source_file(target_path: Path, file_bytes: bytes, original_nam
     }, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+
+
+def overlay_photo_registry(base_df: pd.DataFrame | None, reg_df: pd.DataFrame | None) -> pd.DataFrame:
+    cols = [
+        "article", "article_norm", "photo_url", "source_sheet",
+        "meta_color", "meta_iso_pages", "meta_manufacturer_code",
+        "meta_model", "meta_fits_models",
+    ]
+    if not isinstance(base_df, pd.DataFrame) or base_df is None or base_df.empty:
+        if isinstance(reg_df, pd.DataFrame) and not reg_df.empty:
+            out = reg_df.copy()
+            for c in cols:
+                if c not in out.columns:
+                    out[c] = ""
+            return out[cols].drop_duplicates(subset=["article_norm"], keep="last").reset_index(drop=True)
+        return pd.DataFrame(columns=cols)
+
+    out = base_df.copy()
+    for c in cols:
+        if c not in out.columns:
+            out[c] = ""
+    if not isinstance(reg_df, pd.DataFrame) or reg_df is None or reg_df.empty:
+        return out[cols].drop_duplicates(subset=["article_norm"], keep="first").reset_index(drop=True)
+
+    reg = reg_df.copy()
+    for c in cols:
+        if c not in reg.columns:
+            reg[c] = ""
+    out = out.set_index("article_norm", drop=False)
+    reg = reg.set_index("article_norm", drop=False)
+    for norm, row in reg.iterrows():
+        if not norm:
+            continue
+        payload = {c: normalize_text(row.get(c, "")) for c in cols}
+        if norm not in out.index:
+            payload["article_norm"] = norm
+            payload["article"] = payload.get("article") or norm
+            out.loc[norm, cols] = [payload[c] for c in cols]
+        else:
+            for c, val in payload.items():
+                if val:
+                    out.at[norm, c] = val
+    return out.reset_index(drop=True)[cols].drop_duplicates(subset=["article_norm"], keep="last").reset_index(drop=True)
+
 def load_persisted_photo_source_into_state() -> bool:
     target = get_persisted_photo_file_path()
     if not target.exists():
@@ -94,7 +143,8 @@ def load_persisted_photo_source_into_state() -> bool:
     try:
         raw = target.read_bytes()
         df = load_photo_map_file(read_persisted_original_name(target, target.name), raw)
-        st.session_state.photo_df = df
+        reg_df = load_photo_registry_df()
+        st.session_state.photo_df = overlay_photo_registry(df, reg_df)
         st.session_state.photo_name = read_persisted_original_name(target, target.name) + " • из /data"
         return True
     except Exception:
@@ -1064,7 +1114,7 @@ def apply_photo_map(df: pd.DataFrame | None, photo_df: pd.DataFrame | None) -> p
     if df is None:
         return None
     out = df.copy()
-    for col in ["photo_url", "photo_name", "meta_color", "meta_iso_pages", "meta_manufacturer_code", "meta_model", "meta_fits_models"]:
+    for col in ["photo_url", "photo_name", "meta_color", "meta_iso_pages", "meta_manufacturer_code", "meta_model", "meta_fits_models", "photo_candidates"]:
         if col not in out.columns:
             out[col] = ""
     if photo_df is None or photo_df.empty:
@@ -1075,6 +1125,7 @@ def apply_photo_map(df: pd.DataFrame | None, photo_df: pd.DataFrame | None) -> p
         row = lookup.get(norm, {})
         return normalize_text(row.get(key, ""))
     out["photo_url"] = out["article_norm"].map(lambda x: _meta(x, "photo_url"))
+    out["photo_candidates"] = [[] for _ in range(len(out))]
     out["photo_name"] = out["name"]
     out["meta_color"] = out["article_norm"].map(lambda x: _meta(x, "meta_color"))
     out["meta_iso_pages"] = out["article_norm"].map(lambda x: _meta(x, "meta_iso_pages"))
@@ -1395,6 +1446,18 @@ def ensure_photo_registry() -> None:
         conn.commit()
 
 
+def is_bad_fallback_photo_url(url: str) -> bool:
+    low = normalize_text(url).lower()
+    if not low:
+        return False
+    bad_markers = [
+        "logo", "logos", "icon", "icons", "favicon", "sprite", "placeholder", "blank",
+        "no-photo", "no_photo", "noimage", "no-image", "notfound", "watermark", "brand",
+        "loader", "thumbs/default", "default-image"
+    ]
+    return any(marker in low for marker in bad_markers)
+
+
 def load_photo_registry_df() -> pd.DataFrame:
     path = get_photo_registry_path()
     if not path.exists():
@@ -1411,6 +1474,11 @@ def load_photo_registry_df() -> pd.DataFrame:
     ]:
         if col in df.columns:
             df[col] = df[col].fillna("").map(normalize_text)
+    if "source_sheet" in df.columns and "photo_url" in df.columns:
+        web_mask = df["source_sheet"].fillna("").map(lambda x: normalize_text(x).lower().startswith("web:"))
+        bad_mask = df["photo_url"].fillna("").map(is_bad_fallback_photo_url)
+        if (web_mask & bad_mask).any():
+            df.loc[web_mask & bad_mask, "photo_url"] = ""
     return df
 
 
@@ -1529,11 +1597,7 @@ def ensure_photo_registry_loaded() -> None:
         return
     reg = load_photo_registry_df()
     if isinstance(reg, pd.DataFrame) and not reg.empty:
-        st.session_state.photo_df = reg[[
-            "article", "article_norm", "photo_url", "source_sheet",
-            "meta_color", "meta_iso_pages", "meta_manufacturer_code",
-            "meta_model", "meta_fits_models",
-        ]].copy()
+        st.session_state.photo_df = overlay_photo_registry(pd.DataFrame(), reg)
         if normalize_text(st.session_state.get("photo_name", "")) in {"", "ещё не загружен"}:
             st.session_state.photo_name = "из реестра сервера"
 
@@ -1543,6 +1607,110 @@ def ensure_persisted_source_files_loaded() -> None:
         load_persisted_comparison_source_into_state()
     if (not isinstance(st.session_state.get("photo_df"), pd.DataFrame) or st.session_state.get("photo_df").empty) and get_persisted_photo_file_path().exists():
         load_persisted_photo_source_into_state()
+
+
+
+def save_manual_photo_url(article: str, photo_url: str) -> dict[str, Any]:
+    article = normalize_text(article)
+    photo_url = normalize_text(photo_url)
+    if not article:
+        raise ValueError("Не указан артикул.")
+    if not photo_url or not re.match(r"^https?://", photo_url, flags=re.IGNORECASE):
+        raise ValueError("Нужна полная ссылка на фото, начиная с http:// или https://")
+
+    article_norm = normalize_article(article)
+    existing_meta: dict[str, str] = {}
+    photo_df = st.session_state.get("photo_df")
+    if isinstance(photo_df, pd.DataFrame) and not photo_df.empty and "article_norm" in photo_df.columns:
+        hit = photo_df[photo_df["article_norm"] == article_norm]
+        if not hit.empty:
+            rec = hit.iloc[0]
+            existing_meta = {
+                "meta_color": normalize_text(rec.get("meta_color", "")),
+                "meta_iso_pages": normalize_text(rec.get("meta_iso_pages", "")),
+                "meta_manufacturer_code": normalize_text(rec.get("meta_manufacturer_code", "")),
+                "meta_model": normalize_text(rec.get("meta_model", "")),
+                "meta_fits_models": normalize_text(rec.get("meta_fits_models", "")),
+            }
+
+    row = pd.DataFrame([
+        {
+            "article": article,
+            "article_norm": article_norm,
+            "photo_url": photo_url,
+            "source_sheet": "manual",
+            "meta_color": existing_meta.get("meta_color", ""),
+            "meta_iso_pages": existing_meta.get("meta_iso_pages", ""),
+            "meta_manufacturer_code": existing_meta.get("meta_manufacturer_code", ""),
+            "meta_model": existing_meta.get("meta_model", ""),
+            "meta_fits_models": existing_meta.get("meta_fits_models", ""),
+        }
+    ])
+    stats = sync_photo_registry(row, "manual-photo-ui")
+    reg_df = load_photo_registry_df()
+    base_photo_df = st.session_state.get("photo_df")
+    if not isinstance(base_photo_df, pd.DataFrame) or base_photo_df is None:
+        base_photo_df = pd.DataFrame()
+    st.session_state.photo_df = overlay_photo_registry(base_photo_df, reg_df)
+    if normalize_text(st.session_state.get("photo_name", "")) in {"", "ещё не загружен"} and isinstance(reg_df, pd.DataFrame) and not reg_df.empty:
+        st.session_state.photo_name = "из реестра сервера"
+    rebuild_current_df()
+    refresh_all_search_results()
+    return stats
+
+
+def render_manual_photo_manager(display_result_df: pd.DataFrame | None, tab_key: str) -> None:
+    if display_result_df is None or display_result_df.empty:
+        return
+    work = display_result_df.copy()
+    if "photo_url" not in work.columns:
+        work["photo_url"] = ""
+    missing = work[work["photo_url"].fillna("").map(lambda x: normalize_text(x) == "")].copy()
+    if missing.empty:
+        return
+
+    missing = missing.drop_duplicates(subset=["article_norm"], keep="first").reset_index(drop=True)
+    st.markdown('<div id="manual-photo-' + tab_key + '"></div>', unsafe_allow_html=True)
+    st.markdown('<div class="result-wrap">', unsafe_allow_html=True)
+    render_block_header(
+        "Фото нет — добавить вручную",
+        "Если по позиции нет фото, вставь прямую ссылку на картинку и сохрани. Она попадёт в реестр и дальше будет подставляться автоматически.",
+        icon="🖼️",
+        help_text="Это ручной режим вместо автопарсера. Сохраняем только ту ссылку, которую ты вставил сам, и используем её дальше как основную.",
+    )
+    options = missing["article"].astype(str).tolist()
+    labels = {str(r["article"]): f"{r['article']} — {normalize_text(r.get('name',''))[:110]}" for _, r in missing.iterrows()}
+    default_article = options[0] if options else ""
+    selected_article = st.selectbox(
+        "Позиция без фото",
+        options=options,
+        format_func=lambda x: labels.get(x, x),
+        key=f"manual_photo_article_{tab_key}",
+    )
+    current_row = missing[missing["article"] == selected_article].iloc[0] if selected_article in set(missing["article"].astype(str).tolist()) else None
+    st.caption(f"Сохраняем ссылку для артикула: {selected_article}")
+    if st.session_state.pop(f"manual_photo_clear_{tab_key}", False):
+        st.session_state.pop(f"manual_photo_url_{tab_key}", None)
+    manual_url = st.text_input(
+        "Ссылка на изображение",
+        key=f"manual_photo_url_{tab_key}",
+        placeholder="https://...jpg или https://...png",
+    )
+    c1, c2 = st.columns([1, 2])
+    if c1.button("Сохранить фото", key=f"manual_photo_save_{tab_key}", use_container_width=True):
+        try:
+            save_manual_photo_url(selected_article, manual_url)
+            st.session_state[f"manual_photo_message_{tab_key}"] = f"Фото для {selected_article} сохранено."
+            st.session_state[f"manual_photo_clear_{tab_key}"] = True
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Не удалось сохранить фото: {exc}")
+    if c2.button("Открыть ссылку", key=f"manual_photo_open_{tab_key}", use_container_width=True, disabled=not normalize_text(manual_url)):
+        st.markdown(f"[Открыть изображение]({manual_url})")
+    msg = normalize_text(st.session_state.get(f"manual_photo_message_{tab_key}", ""))
+    if msg:
+        st.success(msg)
+    st.markdown('</div>', unsafe_allow_html=True)
     if (not isinstance(st.session_state.get("avito_df"), pd.DataFrame) or st.session_state.get("avito_df").empty) and get_persisted_avito_file_path().exists():
         load_persisted_avito_source_into_state()
 
@@ -1562,10 +1730,14 @@ def ensure_photo_web_cache_table() -> None:
                 source_page TEXT,
                 source_domain TEXT,
                 status TEXT,
-                checked_at TEXT
+                checked_at TEXT,
+                candidate_urls_json TEXT DEFAULT '[]'
             )
             """
         )
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(photo_web_cache)")}
+        if "candidate_urls_json" not in cols:
+            conn.execute("ALTER TABLE photo_web_cache ADD COLUMN candidate_urls_json TEXT DEFAULT '[]'")
         conn.commit()
 
 
@@ -1580,28 +1752,48 @@ def get_photo_web_cache(article_norm: str) -> dict[str, Any] | None:
             "SELECT * FROM photo_web_cache WHERE article_norm=?",
             (article_norm,),
         ).fetchone()
-    return dict(row) if row else None
+    if not row:
+        return None
+    payload = dict(row)
+    try:
+        payload["candidate_urls"] = json.loads(payload.get("candidate_urls_json") or "[]")
+    except Exception:
+        payload["candidate_urls"] = []
+    if normalize_text(payload.get("status", "")) == "found" and is_bad_fallback_photo_url(str(payload.get("photo_url", ""))):
+        return None
+    return payload
 
 
-def save_photo_web_cache(article_norm: str, article: str, photo_url: str, source_page: str, source_domain: str, status: str) -> None:
+def save_photo_web_cache(article_norm: str, article: str, photo_url: str, source_page: str, source_domain: str, status: str, candidate_urls: Optional[list[str]] = None) -> None:
     article_norm = normalize_article(article_norm)
     if not article_norm:
         return
     ensure_photo_web_cache_table()
+    candidate_urls = [normalize_text(x) for x in (candidate_urls or []) if normalize_text(x)]
     with sqlite3.connect(get_photo_registry_path()) as conn:
         conn.execute(
             """
-            INSERT INTO photo_web_cache (article_norm, article, photo_url, source_page, source_domain, status, checked_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO photo_web_cache (article_norm, article, photo_url, source_page, source_domain, status, checked_at, candidate_urls_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(article_norm) DO UPDATE SET
                 article=excluded.article,
                 photo_url=excluded.photo_url,
                 source_page=excluded.source_page,
                 source_domain=excluded.source_domain,
                 status=excluded.status,
-                checked_at=excluded.checked_at
+                checked_at=excluded.checked_at,
+                candidate_urls_json=excluded.candidate_urls_json
             """,
-            (article_norm, normalize_text(article), normalize_text(photo_url), normalize_text(source_page), normalize_text(source_domain), normalize_text(status), datetime.utcnow().isoformat(timespec="seconds")),
+            (
+                article_norm,
+                normalize_text(article),
+                normalize_text(photo_url),
+                normalize_text(source_page),
+                normalize_text(source_domain),
+                normalize_text(status),
+                datetime.utcnow().isoformat(timespec="seconds"),
+                json.dumps(candidate_urls, ensure_ascii=False),
+            ),
         )
         conn.commit()
 
@@ -1625,54 +1817,375 @@ def fetch_url_text(url: str, timeout: int = 12) -> str:
     return ""
 
 
-def extract_image_candidates_from_html(html_text: str, page_url: str, article_norm: str = "") -> list[str]:
+def _normalized_page_text(text: str) -> str:
+    text = normalize_text(text)
+    if not text:
+        return ""
+    return re.sub(r"[^A-Za-z0-9А-Яа-я]+", "", text).upper()
+
+
+def page_mentions_article(html_text: str, article: str, article_norm: str) -> bool:
+    norm_article = normalize_article(article_norm or article)
+    if not norm_article or not normalize_text(html_text):
+        return False
+    page_norm = _normalized_page_text(html_text)
+    return norm_article in page_norm
+
+
+def _collect_json_ld_images(soup: BeautifulSoup, page_url: str) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for tag in soup.find_all("script", attrs={"type": re.compile(r"ld\+json", re.I)}):
+        raw = (tag.string or tag.get_text(" ", strip=True) or "").strip()
+        if not raw:
+            continue
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            continue
+        stack = [payload]
+        while stack:
+            cur = stack.pop()
+            if isinstance(cur, dict):
+                for key, val in cur.items():
+                    if key == "image":
+                        vals = val if isinstance(val, list) else [val]
+                        for item in vals:
+                            if isinstance(item, str):
+                                abs_url = urljoin(page_url, item)
+                                if abs_url not in seen:
+                                    seen.add(abs_url)
+                                    out.append(abs_url)
+                            elif isinstance(item, dict):
+                                for sub in [item.get("url"), item.get("contentUrl")]:
+                                    if isinstance(sub, str) and normalize_text(sub):
+                                        abs_url = urljoin(page_url, sub)
+                                        if abs_url not in seen:
+                                            seen.add(abs_url)
+                                            out.append(abs_url)
+                    elif isinstance(val, (dict, list)):
+                        stack.append(val)
+            elif isinstance(cur, list):
+                stack.extend(cur)
+    return out
+
+
+def extract_image_candidates_from_html(html_text: str, page_url: str, article: str = "", article_norm: str = "") -> list[str]:
+    if not normalize_text(html_text) or BeautifulSoup is None:
+        return []
+
+    article_norm = normalize_article(article_norm or article)
+    if not article_norm:
+        return []
+
+    soup = BeautifulSoup(html_text, "html.parser")
+    page_title = normalize_text(soup.title.get_text(" ", strip=True) if soup.title else "")
+    page_title_norm = _normalized_page_text(page_title)
+    domain = (urlparse(page_url).netloc or "").replace("www.", "").lower()
+
+    candidates: list[tuple[int, str]] = []
+    seen: set[str] = set()
+
+    def _push(url: str, score: int) -> None:
+        url = normalize_text(url)
+        if not url:
+            return
+        abs_url = urljoin(page_url, url)
+        if score <= 0 or is_bad_fallback_photo_url(abs_url.lower()) or abs_url in seen:
+            return
+        seen.add(abs_url)
+        candidates.append((score, abs_url))
+
+    def _score_url(url: str, extra_text: str = "", css_text: str = "", width: int = 0, height: int = 0) -> int:
+        low = url.lower()
+        if is_bad_fallback_photo_url(low):
+            return -999
+        score = 0
+        if low.endswith((".jpg", ".jpeg", ".png", ".webp")):
+            score += 5
+        if any(k in low for k in ["product", "products", "goods", "item", "catalog", "uploads", "cache", "large", "zoom", "original", "wp-content", "woocommerce"]):
+            score += 4
+        if width >= 250 or height >= 250:
+            score += 4
+        elif width and height and min(width, height) < 90:
+            score -= 8
+        css_low = normalize_text(css_text).lower()
+        if any(k in css_low for k in ["product", "gallery", "zoom", "main", "detail", "big", "image", "photo", "woocommerce", "thumb"]):
+            score += 8
+        if any(k in css_low for k in ["logo", "icon", "brand", "sprite", "header", "footer", "menu", "avatar"]):
+            score -= 14
+        extra_norm = _normalized_page_text(extra_text)
+        if article_norm and article_norm in extra_norm:
+            score += 22
+        if article_norm and article_norm in re.sub(r"[^A-Za-z0-9]", "", low).upper():
+            score += 14
+        if page_title_norm and extra_norm and any(token and token in extra_norm for token in re.findall(r"[A-Z0-9]{3,}", page_title_norm)[:4]):
+            score += 2
+        return score
+
+    # Site-specific selectors for the 4 target sites.
+    site_selectors = {
+        "t-toner.ru": [
+            ".woocommerce-product-gallery__image a[href]",
+            ".woocommerce-product-gallery__wrapper a[href]",
+            ".woocommerce-product-gallery__wrapper img[data-large_image]",
+            ".woocommerce-product-gallery__wrapper img[src]",
+            "img.wp-post-image",
+        ],
+        "interlink.ru": [
+            ".product-gallery a[href]",
+            ".product-gallery img[src]",
+            ".product__images a[href]",
+            ".product__images img[src]",
+            "img[itemprop='image']",
+        ],
+        "mrimage.ru": [
+            ".product-images a[href]",
+            ".product-images img[src]",
+            ".fotorama__stage__shaft img[src]",
+            "img[itemprop='image']",
+        ],
+        "rashodniki.ru": [
+            ".productdetails-view a[href]",
+            ".productdetails-view img[src]",
+            ".images a[href]",
+            ".images img[src]",
+        ],
+    }
+    for sel in site_selectors.get(domain, []):
+        for node in soup.select(sel):
+            raw = normalize_text(node.get('href') or node.get('data-large_image') or node.get('data-zoom-image') or node.get('data-original') or node.get('data-src') or node.get('src') or node.get('content'))
+            if not raw:
+                continue
+            extra = " ".join([
+                normalize_text(node.get('alt')),
+                normalize_text(node.get('title')),
+                normalize_text(node.get('class')),
+                normalize_text(node.get('id')),
+                page_title,
+            ])
+            score = _score_url(raw, extra_text=extra, css_text=f"{domain} {sel}") + 15
+            _push(raw, score)
+
+    for raw in _collect_json_ld_images(soup, page_url):
+        score = _score_url(raw, extra_text=page_title, css_text=f"{domain} jsonld") + 10
+        _push(raw, score)
+
+    # Generic fallback extraction.
+    for meta in soup.find_all("meta"):
+        key = normalize_text(meta.get("property") or meta.get("name")).lower()
+        if key not in {"og:image", "twitter:image", "twitter:image:src"}:
+            continue
+        raw = normalize_text(meta.get("content"))
+        if not raw:
+            continue
+        _push(raw, _score_url(raw, extra_text=page_title, css_text=key) + 8)
+
+    for img in soup.find_all("img"):
+        raw = normalize_text(img.get("data-large_image") or img.get("data-zoom-image") or img.get("data-original") or img.get("data-src") or img.get("src"))
+        if not raw:
+            continue
+        attrs = [
+            normalize_text(img.get("alt")),
+            normalize_text(img.get("title")),
+            normalize_text(img.get("class")),
+            normalize_text(img.get("id")),
+        ]
+        parent = img.parent
+        for _ in range(3):
+            if not parent:
+                break
+            attrs.extend([
+                normalize_text(parent.get("class")),
+                normalize_text(parent.get("id")),
+                normalize_text(parent.get_text(" ", strip=True)[:240]),
+            ])
+            parent = parent.parent
+        extra_text = " ".join(a for a in attrs if a)
+        css_text = " ".join(a for a in attrs[:4] if a)
+        width = height = 0
+        try:
+            width = int(float(img.get("width") or 0))
+        except Exception:
+            width = 0
+        try:
+            height = int(float(img.get("height") or 0))
+        except Exception:
+            height = 0
+        _push(raw, _score_url(raw, extra_text=extra_text, css_text=css_text, width=width, height=height))
+
+    candidates.sort(key=lambda x: (-x[0], x[1]))
+    return [u for _, u in candidates]
+
+def _clean_candidate_href(href: str, base_url: str, domain: str) -> str:
+    href = normalize_text(href)
+    if not href:
+        return ""
+    href = html.unescape(href)
+    href = urljoin(base_url, href)
+    if 'duckduckgo.com/l/?uddg=' in href:
+        m = re.search(r'uddg=([^&]+)', href)
+        if m:
+            href = unquote(m.group(1))
+    if domain not in href:
+        return ""
+    low = href.lower()
+    bad_bits = ['#', '/cart', '/checkout', '/compare', '/wishlist', '/login', '/register', '/blog', '/news', '/contacts', '/delivery', '/privacy', '/policy']
+    if any(bit in low for bit in bad_bits):
+        return ""
+    return href
+
+
+def _extract_product_links_from_html(html_text: str, base_url: str, article: str, domain: str) -> list[str]:
     if not normalize_text(html_text):
         return []
-    attrs = ["content", "src", "data-src", "data-large_image", "data-zoom-image", "data-original", "href"]
-    patterns = []
-    for attr in attrs:
-        patterns.append(rf"{attr}=[\"']([^\"']+)[\"']")
-    urls: list[str] = []
-    for pat in patterns:
-        for match in re.findall(pat, html_text, flags=re.IGNORECASE):
-            url = normalize_text(match)
-            if not url:
-                continue
-            abs_url = urljoin(page_url, url)
-            low = abs_url.lower()
-            if not any(ext in low for ext in [".jpg", ".jpeg", ".png", ".webp", ".gif"]) and not any(k in low for k in ["image", "images", "product", "uploads", "cache"]):
-                continue
-            if any(k in low for k in ["logo", "icon", "favicon", "sprite", "placeholder", "blank.gif", "1x1", "captcha"]):
-                continue
-            urls.append(abs_url)
-    seen = set()
-    scored: list[tuple[int, str]] = []
-    for url in urls:
-        if url in seen:
-            continue
-        seen.add(url)
+    article = normalize_text(article)
+    article_norm = normalize_article(article)
+    found: list[tuple[int, str]] = []
+    seen: set[str] = set()
+
+    def _score(href: str, text: str) -> int:
+        href_low = href.lower()
+        text_norm = _normalized_page_text(text)
         score = 0
-        low = url.lower()
-        if article_norm and article_norm.lower() in re.sub(r'[^a-z0-9]', '', low):
-            score += 10
-        if any(k in low for k in ["product", "goods", "item", "kartrid", "cartridge", "uploads"]):
+        if article_norm and article_norm in re.sub(r'[^A-Za-z0-9]', '', href_low).upper():
+            score += 25
+        if article_norm and article_norm in text_norm:
+            score += 20
+        if any(k in href_low for k in ['/product/', '/shop/', '/kartrid', '/kartridzhi/', '/internet-magazin/']):
+            score += 8
+        if any(k in href_low for k in ['original', 'detail', 'chern', 'black', 'pantum', 'brother', 'hp', 'canon', 'xerox']):
             score += 3
-        if low.endswith((".jpg", ".jpeg", ".png", ".webp")):
-            score += 2
-        scored.append((score, url))
-    scored.sort(key=lambda x: (-x[0], x[1]))
-    return [u for _, u in scored]
+        if any(k in href_low for k in ['/search', '?s=', 'component/search']):
+            score -= 8
+        return score
+
+    if BeautifulSoup is not None:
+        soup = BeautifulSoup(html_text, 'html.parser')
+        for a in soup.find_all('a'):
+            href = _clean_candidate_href(a.get('href') or '', base_url, domain)
+            if not href or href in seen:
+                continue
+            text = normalize_text(a.get_text(' ', strip=True))
+            sc = _score(href, text)
+            if sc <= 0:
+                continue
+            seen.add(href)
+            found.append((sc, href))
+    for raw in re.findall(r"href=[\"']([^\"']+)[\"']", html_text, flags=re.IGNORECASE):
+        href = _clean_candidate_href(raw, base_url, domain)
+        if not href or href in seen:
+            continue
+        sc = _score(href, href)
+        if sc <= 0:
+            continue
+        seen.add(href)
+        found.append((sc, href))
+
+    found.sort(key=lambda x: (-x[0], x[1]))
+    return [u for _, u in found[:FALLBACK_SEARCH_LIMIT]]
 
 
-def discover_product_pages(article: str, domain: str) -> list[str]:
+def _extract_brand_hint(context_text: str) -> str:
+    text = contains_text(context_text)
+    for brand in ["PANTUM", "BROTHER", "CANON", "HP", "XEROX", "KYOCERA", "RICOH", "SAMSUNG", "SHARP", "OKI", "LEXMARK", "KONICA", "PANASONIC", "AVISION"]:
+        if brand in text:
+            return brand.title().replace("Hp", "HP")
+    return ""
+
+
+def _site_search_urls(article: str, domain: str, context_text: str = "") -> list[str]:
+    brand = _extract_brand_hint(context_text)
+    queries = [article]
+    if brand:
+        queries.append(f"{article} {brand}")
+    urls: list[str] = []
+    for q_text in queries:
+        q = quote_plus(q_text)
+        if domain == 't-toner.ru':
+            urls.extend([
+                f'https://{domain}/?s={q}&post_type=product',
+                f'https://{domain}/?s={q}',
+            ])
+        elif domain == 'interlink.ru':
+            urls.extend([
+                f'https://{domain}/?s={q}',
+                f'https://{domain}/search/?q={q}',
+            ])
+        elif domain == 'mrimage.ru':
+            urls.extend([
+                f'https://{domain}/?s={q}',
+                f'https://{domain}/search?keyword={q}',
+            ])
+        elif domain == 'rashodniki.ru':
+            urls.extend([
+                f'https://{domain}/component/search/?searchword={q}',
+                f'https://{domain}/search?searchword={q}',
+            ])
+    seen: set[str] = set()
+    return [u for u in urls if not (u in seen or seen.add(u))]
+
+
+def _site_direct_product_guesses(article: str, domain: str, context_text: str = "") -> list[str]:
+    article = normalize_text(article)
+    if not article:
+        return []
+    slug = article.lower().replace("/", "-").replace("_", "-")
+    slug = re.sub(r"[^a-z0-9-]+", "-", slug)
+    slug = re.sub(r"-+", "-", slug).strip("-")
+    brand = _extract_brand_hint(context_text).lower().replace(" ", "-")
+    guesses: list[str] = []
+    if domain == 't-toner.ru':
+        if brand:
+            guesses.append(f'https://{domain}/product/{brand}-{slug}-original/')
+            guesses.append(f'https://{domain}/product/{brand}-{slug}/')
+        guesses.extend([
+            f'https://{domain}/product/{slug}-original/',
+            f'https://{domain}/product/{slug}/',
+        ])
+    return guesses
+
+
+def discover_product_pages(article: str, domain: str, context_text: str = "") -> list[str]:
     article = normalize_text(article)
     if not article or requests is None:
         return []
+
+    found: list[str] = []
+    seen: set[str] = set()
+
+    def _append(urls: list[str]) -> None:
+        for u in urls:
+            if not u or u in seen:
+                continue
+            seen.add(u)
+            found.append(u)
+            if len(found) >= FALLBACK_SEARCH_LIMIT:
+                return
+
+    for guess in _site_direct_product_guesses(article, domain, context_text):
+        html_text = fetch_url_text(guess, timeout=10)
+        if html_text and page_mentions_article(html_text, article, normalize_article(article)):
+            _append([guess])
+            if len(found) >= FALLBACK_SEARCH_LIMIT:
+                return found
+
+    for search_url in _site_search_urls(article, domain, context_text):
+        html_text = fetch_url_text(search_url, timeout=12)
+        if not html_text:
+            continue
+        _append(_extract_product_links_from_html(html_text, search_url, article, domain))
+        if len(found) >= FALLBACK_SEARCH_LIMIT:
+            return found
+
     queries = [
         f"site:{domain} {article}",
         f'site:{domain} "{article}"',
+        f'site:{domain} {article} оригинальный',
     ]
-    found: list[str] = []
+    brand = _extract_brand_hint(context_text)
+    if brand:
+        queries.append(f'site:{domain} "{article}" {brand}')
     for q in queries:
         for search_url in [
             f"https://duckduckgo.com/html/?q={quote_plus(q)}",
@@ -1681,44 +2194,103 @@ def discover_product_pages(article: str, domain: str) -> list[str]:
             html_text = fetch_url_text(search_url, timeout=10)
             if not html_text:
                 continue
-            for raw in re.findall(r"href=[\"']([^\"']+)[\"']", html_text, flags=re.IGNORECASE):
-                href = html.unescape(raw)
-                href = urljoin(search_url, href)
-                if 'duckduckgo.com/l/?uddg=' in href:
-                    m = re.search(r'uddg=([^&]+)', href)
-                    if m:
-                        href = unquote(m.group(1))
-                if domain not in href:
-                    continue
-                if href not in found:
-                    found.append(href)
-                if len(found) >= FALLBACK_SEARCH_LIMIT:
-                    return found
+            _append(_extract_product_links_from_html(html_text, search_url, article, domain))
+            if len(found) >= FALLBACK_SEARCH_LIMIT:
+                return found
     return found
 
+def _validate_cached_web_payload(payload: dict[str, Any] | None, article: str, article_norm: str) -> bool:
+    if not payload or normalize_text(payload.get("status", "")) != "found":
+        return False
+    source_page = normalize_text(payload.get("source_page", ""))
+    photo_url = normalize_text(payload.get("photo_url", ""))
+    if not source_page or not photo_url or is_bad_fallback_photo_url(photo_url):
+        return False
+    html_text = fetch_url_text(source_page, timeout=10)
+    if not html_text or not page_mentions_article(html_text, article, article_norm):
+        return False
+    imgs = extract_image_candidates_from_html(html_text, source_page, article=article, article_norm=article_norm)
+    return photo_url in imgs[:6]
 
-def discover_photo_url_for_article(article: str) -> tuple[str, str, str]:
+
+def discover_photo_candidates_for_article(article: str, context_text: str = "", max_candidates: int = 4) -> list[dict[str, str]]:
     article_norm = normalize_article(article)
     cached = get_photo_web_cache(article_norm)
-    if cached and normalize_text(cached.get("status", "")) in {"found", "not_found"}:
-        return (normalize_text(cached.get("photo_url", "")), normalize_text(cached.get("source_page", "")), normalize_text(cached.get("source_domain", "")))
+    if _validate_cached_web_payload(cached, article, article_norm):
+        candidate_urls = [normalize_text(x) for x in (cached.get("candidate_urls") or []) if normalize_text(x)]
+        if not candidate_urls:
+            candidate_urls = [normalize_text(cached.get("photo_url", ""))]
+        return [
+            {
+                "url": url,
+                "source_page": normalize_text(cached.get("source_page", "")),
+                "source_domain": normalize_text(cached.get("source_domain", "")),
+            }
+            for url in candidate_urls[:max_candidates]
+            if normalize_text(url)
+        ]
 
     if requests is None:
-        save_photo_web_cache(article_norm, article, "", "", "", "not_found")
-        return "", "", ""
+        save_photo_web_cache(article_norm, article, "", "", "", "not_found", [])
+        return []
 
+    results: list[dict[str, str]] = []
+    seen_urls: set[str] = set()
     for domain in FALLBACK_PHOTO_DOMAINS:
-        for page_url in discover_product_pages(article, domain):
+        domain_best: dict[str, str] | None = None
+        for page_url in discover_product_pages(article, domain, context_text=context_text):
             html_text = fetch_url_text(page_url, timeout=12)
-            if not html_text:
+            if not html_text or not page_mentions_article(html_text, article, article_norm):
                 continue
-            imgs = extract_image_candidates_from_html(html_text, page_url, article_norm=article_norm)
-            if imgs:
-                best = imgs[0]
-                save_photo_web_cache(article_norm, article, best, page_url, domain, "found")
-                return best, page_url, domain
-    save_photo_web_cache(article_norm, article, "", "", "", "not_found")
+            imgs = extract_image_candidates_from_html(html_text, page_url, article=article, article_norm=article_norm)
+            for img_url in imgs:
+                if is_bad_fallback_photo_url(img_url) or img_url in seen_urls:
+                    continue
+                domain_best = {"url": img_url, "source_page": page_url, "source_domain": domain}
+                break
+            if domain_best:
+                break
+        if domain_best:
+            seen_urls.add(domain_best["url"])
+            results.append(domain_best)
+        if len(results) >= max_candidates:
+            break
+
+    if results:
+        save_photo_web_cache(
+            article_norm,
+            article,
+            results[0]["url"],
+            results[0]["source_page"],
+            results[0]["source_domain"],
+            "found",
+            [r["url"] for r in results],
+        )
+        return results
+
+    save_photo_web_cache(article_norm, article, "", "", "", "not_found", [])
+    return []
+
+
+def discover_photo_url_for_article(article: str, context_text: str = "") -> tuple[str, str, str]:
+    candidates = discover_photo_candidates_for_article(article, context_text=context_text, max_candidates=4)
+    if candidates:
+        first = candidates[0]
+        return normalize_text(first.get("url", "")), normalize_text(first.get("source_page", "")), normalize_text(first.get("source_domain", ""))
     return "", "", ""
+
+
+def row_needs_fallback_photo(row: pd.Series) -> bool:
+    url = normalize_text(row.get("photo_url", ""))
+    source_sheet = normalize_text(row.get("source_sheet", "")).lower()
+    if not url:
+        return True
+    # web-fallback фото можно обновлять заново: если раньше поймался мусор, даём парсеру пройти по всем сайтам ещё раз
+    if source_sheet.startswith("web:"):
+        return True
+    if source_sheet.startswith("web:") and is_bad_fallback_photo_url(url):
+        return True
+    return False
 
 
 def inject_web_photos_into_registry(found_rows: list[dict[str, str]], import_name: str = "web-fallback") -> None:
@@ -1735,40 +2307,51 @@ def try_fill_missing_photos(df: pd.DataFrame | None, enabled: bool = False, limi
     if df is None or df.empty or not enabled:
         return df
     work = df.copy()
-    missing = work[work.get("photo_url", pd.Series(dtype=object)).fillna("").map(lambda x: not bool(normalize_text(x)))].head(limit)
+    if "source_sheet" not in work.columns:
+        work["source_sheet"] = ""
+    if "photo_url" not in work.columns:
+        work["photo_url"] = ""
+    if "photo_candidates" not in work.columns:
+        work["photo_candidates"] = [[] for _ in range(len(work))]
+    missing = work[work.apply(row_needs_fallback_photo, axis=1)].head(limit)
     if missing.empty:
         return work
     found_rows: list[dict[str, str]] = []
     article_to_url: dict[str, str] = {}
+    article_to_source: dict[str, str] = {}
+    article_to_candidates: dict[str, list[str]] = {}
     for _, row in missing.iterrows():
         article = normalize_text(row.get("article", ""))
         article_norm = normalize_article(row.get("article_norm", article))
         if not article_norm:
             continue
-        url, source_page, domain = discover_photo_url_for_article(article)
-        if url:
-            article_to_url[article_norm] = url
-            found_rows.append({
-                "article": article or article_norm,
-                "article_norm": article_norm,
-                "photo_url": url,
-                "source_sheet": f"web:{domain}",
-                "meta_color": normalize_text(row.get("meta_color", "")),
-                "meta_iso_pages": normalize_text(row.get("meta_iso_pages", "")),
-                "meta_manufacturer_code": normalize_text(row.get("meta_manufacturer_code", "")),
-                "meta_model": normalize_text(row.get("meta_model", "")),
-                "meta_fits_models": normalize_text(row.get("meta_fits_models", "")),
-            })
+        context_text = normalize_text(row.get("name", ""))
+        candidates = discover_photo_candidates_for_article(article, context_text=context_text, max_candidates=4)
+        if candidates:
+            urls = [normalize_text(c.get("url", "")) for c in candidates if normalize_text(c.get("url", ""))]
+            if urls:
+                article_to_url[article_norm] = urls[0]
+                article_to_source[article_norm] = f"web:{normalize_text(candidates[0].get('source_domain', ''))}"
+                article_to_candidates[article_norm] = urls
+                found_rows.append({
+                    "article": article or article_norm,
+                    "article_norm": article_norm,
+                    "photo_url": urls[0],
+                    "source_sheet": article_to_source[article_norm],
+                    "meta_color": normalize_text(row.get("meta_color", "")),
+                    "meta_iso_pages": normalize_text(row.get("meta_iso_pages", "")),
+                    "meta_manufacturer_code": normalize_text(row.get("meta_manufacturer_code", "")),
+                    "meta_model": normalize_text(row.get("meta_model", "")),
+                    "meta_fits_models": normalize_text(row.get("meta_fits_models", "")),
+                })
     if found_rows:
         inject_web_photos_into_registry(found_rows)
         work["photo_url"] = work.apply(lambda r: article_to_url.get(normalize_article(r.get("article_norm", r.get("article", ""))), normalize_text(r.get("photo_url", ""))), axis=1)
+        work["source_sheet"] = work.apply(lambda r: article_to_source.get(normalize_article(r.get("article_norm", r.get("article", ""))), normalize_text(r.get("source_sheet", ""))), axis=1)
+        work["photo_candidates"] = work.apply(lambda r: article_to_candidates.get(normalize_article(r.get("article_norm", r.get("article", ""))), r.get("photo_candidates", []) if isinstance(r.get("photo_candidates", []), list) else []), axis=1)
         reg_df = load_photo_registry_df()
         if isinstance(reg_df, pd.DataFrame) and not reg_df.empty:
-            st.session_state.photo_df = reg_df[[
-                "article", "article_norm", "photo_url", "source_sheet",
-                "meta_color", "meta_iso_pages", "meta_manufacturer_code",
-                "meta_model", "meta_fits_models",
-            ]].copy()
+            st.session_state.photo_df = overlay_photo_registry(st.session_state.get("photo_df"), reg_df)
     return work
 
 def init_state() -> None:
@@ -2521,7 +3104,7 @@ def status_visual_class(status: str) -> str:
 
 
 
-def render_results_table(df: pd.DataFrame, price_mode: str, round100: bool, custom_discount: float, distributor_map: Optional[dict[str, dict[str, Any]]] = None, show_photos: bool = True) -> None:
+def render_results_table(df: pd.DataFrame, price_mode: str, round100: bool, custom_discount: float, distributor_map: Optional[dict[str, dict[str, Any]]] = None, show_photos: bool = True, manual_anchor_id: str = "") -> None:
     selected_label = current_price_label(price_mode, custom_discount)
     distributor_map = distributor_map or {}
     rows_html = []
@@ -2571,18 +3154,42 @@ def render_results_table(df: pd.DataFrame, price_mode: str, round100: bool, cust
             """
 
         photo_url = normalize_text(row.get("photo_url", "")) if show_photos else ""
+        candidate_urls = []
+        if show_photos:
+            raw_candidates = row.get("photo_candidates", [])
+            if isinstance(raw_candidates, list):
+                candidate_urls = [normalize_text(x) for x in raw_candidates if normalize_text(x)]
+            if photo_url and photo_url not in candidate_urls:
+                candidate_urls.insert(0, photo_url)
+            # Убираем дубли, но сохраняем порядок: 1 сайт = 1 кандидат.
+            seen_c = set()
+            candidate_urls = [u for u in candidate_urls if not (u in seen_c or seen_c.add(u))][:4]
+            if not photo_url and candidate_urls:
+                photo_url = candidate_urls[0]
         if show_photos and photo_url:
             photo_html = f"""
             <a href="{html.escape(photo_url, quote=True)}" target="_blank" class="photo-wrap">
-              <img src="{html.escape(photo_url, quote=True)}" class="result-photo" loading="lazy" onerror="this.style.display='none'; this.parentNode.innerHTML='<div class=&quot;photo-empty photo-empty-small&quot;>нет фото</div>';">
-            </a>
+              <img src="{html.escape(photo_url, quote=True)}" class="result-photo" loading="lazy" onerror="this.style.display='none'; this.parentNode.innerHTML='<div class=&quot;photo-empty photo-empty-small&quot;>нет фото</div>';"></a>
             """
         elif show_photos:
-            photo_html = "<div class='photo-empty photo-empty-small'>нет фото</div>"
+            if manual_anchor_id:
+                photo_html = f"<a href='#{html.escape(manual_anchor_id, quote=True)}' class='photo-empty photo-empty-small photo-empty-link'>нет фото</a>"
+            else:
+                photo_html = "<div class='photo-empty photo-empty-small'>нет фото</div>"
         else:
             photo_html = ""
 
-        item_photo_html = f"<div class='item-photo'>{photo_html}</div>" if show_photos else ""
+        candidate_html = ""
+        if show_photos and len(candidate_urls) > 1:
+            thumbs = []
+            for idx, c_url in enumerate(candidate_urls[:4]):
+                thumbs.append(
+                    f"<a href='{html.escape(c_url, quote=True)}' target='_blank' class='photo-thumb-wrap {'active' if idx == 0 else ''}' title='Кандидат {idx+1}'><img src='{html.escape(c_url, quote=True)}' class='photo-thumb' loading='lazy'></a>"
+                )
+            candidate_html = "<div class='photo-candidates'>" + "".join(thumbs) + "</div>"
+
+        item_photo_html = f"<div class='item-photo'>{photo_html}{candidate_html}</div>" if show_photos else ""
+
 
         rows_html.append(
             f"""
@@ -3190,14 +3797,7 @@ with st.sidebar:
                 )
                 st.session_state.photo_last_sync_sig = photo_sig
             reg_df = load_photo_registry_df()
-            if isinstance(reg_df, pd.DataFrame) and not reg_df.empty:
-                st.session_state.photo_df = reg_df[[
-                    "article", "article_norm", "photo_url", "source_sheet",
-                    "meta_color", "meta_iso_pages", "meta_manufacturer_code",
-                    "meta_model", "meta_fits_models",
-                ]].copy()
-            else:
-                st.session_state.photo_df = loaded_photo_df
+            st.session_state.photo_df = overlay_photo_registry(loaded_photo_df, reg_df)
             st.session_state.photo_name = photo_uploaded.name + " • сохранён в /data"
             rebuild_current_df()
             refresh_all_search_results()
@@ -3208,8 +3808,7 @@ with st.sidebar:
             ensure_photo_registry_loaded()
     st.markdown(f'<div class="sidebar-status">Фото: {html.escape(st.session_state.get("photo_name", "ещё не загружен"))}</div>', unsafe_allow_html=True)
     st.markdown(f'<div class="sidebar-mini">Файл на сервере: {html.escape(str(get_persisted_photo_file_path()))}</div>', unsafe_allow_html=True)
-    st.checkbox("Резервно искать фото на сайтах, если в нашем каталоге фото нет", key="enable_fallback_photo_parser")
-    st.markdown('<div class="sidebar-mini">Экспериментально и медленнее: если фото не найдено в нашем каталоге, приложение может попробовать найти картинку на внешних сайтах и сохранить ссылку в реестр.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sidebar-mini">Автопоиск фото по сайтам отключён. Если у позиции нет фото, его можно добавить вручную прямо из результатов поиска — ссылка сохранится в реестр и будет использоваться дальше автоматически.</div>', unsafe_allow_html=True)
     if st.session_state.get("photo_registry_message"):
         st.markdown(f'<div class="sidebar-mini">{html.escape(st.session_state.get("photo_registry_message"))}</div>', unsafe_allow_html=True)
     st.markdown(f'<div class="sidebar-mini">{html.escape(photo_registry_summary_text())}</div>', unsafe_allow_html=True)
@@ -3454,7 +4053,6 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
     display_result_df = result_df
     if isinstance(result_df, pd.DataFrame) and show_photos:
         display_result_df = apply_photo_map(result_df, photo_df)
-        display_result_df = try_fill_missing_photos(display_result_df, enabled=bool(st.session_state.get("enable_fallback_photo_parser", False)), limit=12)
 
     if result_df is None:
         render_info_banner(
@@ -3477,7 +4075,7 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
         else:
             compare_map = build_distributor_compare(result_df, min_qty=min_dist_qty)
             render_results_insight_dashboard(result_df, compare_map, source_pairs)
-            render_results_table(display_result_df.head(200), price_mode, round100, custom_discount, distributor_map=compare_map, show_photos=show_photos)
+            render_results_table(display_result_df.head(200), price_mode, round100, custom_discount, distributor_map=compare_map, show_photos=show_photos, manual_anchor_id=f'manual-photo-{tab_key}')
             st.download_button(
                 "⬇️ Скачать результаты в Excel",
                 to_excel_bytes(display_result_df, price_mode, round100, custom_discount, min_dist_qty),
@@ -3486,6 +4084,7 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
                 use_container_width=True,
                 key=f"download_results_{tab_key}",
             )
+            render_manual_photo_manager(display_result_df.head(200) if isinstance(display_result_df, pd.DataFrame) else display_result_df, tab_key)
             with st.expander("Показать техническую таблицу"):
                 tech = display_result_df.copy()
                 tech["Наша цена"] = tech["sale_price"].map(fmt_price)
