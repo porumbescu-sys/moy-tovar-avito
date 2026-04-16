@@ -581,6 +581,53 @@ def build_row_compare_codes(article: object, name: object) -> list[str]:
     return unique_norm_codes([article, *extract_article_candidates_from_text(name)])
 
 
+COMPATIBLE_BRAND_MARKERS: list[tuple[str, str]] = [
+    ("NV PRINT", "NV Print"),
+    ("STATIC CONTROL", "Static Control"),
+    ("HI-BLACK", "Hi-Black"),
+    ("NETPRODUCT", "NetProduct"),
+    ("PROFILINE", "ProfiLine"),
+    ("G&G", "G&G"),
+    ("MYTONER", "MyToner"),
+    ("MYTONE", "MyTone"),
+    ("BLOSSOM", "Blossom"),
+    ("CACTUS", "Cactus"),
+    ("SAKURA", "Sakura"),
+    ("KATUN", "Katun"),
+    ("UNITON", "Uniton"),
+    ("COPYRITE", "Copyrite"),
+    ("COLORING", "Coloring"),
+    ("BULAT", "Bulat"),
+    ("CET", "CET"),
+]
+
+COMPATIBLE_ARTICLE_PREFIX_BRANDS = {
+    "BS": "Blossom",
+    "CS": "Cactus",
+    "BSL": "Bulat",
+    "CET": "CET",
+    "NV": "NV Print",
+    "SC": "Static Control",
+    "STA": "Static Control",
+    "KAT": "Katun",
+    "KTN": "Katun",
+    "SKR": "Sakura",
+}
+
+
+def extract_compatible_brand(name: object, article: object = "") -> str:
+    text = contains_text(name)
+    for needle, label in COMPATIBLE_BRAND_MARKERS:
+        if needle in text:
+            return label
+    article_text = normalize_text(article)
+    if article_text:
+        prefix = article_text.split('-', 1)[0].strip().upper()
+        if prefix in COMPATIBLE_ARTICLE_PREFIX_BRANDS:
+            return COMPATIBLE_ARTICLE_PREFIX_BRANDS[prefix]
+    return ""
+
+
 SERIES_SUFFIX_ORDER = {"A": 0, "AC": 1, "X": 2, "XC": 3, "Y": 4, "YC": 5, "M": 6, "MC": 7, "C": 8, "K": 9}
 
 
@@ -1900,22 +1947,24 @@ def refresh_all_search_results() -> None:
         query = normalize_text(st.session_state.get(submitted_key, ""))
         desired_sig = (query, search_mode, sheet_name, st.session_state.get("comparison_version", ""))
         if query and isinstance(base_df, pd.DataFrame):
-            st.session_state[result_key] = search_in_df(base_df, query, search_mode)
+            st.session_state[result_key] = search_in_df(base_df, query, search_mode, sheet_name=sheet_name)
             st.session_state[sig_key] = desired_sig
         else:
             st.session_state[result_key] = None
             st.session_state[sig_key] = None
 
 
-def search_in_df(df: pd.DataFrame, query: str, search_mode: str) -> pd.DataFrame:
+def search_in_df(df: pd.DataFrame, query: str, search_mode: str, sheet_name: str = "") -> pd.DataFrame:
     tokens = split_query_parts(query)
     if not tokens:
         return df.iloc[0:0].copy()
 
     exact_hits = []
     linked_hits = []
+    relaxed_hits = []
     contains_hits = []
     seen: set[str] = set()
+    relaxed_sheet = sheet_name in {"Уценка", "Совместимые"}
 
     for token in tokens:
         token_norm = normalize_article(token)
@@ -1944,6 +1993,25 @@ def search_in_df(df: pd.DataFrame, query: str, search_mode: str) -> pd.DataFrame
                 row_dict["match_query"] = token
                 linked_hits.append(row_dict)
 
+        # Для Уценки и Совместимых разрешаем более мягкий OEM-поиск:
+        # пользователь может ввести оригинальный код, а мы найдём его внутри
+        # префиксного артикула/названия (например BS-HPCE505A или CE505A-UCENKA).
+        if relaxed_sheet and token_norm:
+            relaxed_mask = (
+                df["article_norm"].str.contains(re.escape(token_norm), na=False, regex=True)
+                | df["search_blob_compact"].str.contains(re.escape(token_norm), na=False, regex=True)
+            )
+            relaxed = df[relaxed_mask]
+            for _, row in relaxed.iterrows():
+                key = str(row["article_norm"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                row_dict = row.to_dict()
+                row_dict["match_type"] = "relaxed"
+                row_dict["match_query"] = token
+                relaxed_hits.append(row_dict)
+
         if search_mode == "Артикул + название + бренд":
             mask = (
                 df["search_blob"].str.contains(re.escape(token_upper), na=False, regex=True)
@@ -1960,11 +2028,11 @@ def search_in_df(df: pd.DataFrame, query: str, search_mode: str) -> pd.DataFrame
                 row_dict["match_query"] = token
                 contains_hits.append(row_dict)
 
-    rows = exact_hits + linked_hits + contains_hits
+    rows = exact_hits + linked_hits + relaxed_hits + contains_hits
     if not rows:
         return df.iloc[0:0].copy()
     out = pd.DataFrame(rows)
-    rank_map = {"exact": 0, "linked": 1, "contains": 2}
+    rank_map = {"exact": 0, "linked": 1, "relaxed": 2, "contains": 3}
     out["_rank"] = out["match_type"].map(lambda x: rank_map.get(str(x), 99))
     out = out.sort_values(["_rank", "article"]).drop(columns=["_rank"]).reset_index(drop=True)
     return out
@@ -2422,7 +2490,7 @@ def build_product_analysis_workbook_bytes(result_df: pd.DataFrame, min_qty: floa
 
 
 def build_offer_template(df: pd.DataFrame, query: str, round100: bool, footer_text: str, search_mode: str) -> str:
-    result_df = search_in_df(df, query, search_mode)
+    result_df = search_in_df(df, query, search_mode, sheet_name=st.session_state.get("selected_sheet", ""))
     if result_df.empty:
         return ""
     lines: list[str] = []
@@ -2454,7 +2522,7 @@ def build_offer_template(df: pd.DataFrame, query: str, round100: bool, footer_te
 
 
 def build_selected_price_template(df: pd.DataFrame, query: str, price_mode: str, round100: bool, custom_discount: float, search_mode: str) -> str:
-    result_df = search_in_df(df, query, search_mode)
+    result_df = search_in_df(df, query, search_mode, sheet_name=st.session_state.get("selected_sheet", ""))
     if result_df.empty:
         return ""
     parts = []
@@ -3536,7 +3604,7 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
         desired_sig = (normalized_query, search_mode, sheet_name, st.session_state.get("comparison_version", ""))
         if isinstance(base_sheet_df, pd.DataFrame) and normalize_text(normalized_query):
             if st.session_state.get(sig_key) != desired_sig or result_df is None:
-                result_df = search_in_df(base_sheet_df, normalized_query, search_mode)
+                result_df = search_in_df(base_sheet_df, normalized_query, search_mode, sheet_name=sheet_name)
                 st.session_state[result_key] = result_df
                 st.session_state[sig_key] = desired_sig
         else:
@@ -3548,7 +3616,7 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
     desired_sig = (submitted_query, search_mode, sheet_name, st.session_state.get("comparison_version", ""))
     if isinstance(base_sheet_df, pd.DataFrame) and normalize_text(submitted_query):
         if st.session_state.get(sig_key) != desired_sig or result_df is None:
-            result_df = search_in_df(base_sheet_df, submitted_query, search_mode)
+            result_df = search_in_df(base_sheet_df, submitted_query, search_mode, sheet_name=sheet_name)
             st.session_state[result_key] = result_df
             st.session_state[sig_key] = desired_sig
     else:
@@ -3607,7 +3675,7 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
                 normalized_query = "\n".join(unique_preserve_order(selected_articles))
                 st.session_state[search_key] = normalized_query
                 st.session_state[submitted_key] = normalized_query
-                result_df = search_in_df(base_sheet_df, normalized_query, search_mode)
+                result_df = search_in_df(base_sheet_df, normalized_query, search_mode, sheet_name=sheet_name)
                 st.session_state[result_key] = result_df
                 st.session_state[sig_key] = (normalized_query, search_mode, sheet_name, st.session_state.get("comparison_version", ""))
                 submitted_query = normalized_query
@@ -3624,6 +3692,23 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
         return
 
     display_result_df = result_df
+    if isinstance(result_df, pd.DataFrame) and sheet_name == "Совместимые" and not result_df.empty:
+        compatible_result = result_df.copy()
+        compatible_result["compatible_brand"] = compatible_result.apply(
+            lambda row: extract_compatible_brand(row.get("name", ""), row.get("article", "")),
+            axis=1,
+        )
+        brand_options = [b for b in sorted({normalize_text(x) for x in compatible_result["compatible_brand"].tolist() if normalize_text(x)})]
+        selected_brand = st.selectbox(
+            "Фильтр по бренду совместимки",
+            ["Все бренды", *brand_options],
+            key="compatible_brand_filter",
+            help="Бренд берётся из названия совместимой позиции; если не распознан, строка остаётся только в режиме 'Все бренды'.",
+        )
+        if selected_brand != "Все бренды":
+            compatible_result = compatible_result[compatible_result["compatible_brand"] == selected_brand].reset_index(drop=True)
+        result_df = compatible_result
+        st.session_state[result_key] = result_df
     if isinstance(result_df, pd.DataFrame) and show_photos:
         display_result_df = apply_photo_map(result_df, photo_df)
 
