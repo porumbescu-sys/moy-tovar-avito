@@ -325,18 +325,51 @@ def normalize_pages_value(value: object) -> str:
     raw = normalize_text(value)
     if not raw:
         return ""
-    digits = re.sub(r"[^\d]", "", raw)
-    if digits:
-        try:
-            return f"{int(digits):,}".replace(",", " ")
-        except Exception:
-            return digits
+    # Берём только первое числовое значение и игнорируем хвосты вроде "(A4)" / "(А4)".
+    # Иначе строка "2500 (A4)" превращается в ошибочные "25004".
+    m = re.search(r"(\d[\d\s]{1,})", raw)
+    if not m:
+        m = re.search(r"(\d+)", raw)
+    if m:
+        digits = re.sub(r"\s+", "", m.group(1))
+        if digits:
+            try:
+                return f"{int(digits):,}".replace(",", " ")
+            except Exception:
+                return digits
+    return raw
+
+
+def simplify_template_color(value: object) -> str:
+    raw = normalize_text(value)
+    if not raw:
+        return ""
+    low = raw.lower()
+    # Если цвет уже содержит русское название и английский перевод в скобках,
+    # оставляем только один, более короткий и привычный вариант.
+    replacements = [
+        (r"^(ч[её]рн(?:ый|ая|ое)?)\s*\((?:black)\)$", "чёрный"),
+        (r"^(черный)\s*\((?:black)\)$", "чёрный"),
+        (r"^(голуб(?:ой|ая|ое)?)\s*\((?:cyan)\)$", "голубой"),
+        (r"^(ж[её]лт(?:ый|ая|ое)?)\s*\((?:yellow)\)$", "жёлтый"),
+        (r"^(пурпурн(?:ый|ая|ое)?)\s*\((?:magenta)\)$", "пурпурный"),
+        (r"^(син(?:ий|яя|ее)?)\s*\((?:blue)\)$", "синий"),
+        (r"^(красн(?:ый|ая|ое)?)\s*\((?:red)\)$", "красный"),
+        (r"^(зел[её]н(?:ый|ая|ое)?)\s*\((?:green)\)$", "зелёный"),
+        (r"^(сер(?:ый|ая|ое)?)\s*\((?:grey|gray)\)$", "серый"),
+    ]
+    for pattern, repl in replacements:
+        if re.match(pattern, low, flags=re.IGNORECASE):
+            return repl
+    # Если в скобках просто английский перевод цвета, отбрасываем его.
+    if re.search(r"\(([A-Za-z]+)\)$", raw) and re.search(r"[А-Яа-яЁё]", raw):
+        raw = re.sub(r"\s*\([A-Za-z]+\)$", "", raw).strip()
     return raw
 
 
 def compose_article_template_label(row: pd.Series) -> str:
     article = normalize_text(row.get("article", ""))
-    color = normalize_text(row.get("meta_color", "")) or extract_color_from_text(row.get("name", ""))
+    color = simplify_template_color(normalize_text(row.get("meta_color", "")) or extract_color_from_text(row.get("name", "")))
     pages = normalize_pages_value(row.get("meta_iso_pages", "")) or extract_iso_pages_from_text(row.get("name", ""))
     details = []
     if color:
