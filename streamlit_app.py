@@ -3467,6 +3467,8 @@ st.markdown(f"""
 
 def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> None:
     search_key = f"search_input_{tab_key}"
+    search_widget_key = f"search_input_widget_{tab_key}"
+    clear_flag_key = f"search_clear_requested_{tab_key}"
     submitted_key = f"submitted_query_{tab_key}"
     result_key = f"last_result_{tab_key}"
     sig_key = f"last_result_sig_{tab_key}"
@@ -3478,6 +3480,14 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
         st.session_state[result_key] = None
     if sig_key not in st.session_state:
         st.session_state[sig_key] = None
+    if search_widget_key not in st.session_state:
+        st.session_state[search_widget_key] = st.session_state[search_key]
+    if clear_flag_key not in st.session_state:
+        st.session_state[clear_flag_key] = False
+    if st.session_state.get(clear_flag_key):
+        st.session_state[search_key] = ""
+        st.session_state[search_widget_key] = ""
+        st.session_state[clear_flag_key] = False
 
     base_sheet_df = sheets.get(sheet_name) if isinstance(sheets, dict) else None
     show_photos = bool(st.session_state.get("show_photos_global", True))
@@ -3516,9 +3526,11 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
         st.session_state[submitted_key] = ""
         st.session_state[result_key] = None
         st.session_state[sig_key] = None
+        st.session_state[clear_flag_key] = True
         result_df = None
     elif find_clicked:
         normalized_query = normalize_query_for_display(search_value)
+        st.session_state[search_widget_key] = normalized_query
         st.session_state[search_key] = normalized_query
         st.session_state[submitted_key] = normalized_query
         desired_sig = (normalized_query, search_mode, sheet_name, st.session_state.get("comparison_version", ""))
