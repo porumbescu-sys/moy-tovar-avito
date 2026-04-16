@@ -1972,8 +1972,10 @@ def apply_price_updates_to_sheets(sheets: dict[str, pd.DataFrame], updates_text:
             continue
         out = df.copy()
         sheet_hits = 0
+        if "row_codes" not in out.columns:
+            out["row_codes"] = out.apply(lambda row: build_row_compare_codes(row.get("article", ""), row.get("name", "")), axis=1)
         for article_norm, new_price in updates:
-            mask = out["article_norm"] == article_norm
+            mask = out["row_codes"].apply(lambda codes: article_norm in (codes or []) if isinstance(codes, list) else False)
             if mask.any():
                 out.loc[mask, "sale_price"] = float(new_price)
                 sheet_hits += int(mask.sum())
@@ -1990,6 +1992,71 @@ def apply_price_updates_to_sheets(sheets: dict[str, pd.DataFrame], updates_text:
     if missed:
         msg += " | Не найдено: " + ", ".join(missed[:10])
     return updated_sheets, msg
+
+
+def patch_comparison_workbook_bytes(file_bytes: bytes, updates_text: str) -> tuple[bytes | None, str]:
+    updates = parse_price_updates(updates_text)
+    if not updates:
+        return None, "Не нашёл строк для правки цен."
+
+    wb = openpyxl.load_workbook(io.BytesIO(file_bytes))
+    total_updated = 0
+    hits_by_sheet: list[str] = []
+    found_articles: set[str] = set()
+
+    for ws in wb.worksheets:
+        headers = [normalize_text(ws.cell(1, c).value) for c in range(1, ws.max_column + 1)]
+        mapping = {key: find_column(headers, aliases) for key, aliases in CATALOG_COLUMN_ALIASES.items()}
+        required = ["article", "name", "price"]
+        if any(not mapping.get(key) for key in required):
+            continue
+
+        def _col_idx(header_value: str | None) -> int | None:
+            if not header_value:
+                return None
+            for idx, header in enumerate(headers, start=1):
+                if normalize_text(header) == normalize_text(header_value):
+                    return idx
+            return None
+
+        article_idx = _col_idx(mapping.get("article"))
+        name_idx = _col_idx(mapping.get("name"))
+        price_idx = _col_idx(mapping.get("price"))
+        if not article_idx or not name_idx or not price_idx:
+            continue
+
+        sheet_hits = 0
+        for r in range(2, ws.max_row + 1):
+            article = normalize_text(ws.cell(r, article_idx).value)
+            name = normalize_text(ws.cell(r, name_idx).value)
+            row_codes = build_row_compare_codes(article, name)
+            matched_price = None
+            for article_norm, new_price in updates:
+                if article_norm in row_codes:
+                    matched_price = float(new_price)
+                    found_articles.add(article_norm)
+                    break
+            if matched_price is None:
+                continue
+            cell = ws.cell(r, price_idx)
+            cell.value = int(matched_price) if float(matched_price).is_integer() else float(matched_price)
+            sheet_hits += 1
+
+        if sheet_hits:
+            total_updated += sheet_hits
+            hits_by_sheet.append(f"{ws.title}: {sheet_hits}")
+
+    bio = io.BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+
+    missed = [article for article, _ in updates if article not in found_articles]
+    msg = f"Обновлено цен: {total_updated}"
+    if hits_by_sheet:
+        msg += " | По листам: " + "; ".join(hits_by_sheet)
+    if missed:
+        msg += " | Не найдено: " + ", ".join(missed[:10])
+    return bio.read(), msg
 
 
 def get_source_pairs(df: pd.DataFrame) -> list[dict[str, str]]:
@@ -3258,7 +3325,22 @@ with st.sidebar:
     st.text_area("Правка цен", key="price_patch_input", height=110, label_visibility="collapsed", placeholder="CE278A 8900\nCF364A - 29700")
     if st.button("Править цены в файле", use_container_width=True):
         sheets_state = st.session_state.get("comparison_sheets")
-        if isinstance(sheets_state, dict) and sheets_state:
+        persisted_path = get_persisted_comparison_file_path()
+        original_name = read_persisted_original_name(persisted_path, persisted_path.name) if persisted_path.exists() else st.session_state.get("comparison_name", "comparison_latest.xlsx")
+        if persisted_path.exists():
+            try:
+                updated_bytes, patch_message = patch_comparison_workbook_bytes(persisted_path.read_bytes(), st.session_state.price_patch_input)
+                if updated_bytes is not None:
+                    save_uploaded_source_file(persisted_path, updated_bytes, original_name.replace(" • из /data", "").replace(" • сохранён в /data", ""))
+                    st.session_state.comparison_sheets = load_comparison_workbook(original_name, updated_bytes)
+                    st.session_state.comparison_name = original_name + " • из /data"
+                    st.session_state.comparison_version = datetime.utcnow().isoformat()
+                    rebuild_current_df()
+                    refresh_all_search_results()
+                st.session_state.patch_message = patch_message
+            except Exception as exc:
+                st.session_state.patch_message = f"Ошибка правки файла: {exc}"
+        elif isinstance(sheets_state, dict) and sheets_state:
             updated_sheets, patch_message = apply_price_updates_to_sheets(sheets_state, st.session_state.price_patch_input)
             st.session_state.comparison_sheets = updated_sheets
             st.session_state.comparison_version = datetime.utcnow().isoformat()
