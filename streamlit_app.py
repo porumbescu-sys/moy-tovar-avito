@@ -1108,6 +1108,7 @@ def load_avito_file(file_name: str, file_bytes: bytes) -> pd.DataFrame:
             })
         out = pd.DataFrame(rows)
         out["title_norm"] = out["title"].map(contains_text)
+        out["title_codes"] = out["title"].map(extract_article_candidates_from_text)
         out["registry_key"] = out.apply(build_avito_registry_key, axis=1)
         return out
 
@@ -1155,6 +1156,7 @@ def load_avito_file(file_name: str, file_bytes: bytes) -> pd.DataFrame:
         })
     out = pd.DataFrame(rows)
     out["title_norm"] = out["title"].map(contains_text)
+    out["title_codes"] = out["title"].map(extract_article_candidates_from_text)
     out["registry_key"] = out.apply(build_avito_registry_key, axis=1)
     return out
 
@@ -2460,13 +2462,23 @@ def find_avito_ads(avito_df: pd.DataFrame, result_df: pd.DataFrame) -> pd.DataFr
         return pd.DataFrame()
     if result_df is None or result_df.empty:
         return pd.DataFrame()
-    tokens = []
+
+    tokens: list[str] = []
+    raw_tokens: list[str] = []
     for _, row in result_df.iterrows():
-        token = normalize_article(row.get("article", ""))
-        if token:
-            tokens.append(token)
-    tokens = unique_preserve_order(tokens)
-    if not tokens:
+        row_codes = row.get("row_codes", [])
+        if isinstance(row_codes, list) and row_codes:
+            tokens.extend(unique_norm_codes(row_codes))
+        else:
+            tokens.extend(build_row_compare_codes(row.get("article", ""), row.get("name", "")))
+        article_raw = normalize_text(row.get("article", ""))
+        if article_raw:
+            raw_tokens.append(article_raw)
+        for code in extract_article_candidates_from_text(row.get("name", "")):
+            raw_tokens.append(code)
+    tokens = unique_preserve_order([normalize_article(x) for x in tokens if normalize_article(x)])
+    raw_tokens = unique_preserve_order([normalize_article(x) for x in raw_tokens if normalize_article(x)])
+    if not tokens and not raw_tokens:
         return pd.DataFrame()
 
     base_df = avito_df.copy() if isinstance(avito_df, pd.DataFrame) and not avito_df.empty else registry_df.copy()
@@ -2474,21 +2486,29 @@ def find_avito_ads(avito_df: pd.DataFrame, result_df: pd.DataFrame) -> pd.DataFr
         return pd.DataFrame()
     if "title_norm" not in base_df.columns:
         base_df["title_norm"] = base_df["title"].map(contains_text)
+    if "title_codes" not in base_df.columns:
+        base_df["title_codes"] = base_df["title"].map(extract_article_candidates_from_text)
     if "registry_key" not in base_df.columns:
         base_df["registry_key"] = base_df.apply(build_avito_registry_key, axis=1)
 
     matches = []
     for _, row in base_df.iterrows():
-        title_norm = contains_text(row.get("title", ""))
-        hit_tokens = [t for t in tokens if t and t in compact_text(title_norm)]
-        if hit_tokens:
+        title_codes = unique_norm_codes(row.get("title_codes", []) if isinstance(row.get("title_codes", []), list) else extract_article_candidates_from_text(row.get("title", "")))
+        title_compact = compact_text(row.get("title", ""))
+        exact_hits = [t for t in tokens if t in title_codes]
+        substring_hits = [t for t in tokens if t and t in title_compact and t not in exact_hits]
+        raw_hits = [t for t in raw_tokens if t and t in title_compact and t not in exact_hits and t not in substring_hits]
+        if exact_hits or substring_hits or raw_hits:
             item = row.to_dict()
-            item["matched_tokens"] = ", ".join(hit_tokens)
+            item["matched_tokens"] = ", ".join(unique_preserve_order(exact_hits + substring_hits + raw_hits))
+            item["match_score"] = len(exact_hits) * 100 + len(substring_hits) * 10 + len(raw_hits)
+            item["match_kind"] = "точное" if exact_hits else ("связанное" if substring_hits else "по названию")
             matches.append(item)
     if not matches:
         return pd.DataFrame()
 
-    out = pd.DataFrame(matches).drop_duplicates(subset=["registry_key"], keep="first").reset_index(drop=True)
+    out = pd.DataFrame(matches)
+    out = out.sort_values(["match_score", "registry_key"], ascending=[False, True]).drop_duplicates(subset=["registry_key"], keep="first").reset_index(drop=True)
     if not registry_df.empty:
         reg = registry_df.copy()
         if "registry_key" not in reg.columns:
