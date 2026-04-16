@@ -344,7 +344,26 @@ def simplify_template_color(value: object) -> str:
     raw = normalize_text(value)
     if not raw:
         return ""
-    low = raw.lower()
+    low = raw.lower().strip()
+
+    english_only_map = {
+        "black": "чёрный",
+        "cyan": "голубой",
+        "yellow": "жёлтый",
+        "magenta": "пурпурный",
+        "blue": "синий",
+        "red": "красный",
+        "green": "зелёный",
+        "grey": "серый",
+        "gray": "серый",
+    }
+
+    # Сначала нормализуем случаи, когда цвет пришёл только как английское слово
+    # или только в скобках: magenta / (magenta) -> пурпурный
+    raw_no_parens = re.sub(r"^[\s(]+|[\s)]+$", "", low)
+    if raw_no_parens in english_only_map:
+        return english_only_map[raw_no_parens]
+
     # Если цвет уже содержит русское название и английский перевод в скобках,
     # оставляем только один, более короткий и привычный вариант.
     replacements = [
@@ -361,9 +380,12 @@ def simplify_template_color(value: object) -> str:
     for pattern, repl in replacements:
         if re.match(pattern, low, flags=re.IGNORECASE):
             return repl
-    # Если в скобках просто английский перевод цвета, отбрасываем его.
+
+    # Если есть русский цвет + английский перевод в конце, убираем перевод.
     if re.search(r"\(([A-Za-z]+)\)$", raw) and re.search(r"[А-Яа-яЁё]", raw):
         raw = re.sub(r"\s*\([A-Za-z]+\)$", "", raw).strip()
+        return raw
+
     return raw
 
 
