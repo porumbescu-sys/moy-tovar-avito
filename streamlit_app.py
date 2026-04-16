@@ -3591,6 +3591,7 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
 
     if clear_clicked:
         st.session_state[search_key] = ""
+        st.session_state[search_widget_key] = ""
         st.session_state[submitted_key] = ""
         st.session_state[result_key] = None
         st.session_state[sig_key] = None
@@ -3674,6 +3675,7 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
             if selected_articles:
                 normalized_query = "\n".join(unique_preserve_order(selected_articles))
                 st.session_state[search_key] = normalized_query
+                st.session_state[search_widget_key] = normalized_query
                 st.session_state[submitted_key] = normalized_query
                 result_df = search_in_df(base_sheet_df, normalized_query, search_mode, sheet_name=sheet_name)
                 st.session_state[result_key] = result_df
