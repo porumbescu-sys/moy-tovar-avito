@@ -2644,6 +2644,30 @@ def all_prices_to_excel_bytes(df: pd.DataFrame) -> bytes:
     return bio.read()
 
 
+
+def translate_watch_action(action: Any, threshold_pct: float = 35.0) -> str:
+    raw = normalize_text(action)
+    if not raw:
+        return ""
+    tokens = [t.strip().upper() for t in raw.replace("|", ";").split(";") if t.strip()]
+    translated = []
+    for token in tokens:
+        if token == "BUY":
+            translated.append(f"Можно брать (-{int(threshold_pct)}%+)")
+        elif token == "RESTOCK":
+            translated.append("Пополнить запас")
+        elif token == "WATCH":
+            translated.append("Наблюдать")
+        elif token in {"NO_MATCH", "NO_MATCH_IN_COMPARISON"}:
+            translated.append("Нет в сравнении")
+        else:
+            translated.append(token)
+    uniq = []
+    for item in translated:
+        if item not in uniq:
+            uniq.append(item)
+    return "; ".join(uniq)
+
 def build_report_df(
     df: pd.DataFrame,
     threshold_percent: float,
