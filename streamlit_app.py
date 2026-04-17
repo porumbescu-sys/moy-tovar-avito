@@ -360,6 +360,12 @@ def build_hot_buy_watchlist_table() -> pd.DataFrame:
     work = work.loc[buy_mask].copy()
     if work.empty:
         return pd.DataFrame()
+    work = work[
+        pd.to_numeric(work.get("our_price_now", 0.0), errors="coerce").fillna(0.0).gt(0)
+        & pd.to_numeric(work.get("best_supplier_price_now", 0.0), errors="coerce").fillna(0.0).gt(0)
+    ].copy()
+    if work.empty:
+        return pd.DataFrame()
     work["gap_pct_display"] = work.get("best_supplier_gap_pct", pd.Series(dtype=float)).fillna(0.0).map(lambda x: round(float(x) * 100.0, 1))
     out = pd.DataFrame({
         "Лист": work.get("current_sheet", ""),
@@ -2638,10 +2644,17 @@ def all_prices_to_excel_bytes(df: pd.DataFrame) -> bytes:
     return bio.read()
 
 
-def build_report_df(df: pd.DataFrame, threshold_percent: float, min_qty: float) -> pd.DataFrame:
+def build_report_df(
+    df: pd.DataFrame,
+    threshold_percent: float,
+    min_qty: float,
+    tab_label: str = "",
+    hot_lookup: dict[str, list[dict[str, Any]]] | None = None,
+) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
     if df is None or df.empty:
         return pd.DataFrame()
+    hot_lookup = hot_lookup or {}
     for _, row in df.iterrows():
         own_price = safe_float(row.get("sale_price"), 0.0)
         own_qty = safe_float(row.get("free_qty"), 0.0)
@@ -2650,24 +2663,40 @@ def build_report_df(df: pd.DataFrame, threshold_percent: float, min_qty: float) 
         best = get_best_offer(row, min_qty=min_qty)
         if not best:
             continue
+        best_price = safe_float(best.get("price"), 0.0)
+        best_qty = safe_float(best.get("qty"), 0.0)
         delta = safe_float(best.get("delta"), 0.0)
         delta_pct = safe_float(best.get("delta_percent"), 0.0)
-        if delta <= 0 or delta_pct < float(threshold_percent):
+        if best_price <= 0 or delta <= 0 or delta_pct < float(threshold_percent):
             continue
+
+        hot_rec = pick_hot_watch_rec(row, hot_lookup) if hot_lookup else None
         rows.append({
+            "Лист": tab_label,
             "Артикул": row.get("article", ""),
-            "Название": row.get("name", ""),
-            "Наш остаток": own_qty,
+            "Товар": row.get("name", ""),
+            "Спрос, шт/мес": safe_float((hot_rec or {}).get("sales_per_month"), 0.0) if hot_rec else None,
             "Наша цена": own_price,
-            "Лучший дистрибьютер": best["source"],
-            "Цена дистрибьютора": best["price"],
-            "Остаток дистрибьютора": best["qty"],
+            "Наш остаток": own_qty,
+            "Лучший поставщик": best.get("source", ""),
+            "Цена поставщика": best_price,
+            "Остаток поставщика": best_qty,
+            "Ниже нашей цены, %": round(delta_pct, 2),
+            "Дней запаса": safe_float((hot_rec or {}).get("days_of_cover"), 0.0) if hot_rec else None,
+            "Приоритет": safe_float((hot_rec or {}).get("priority_score"), 0.0) if hot_rec else None,
+            "Действие": normalize_text((hot_rec or {}).get("action_today", "")) if hot_rec else "",
             "Разница, руб": delta,
-            "Разница, %": round(delta_pct, 2),
+            "Ходовая": "Да" if hot_rec else "",
         })
     if not rows:
         return pd.DataFrame()
-    out = pd.DataFrame(rows).sort_values(["Разница, %", "Разница, руб", "Артикул"], ascending=[False, False, True]).reset_index(drop=True)
+    out = pd.DataFrame(rows)
+    out["_sort_priority"] = pd.to_numeric(out.get("Приоритет"), errors="coerce").fillna(-1.0)
+    out = out.sort_values(
+        ["_sort_priority", "Ниже нашей цены, %", "Разница, руб", "Артикул"],
+        ascending=[False, False, False, True],
+        kind="stable",
+    ).drop(columns=["_sort_priority"]).reset_index(drop=True)
     return out
 
 
@@ -4827,11 +4856,18 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
         st.markdown('<div class="result-wrap">', unsafe_allow_html=True)
         render_block_header(
             f"{tab_label} — отчёт по листу",
-            "Полный отчёт по выбранному листу: где поставщик реально дешевле нас на заданный процент.",
+            "Полный отчёт по выбранному листу: где поставщик реально дешевле нас на заданный процент. Если загружен watchlist, отчёт дополняется спросом, днями запаса, приоритетом и действием.",
             icon="📊",
             help_text="Отчёт строится по всему текущему листу, а не только по поисковой выдаче. Порог и минимальный остаток меняются в sidebar.",
         )
-        report_df = build_report_df(base_sheet_df, st.session_state.distributor_threshold, st.session_state.distributor_min_qty)
+        report_hot_lookup = build_hot_watchlist_lookup(st.session_state.get("hot_items_df"), tab_label)
+        report_df = build_report_df(
+            base_sheet_df,
+            st.session_state.distributor_threshold,
+            st.session_state.distributor_min_qty,
+            tab_label=tab_label,
+            hot_lookup=report_hot_lookup,
+        )
         if report_df.empty:
             st.info("По текущему листу нет позиций, которые проходят ваш порог выгоды.")
         else:
