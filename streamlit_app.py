@@ -4935,6 +4935,24 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
                 render_avito_block(st.session_state.avito_df, result_df)
                 st.markdown('</div>', unsafe_allow_html=True)
 
+            if st.session_state.get(f"lazy_analytics_{tab_key}", False):
+                st.markdown('<div class="result-wrap">', unsafe_allow_html=True)
+                render_block_header(
+                    f"{tab_label} — аналитика / задачи",
+                    "Операционная аналитика по текущему листу: приоритет на пересмотр цены, проблемные позиции, качество карточек, серии, история правок и действия на сегодня.",
+                    icon="📌",
+                    help_text="Блок считается лениво и открывается только по чекбоксу. Аналитика строится по текущему листу и не должна влиять на обычный поиск, пока выключена.",
+                )
+                render_operational_analytics_block(
+                    base_sheet_df,
+                    photo_df,
+                    st.session_state.get("avito_df"),
+                    st.session_state.distributor_min_qty,
+                    tab_label,
+                    tab_key,
+                )
+                st.markdown('</div>', unsafe_allow_html=True)
+
         st.markdown('</div>', unsafe_allow_html=True)
 
     if st.session_state.get(f"lazy_report_{tab_key}", False):
