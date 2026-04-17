@@ -335,6 +335,14 @@ def apply_hot_watchlist(df: pd.DataFrame | None, hot_df: pd.DataFrame | None, ta
     return work
 
 
+
+
+def dataframe_to_excel_bytes(df: pd.DataFrame) -> bytes:
+    out = io.BytesIO()
+    with pd.ExcelWriter(out, engine="openpyxl") as writer:
+        (df if isinstance(df, pd.DataFrame) else pd.DataFrame()).to_excel(writer, index=False, sheet_name="Watchlist")
+    return out.getvalue()
+
 def hot_watchlist_summary_text() -> str:
     hot_df = st.session_state.get("hot_items_df")
     if not isinstance(hot_df, pd.DataFrame) or hot_df.empty:
@@ -5022,6 +5030,14 @@ def apply_hot_watchlist(df: pd.DataFrame | None, hot_df: pd.DataFrame | None, ta
     work["hot_watch_article"] = [normalize_text((m or {}).get("watch_article", "")) for m in matches]
     return work
 
+
+
+
+def dataframe_to_excel_bytes(df: pd.DataFrame) -> bytes:
+    out = io.BytesIO()
+    with pd.ExcelWriter(out, engine="openpyxl") as writer:
+        (df if isinstance(df, pd.DataFrame) else pd.DataFrame()).to_excel(writer, index=False, sheet_name="Watchlist")
+    return out.getvalue()
 
 def hot_watchlist_summary_text() -> str:
     hot_df = st.session_state.get("hot_items_df")
