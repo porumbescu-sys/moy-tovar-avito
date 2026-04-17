@@ -36,6 +36,7 @@ SERVER_DATA_DIRNAME = "data"
 PERSISTED_PHOTO_FILENAME = "photo_catalog_latest.xlsx"
 PERSISTED_AVITO_FILENAME = "avito_latest.xlsx"
 PERSISTED_COMPARISON_FILENAME = "comparison_latest.xlsx"
+PERSISTED_WATCHLIST_FILENAME = "hot_items_watchlist_latest.dat"
 PERSISTED_META_SUFFIX = ".meta.json"
 
 FALLBACK_PHOTO_DOMAINS = ["rashodniki.ru", "t-toner.ru", "interlink.ru", "mrimage.ru"]
@@ -61,6 +62,10 @@ def get_persisted_avito_file_path() -> Path:
 
 def get_persisted_comparison_file_path() -> Path:
     return get_server_data_dir() / PERSISTED_COMPARISON_FILENAME
+
+
+def get_persisted_watchlist_file_path() -> Path:
+    return get_server_data_dir() / PERSISTED_WATCHLIST_FILENAME
 
 
 def get_persisted_meta_path(file_path: Path) -> Path:
@@ -102,6 +107,10 @@ def clear_loader_caches() -> None:
         pass
     try:
         load_avito_file.clear()
+    except Exception:
+        pass
+    try:
+        load_hot_watchlist_file.clear()
     except Exception:
         pass
 
@@ -171,6 +180,19 @@ def load_persisted_comparison_source_into_state() -> bool:
             st.session_state.selected_sheet = available[0]
         rebuild_current_df()
         refresh_all_search_results()
+        return True
+    except Exception:
+        return False
+
+
+def load_persisted_watchlist_source_into_state() -> bool:
+    target = get_persisted_watchlist_file_path()
+    if not target.exists():
+        return False
+    try:
+        raw = target.read_bytes()
+        st.session_state.hot_items_df = load_hot_watchlist_file(read_persisted_original_name(target, target.name), raw)
+        st.session_state.hot_items_name = read_persisted_original_name(target, target.name) + " • из /data"
         return True
     except Exception:
         return False
@@ -1702,6 +1724,8 @@ def ensure_persisted_source_files_loaded() -> None:
         load_persisted_photo_source_into_state()
     if (not isinstance(st.session_state.get("avito_df"), pd.DataFrame) or st.session_state.get("avito_df").empty) and get_persisted_avito_file_path().exists():
         load_persisted_avito_source_into_state()
+    if (not isinstance(st.session_state.get("hot_items_df"), pd.DataFrame) or st.session_state.get("hot_items_df").empty) and get_persisted_watchlist_file_path().exists():
+        load_persisted_watchlist_source_into_state()
 
 
 
@@ -1945,6 +1969,9 @@ def init_state() -> None:
         "avito_registry_message": "",
         "avito_registry_stats": {},
         "avito_last_sync_sig": "",
+        "hot_items_df": None,
+        "hot_items_name": "ещё не загружен",
+        "hot_items_last_sync_sig": "",
         "search_input": "",
         "submitted_query": "",
         "last_result": None,
@@ -2810,6 +2837,24 @@ def render_results_table(df: pd.DataFrame, price_mode: str, round100: bool, cust
         else:
             badge_html = "<div class='match-badge match-badge-soft'>По названию / бренду</div>"
 
+        hot_html = ""
+        if bool(row.get("hot_flag", False)):
+            hot_parts = []
+            abc = normalize_text(row.get("hot_abc_class", ""))
+            sales_pm = safe_float(row.get("hot_sales_per_month"), 0.0)
+            if abc:
+                hot_parts.append(f"класс {abc}")
+            if sales_pm > 0:
+                hot_parts.append(f"{sales_pm:.1f}/мес")
+            action_today = normalize_text(row.get("hot_action_today", ""))
+            buy_signal = normalize_text(row.get("hot_buy_signal", "")).upper()
+            primary = "🔥 Ходовая"
+            if buy_signal == "BUY":
+                primary = "🔥 Ходовая • BUY"
+            note = " • ".join(hot_parts)
+            action_html = f"<div class='hot-sub-badge'>{html.escape(action_today)}</div>" if action_today else ""
+            hot_html = f"<div class='hot-badge'>{html.escape(primary)}</div>{('<div class="hot-meta">' + html.escape(note) + '</div>') if note else ''}{action_html}"
+
         if best:
             status_class = status_visual_class(str(best.get("status", "")))
             state_label = state_label_from_class(status_class)
@@ -2867,6 +2912,7 @@ def render_results_table(df: pd.DataFrame, price_mode: str, round100: bool, cust
                     <div class='item-top'><span class='article-pill'>{html.escape(str(row['article']))}</span></div>
                     <div class='name-cell'>{html.escape(str(row['name']))}</div>
                     {badge_html}
+                    {hot_html}
                   </div>
                 </div>
               </td>
@@ -3018,10 +3064,17 @@ def render_results_insight_dashboard(result_df: pd.DataFrame, compare_map: dict[
             better_rows += 1
             gains.append(safe_float(offer.get("delta_percent"), 0.0))
     avg_gain = sum(gains) / len(gains) if gains else 0.0
+    hot_count = 0
+    hot_buy_count = 0
+    if isinstance(result_df, pd.DataFrame) and not result_df.empty and "hot_flag" in result_df.columns:
+        hot_count = int(result_df["hot_flag"].fillna(False).map(bool).sum())
+        if "hot_buy_signal" in result_df.columns:
+            hot_buy_count = int(result_df["hot_buy_signal"].fillna("").map(normalize_text).str.upper().eq("BUY").sum())
     cards = [
         ("🔎", "Найдено позиций", str(found_count), "Сколько строк вошло в текущий поиск"),
         ("💚", "Есть цена лучше", str(better_rows), "Сколько позиций реально дешевле у поставщиков"),
         ("📈", "Средняя выгода", (f"{avg_gain:.1f}%" if gains else "—"), "Считается приложением, не берётся из готовых колонок Excel"),
+        ("🔥", "Ходовые в поиске", str(hot_count), (f"BUY-сигналов: {hot_buy_count}" if hot_count else "Watchlist не совпал с результатами")),
         ("🧩", "Источников найдено", str(len(source_pairs)), ", ".join([x["source"] for x in source_pairs]) if source_pairs else "Нет колонок источников"),
     ]
     html_cards = "".join(
@@ -3384,7 +3437,7 @@ st.markdown(
     .banner-chip { display:inline-flex; align-items:center; gap:6px; padding: 6px 10px; border-radius: 999px; background:#eef4ff; border:1px solid #d8e5ff; color:#315efb; font-size: 12px; font-weight: 800; }
     .tone-green { background: linear-gradient(180deg, #fbfffd 0%, #f2fff7 100%); border-color: #d2f1dd; }
     .tone-purple { background: linear-gradient(180deg, #fcfbff 0%, #f6f3ff 100%); border-color: #e6dcff; }
-    .insight-grid { display:grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin: 14px 0 16px 0; }
+    .insight-grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin: 14px 0 16px 0; }
     .insight-card { background: linear-gradient(180deg, #ffffff 0%, #f8fbff 100%); border: 1px solid #dbe7fb; border-radius: 20px; padding: 14px 15px; box-shadow: 0 8px 18px rgba(15,23,42,.05); }
     .insight-top { display:flex; align-items:center; gap:8px; margin-bottom: 10px; }
     .insight-icon { width:32px; height:32px; display:flex; align-items:center; justify-content:center; border-radius: 12px; background:#eef4ff; font-size:16px; }
@@ -3530,6 +3583,29 @@ with st.sidebar:
     if st.session_state.get("avito_registry_message"):
         st.markdown(f'<div class="sidebar-mini">{html.escape(st.session_state.get("avito_registry_message"))}</div>', unsafe_allow_html=True)
     st.markdown(f'<div class="sidebar-mini">{html.escape(registry_summary_text())}</div>', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="sidebar-card">', unsafe_allow_html=True)
+    render_sidebar_card_header("Ходовые позиции", "🔥", "Watchlist с продажами за период. Можно хранить на сервере и подсвечивать ходовые позиции прямо в результатах поиска.")
+    hot_uploaded = st.file_uploader("Загрузить watchlist", type=["xlsx", "xls", "csv"], key="hot_items_uploader", label_visibility="collapsed")
+    if hot_uploaded is not None:
+        try:
+            hot_bytes = hot_uploaded.getvalue()
+            save_uploaded_source_file(get_persisted_watchlist_file_path(), hot_bytes, hot_uploaded.name)
+            clear_loader_caches()
+            st.session_state.hot_items_df = load_hot_watchlist_file(hot_uploaded.name, hot_bytes)
+            st.session_state.hot_items_name = hot_uploaded.name + " • сохранён в /data"
+            st.session_state.hot_items_last_sync_sig = hashlib.md5(hot_bytes).hexdigest()
+            log_operation(f"Обновлён watchlist ходовых: {hot_uploaded.name}", "success")
+        except Exception as exc:
+            log_operation(f"Ошибка файла ходовых: {exc}", "warning")
+            st.error(f"Ошибка watchlist: {exc}")
+    else:
+        if not isinstance(st.session_state.get("hot_items_df"), pd.DataFrame):
+            load_persisted_watchlist_source_into_state()
+    st.markdown(f'<div class="sidebar-status">Watchlist: {html.escape(st.session_state.get("hot_items_name", "ещё не загружен"))}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="sidebar-mini">Файл на сервере: {html.escape(str(get_persisted_watchlist_file_path()))}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="sidebar-mini">{html.escape(hot_watchlist_summary_text())}</div>', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown('<div class="sidebar-card">', unsafe_allow_html=True)
@@ -4337,6 +4413,7 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
         return
 
     display_result_df = result_df
+    hot_items_df = st.session_state.get("hot_items_df")
     if isinstance(result_df, pd.DataFrame) and sheet_name == "Совместимые" and not result_df.empty:
         compatible_result = result_df.copy()
         compatible_result["compatible_brand"] = compatible_result.apply(
@@ -4356,6 +4433,8 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
         st.session_state[result_key] = result_df
     if isinstance(result_df, pd.DataFrame) and show_photos:
         display_result_df = apply_photo_map(result_df, photo_df)
+    if isinstance(display_result_df, pd.DataFrame) and isinstance(hot_items_df, pd.DataFrame) and not hot_items_df.empty:
+        display_result_df = apply_hot_watchlist(display_result_df, hot_items_df, tab_label=tab_label)
 
     if result_df is None:
         render_info_banner(
@@ -4377,7 +4456,7 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
             st.warning("Ничего не найдено. Попробуйте другой артикул или часть названия.")
         else:
             compare_map = build_distributor_compare(result_df, min_qty=min_dist_qty)
-            render_results_insight_dashboard(result_df, compare_map, source_pairs)
+            render_results_insight_dashboard(display_result_df, compare_map, source_pairs)
             render_results_table(display_result_df.head(200), price_mode, round100, custom_discount, distributor_map=compare_map, show_photos=show_photos)
             st.download_button(
                 "⬇️ Скачать результаты в Excel",
@@ -4394,7 +4473,12 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
                 tech["Лучшая цена"] = tech.apply(lambda row: (get_best_offer(row, min_qty=min_dist_qty) or {}).get("price_fmt", ""), axis=1)
                 tech["Лучший поставщик"] = tech.apply(lambda row: (get_best_offer(row, min_qty=min_dist_qty) or {}).get("source", ""), axis=1)
                 tech["Фото"] = tech.get("photo_url", "")
-                tech = tech[["article", "name", "Наша цена", "Наш склад", "Лучший поставщик", "Лучшая цена", "Фото"]].rename(columns={"article": "Артикул", "name": "Название"})
+                if "hot_flag" in tech.columns:
+                    tech["Ходовая"] = tech["hot_flag"].map(lambda x: "Да" if bool(x) else "")
+                    tech["Action"] = tech.get("hot_action_today", "")
+                    tech = tech[["article", "name", "Наша цена", "Наш склад", "Лучший поставщик", "Лучшая цена", "Ходовая", "Action", "Фото"]].rename(columns={"article": "Артикул", "name": "Название"})
+                else:
+                    tech = tech[["article", "name", "Наша цена", "Наш склад", "Лучший поставщик", "Лучшая цена", "Фото"]].rename(columns={"article": "Артикул", "name": "Название"})
                 st.dataframe(tech, use_container_width=True, hide_index=True)
 
             lazy_c0, lazy_c1, lazy_c2, lazy_c3, lazy_c4, lazy_c5 = st.columns(6)
@@ -4533,3 +4617,158 @@ else:
 
     active_sheet_name, active_tab_label, active_tab_key = label_to_spec[st.session_state.get("active_workspace_label", "Оригинал")]
     render_sheet_workspace(active_sheet_name, active_tab_label, active_tab_key)
+
+def normalize_watchlist_sheet_name(value: Any) -> str:
+    txt = contains_text(value)
+    if "ОРИГИН" in txt or "СРАВН" in txt:
+        return "Оригинал"
+    if "УЦЕН" in txt:
+        return "Уценка"
+    if "СОВМЕСТ" in txt:
+        return "Совместимые"
+    return normalize_text(value)
+
+
+@st.cache_data(show_spinner=False, ttl=3600, max_entries=4)
+def load_hot_watchlist_file(file_name: str, file_bytes: bytes) -> pd.DataFrame:
+    suffix = Path(file_name).suffix.lower()
+    if suffix == ".csv":
+        bio = io.BytesIO(file_bytes)
+        try:
+            raw = pd.read_csv(bio)
+        except UnicodeDecodeError:
+            bio.seek(0)
+            raw = pd.read_csv(bio, encoding="cp1251")
+    else:
+        raw = pd.read_excel(io.BytesIO(file_bytes))
+    raw = raw.dropna(how="all").copy()
+    if raw.empty:
+        return pd.DataFrame(columns=[
+            "watch_article", "watch_key", "watch_name", "current_sheet", "comparison_article",
+            "sales_qty_15m", "sales_per_month", "abc_class", "velocity_band",
+            "best_supplier", "best_supplier_gap_pct", "buy_signal_30pct", "days_of_cover",
+            "priority_score", "action_today", "watch_article_norm", "watch_key_norm",
+            "comparison_article_norm", "match_keys_text",
+        ])
+    raw.columns = [normalize_text(c) for c in raw.columns]
+    rows = []
+    for _, r in raw.iterrows():
+        watch_article = normalize_text(r.get("watch_article", ""))
+        watch_key = normalize_text(r.get("watch_key", ""))
+        watch_name = normalize_text(r.get("watch_name", ""))
+        comparison_article = normalize_text(r.get("comparison_article", ""))
+        keys = unique_preserve_order([
+            normalize_article(watch_article),
+            normalize_article(watch_key),
+            normalize_article(comparison_article),
+        ])
+        if not any(keys):
+            continue
+        rows.append({
+            "watch_article": watch_article,
+            "watch_key": watch_key,
+            "watch_name": watch_name,
+            "current_sheet": normalize_watchlist_sheet_name(r.get("current_sheet", "")),
+            "comparison_article": comparison_article,
+            "sales_qty_15m": safe_float(r.get("sales_qty_15m"), 0.0),
+            "sales_per_month": safe_float(r.get("sales_per_month"), 0.0),
+            "abc_class": normalize_text(r.get("abc_class", "")),
+            "velocity_band": normalize_text(r.get("velocity_band", "")),
+            "best_supplier": normalize_text(r.get("best_supplier", "")),
+            "best_supplier_gap_pct": safe_float(r.get("best_supplier_gap_pct"), 0.0),
+            "buy_signal_30pct": normalize_text(r.get("buy_signal_30pct", "")),
+            "days_of_cover": safe_float(r.get("days_of_cover"), 0.0),
+            "priority_score": safe_float(r.get("priority_score"), 0.0),
+            "action_today": normalize_text(r.get("action_today", "")),
+            "watch_article_norm": normalize_article(watch_article),
+            "watch_key_norm": normalize_article(watch_key),
+            "comparison_article_norm": normalize_article(comparison_article),
+            "match_keys_text": "|".join([k for k in keys if k]),
+        })
+    out = pd.DataFrame(rows)
+    return out.reset_index(drop=True)
+
+
+def build_hot_watchlist_lookup(hot_df: pd.DataFrame | None, tab_label: str = "") -> dict[str, list[dict[str, Any]]]:
+    if not isinstance(hot_df, pd.DataFrame) or hot_df.empty:
+        return {}
+    work = hot_df.copy()
+    tab_label = normalize_text(tab_label)
+    if tab_label:
+        filtered = work[(work["current_sheet"] == "") | (work["current_sheet"] == tab_label)].copy()
+        if not filtered.empty:
+            work = filtered
+    lookup: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for _, row in work.iterrows():
+        rec = row.to_dict()
+        keys = [normalize_article(x) for x in normalize_text(rec.get("match_keys_text", "")).split("|") if normalize_article(x)]
+        if not keys:
+            continue
+        for key in keys:
+            lookup[key].append(rec)
+    return lookup
+
+
+def pick_hot_watch_rec(row: pd.Series, lookup: dict[str, list[dict[str, Any]]]) -> dict[str, Any] | None:
+    if not lookup:
+        return None
+    candidate_keys = []
+    article_norm = normalize_article(row.get("article_norm", row.get("article", "")))
+    if article_norm:
+        candidate_keys.append(article_norm)
+    row_codes = row.get("row_codes")
+    if isinstance(row_codes, list):
+        candidate_keys.extend([normalize_article(x) for x in row_codes if normalize_article(x)])
+    best = None
+    best_score = -10**18
+    seen = set()
+    for key in candidate_keys:
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        for rec in lookup.get(key, []):
+            score = safe_float(rec.get("priority_score"), 0.0)
+            if normalize_text(rec.get("buy_signal_30pct", "")).upper() == "BUY":
+                score += 100000.0
+            if key == normalize_article(rec.get("comparison_article_norm", "")):
+                score += 1000.0
+            elif key == normalize_article(rec.get("watch_article_norm", "")):
+                score += 500.0
+            if score > best_score:
+                best = rec
+                best_score = score
+    return best
+
+
+def apply_hot_watchlist(df: pd.DataFrame | None, hot_df: pd.DataFrame | None, tab_label: str = "") -> pd.DataFrame | None:
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    if not isinstance(hot_df, pd.DataFrame) or hot_df.empty:
+        return df
+    lookup = build_hot_watchlist_lookup(hot_df, tab_label=tab_label)
+    if not lookup:
+        return df
+    work = df.copy()
+    matches = [pick_hot_watch_rec(row, lookup) for _, row in work.iterrows()]
+    work["hot_flag"] = [bool(m) for m in matches]
+    work["hot_sales_per_month"] = [safe_float((m or {}).get("sales_per_month"), 0.0) for m in matches]
+    work["hot_priority_score"] = [safe_float((m or {}).get("priority_score"), 0.0) for m in matches]
+    work["hot_abc_class"] = [normalize_text((m or {}).get("abc_class", "")) for m in matches]
+    work["hot_velocity_band"] = [normalize_text((m or {}).get("velocity_band", "")) for m in matches]
+    work["hot_action_today"] = [normalize_text((m or {}).get("action_today", "")) for m in matches]
+    work["hot_buy_signal"] = [normalize_text((m or {}).get("buy_signal_30pct", "")) for m in matches]
+    work["hot_best_supplier"] = [normalize_text((m or {}).get("best_supplier", "")) for m in matches]
+    work["hot_best_supplier_gap_pct"] = [safe_float((m or {}).get("best_supplier_gap_pct"), 0.0) for m in matches]
+    work["hot_watch_article"] = [normalize_text((m or {}).get("watch_article", "")) for m in matches]
+    return work
+
+
+def hot_watchlist_summary_text() -> str:
+    hot_df = st.session_state.get("hot_items_df")
+    if not isinstance(hot_df, pd.DataFrame) or hot_df.empty:
+        return "watchlist не загружен"
+    buy_count = int((hot_df.get("buy_signal_30pct", pd.Series(dtype=object)).fillna("").map(normalize_text).str.upper() == "BUY").sum())
+    ab_count = int(hot_df.get("abc_class", pd.Series(dtype=object)).fillna("").map(normalize_text).isin(["A", "B"]).sum())
+    return f"Ходовые: {len(hot_df)} • A/B: {ab_count} • BUY: {buy_count}"
+
+
