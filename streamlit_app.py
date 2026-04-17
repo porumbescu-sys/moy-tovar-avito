@@ -371,6 +371,7 @@ def build_hot_buy_watchlist_table() -> pd.DataFrame:
         "Лист": work.get("current_sheet", ""),
         "Артикул": work.get("comparison_article", work.get("watch_article", "")),
         "Товар": work.get("watch_name", ""),
+        "Ходовая": "Да",
         "Спрос, шт/мес": work.get("sales_per_month", 0.0),
         "Наша цена": work.get("our_price_now", 0.0),
         "Наш остаток": work.get("our_stock_now", 0.0),
@@ -396,24 +397,84 @@ def render_hot_buy_watchlist_lazy_panel() -> None:
     st.markdown('<div class="result-wrap">', unsafe_allow_html=True)
     render_block_header(
         "Ходовые позиции — сейчас можно брать",
-        "Ленивая таблица только по BUY-сигналам из watchlist. Считается и показывается только когда включён чекбокс в sidebar.",
+        "Ленивая таблица только по ходовым позициям, где лучший поставщик минимум на 35% дешевле нашей цены.",
         icon="🔥",
-        help_text="Показывает только ходовые позиции, где лучший поставщик минимум на 35% дешевле нашей цены. Таблица не грузится, пока чекбокс в блоке Watchlist выключен.",
+        help_text="Показывает только ходовые позиции, где лучший поставщик сейчас минимум на 35% дешевле нашей цены. Таблица не грузится, пока чекбокс в блоке Watchlist выключен.",
     )
     if buy_df.empty:
-        st.info("Сейчас в watchlist нет позиций со статусом «можно брать».")
+        st.info("Сейчас в watchlist нет позиций, где лучший поставщик минимум на 35% дешевле нашей цены.")
     else:
         c1, c2 = st.columns([1.2, 1])
         c1.metric("Позиций можно брать", len(buy_df))
         c2.download_button(
-            "⬇️ Скачать BUY-watchlist в Excel",
+            "⬇️ Скачать таблицу «можно брать» в Excel",
             dataframe_to_excel_bytes(buy_df),
             file_name="hot_buy_watchlist.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key="download_hot_buy_watchlist",
             use_container_width=True,
         )
-        st.dataframe(buy_df, use_container_width=True, height=min(640, 80 + len(buy_df) * 35))
+
+        f1, f2, f3, f4 = st.columns([1.15, 1.1, 1.2, 1.35])
+        sheet_options = ["Все листы"] + sorted(
+            [x for x in buy_df["Лист"].fillna("").astype(str).unique().tolist() if x.strip()]
+        )
+        selected_sheet = f1.selectbox(
+            "Лист",
+            sheet_options,
+            key="hot_buy_sheet_filter",
+            help="Ограничивает таблицу выбранным листом: Оригинал, Уценка или Совместимые.",
+        )
+        only_hot = f2.checkbox(
+            "Только ходовые",
+            value=True,
+            key="hot_buy_only_hot",
+            help="Показывать только товары с хорошим спросом за выбранный период.",
+        )
+        only_buy = f3.checkbox(
+            "Только можно брать",
+            value=True,
+            key="hot_buy_only_buy",
+            help="Показывать только позиции, где лучший поставщик сейчас минимум на 35% дешевле нашей цены.",
+        )
+        only_attention = f4.checkbox(
+            "Только требует внимания",
+            value=False,
+            key="hot_buy_only_attention",
+            help="Показывать позиции, где кроме выгодной закупки есть ещё действие: пополнить запас, наблюдать или проверить сравнение.",
+        )
+
+        st.caption(
+            "Лист — ограничивает таблицу выбранным разделом. "
+            "Только ходовые — товары с хорошим спросом. "
+            "Только можно брать — позиции, где поставщик сейчас минимум на 35% дешевле нашей цены. "
+            "Только требует внимания — позиции, где кроме выгодной закупки есть ещё действие: пополнить запас, наблюдать или проверить сравнение."
+        )
+
+        filtered_buy_df = buy_df.copy()
+
+        if selected_sheet != "Все листы":
+            filtered_buy_df = filtered_buy_df[filtered_buy_df["Лист"].astype(str) == selected_sheet]
+
+        if only_hot:
+            filtered_buy_df = filtered_buy_df[filtered_buy_df["Ходовая"].astype(str).str.strip().eq("Да")]
+
+        if only_buy:
+            filtered_buy_df = filtered_buy_df[
+                filtered_buy_df["Действие"].fillna("").astype(str).str.contains("Можно брать", regex=False)
+            ]
+
+        if only_attention:
+            filtered_buy_df = filtered_buy_df[
+                filtered_buy_df["Действие"].fillna("").astype(str).str.contains(
+                    "Пополнить запас|Наблюдать|Нет в сравнении", regex=True
+                )
+            ]
+
+        if filtered_buy_df.empty:
+            st.info("По выбранным фильтрам строк не найдено.")
+        else:
+            st.dataframe(filtered_buy_df, use_container_width=True, height=min(640, 80 + len(filtered_buy_df) * 35))
     st.markdown('</div>', unsafe_allow_html=True)
 
 
