@@ -11,6 +11,7 @@ import hashlib
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
+from collections import Counter, defaultdict
 from urllib.parse import quote_plus, unquote, urljoin, urlparse
 
 REQUESTS_IMPORT_ERROR: str | None = None
@@ -28,7 +29,7 @@ import streamlit.components.v1 as components
 st.set_page_config(page_title="Мой Товар", page_icon="📦", layout="wide")
 
 APP_TITLE = "Мой Товар"
-APP_VERSION = "v54.6.0"
+APP_VERSION = "v54.6.1"
 
 
 SERVER_DATA_DIRNAME = "data"
@@ -3528,6 +3529,7 @@ with st.sidebar:
         original_name = read_persisted_original_name(persisted_path, persisted_path.name) if persisted_path.exists() else st.session_state.get("comparison_name", "comparison_latest.xlsx")
         if persisted_path.exists():
             try:
+                before_snapshot = build_price_snapshot_for_updates(st.session_state.get("comparison_sheets"), st.session_state.price_patch_input)
                 updated_bytes, patch_message = patch_comparison_workbook_bytes(persisted_path.read_bytes(), st.session_state.price_patch_input)
                 if updated_bytes is not None:
                     save_uploaded_source_file(persisted_path, updated_bytes, original_name.replace(" • из /data", "").replace(" • сохранён в /data", ""))
@@ -3537,16 +3539,25 @@ with st.sidebar:
                     st.session_state.comparison_version = datetime.utcnow().isoformat()
                     rebuild_current_df()
                     refresh_all_search_results()
+                    after_snapshot = build_price_snapshot_for_updates(st.session_state.get("comparison_sheets"), st.session_state.price_patch_input)
+                    history_logged = log_price_patch_history_diff(before_snapshot, after_snapshot, source="manual", note="Быстрая правка цен")
+                    if history_logged:
+                        patch_message += f" | История: {history_logged}"
                 st.session_state.patch_message = patch_message
                 log_operation(f"Быстрая правка цен: {patch_message}", "success")
             except Exception as exc:
                 st.session_state.patch_message = f"Ошибка правки файла: {exc}"
                 log_operation(f"Ошибка быстрой правки цен: {exc}", "warning")
         elif isinstance(sheets_state, dict) and sheets_state:
+            before_snapshot = build_price_snapshot_for_updates(sheets_state, st.session_state.price_patch_input)
             updated_sheets, patch_message = apply_price_updates_to_sheets(sheets_state, st.session_state.price_patch_input)
             st.session_state.comparison_sheets = updated_sheets
             st.session_state.comparison_version = datetime.utcnow().isoformat()
             rebuild_current_df()
+            after_snapshot = build_price_snapshot_for_updates(updated_sheets, st.session_state.price_patch_input)
+            history_logged = log_price_patch_history_diff(before_snapshot, after_snapshot, source="manual", note="Быстрая правка цен")
+            if history_logged:
+                patch_message += f" | История: {history_logged}"
             st.session_state.patch_message = patch_message
             refresh_all_search_results()
             log_operation(f"Быстрая правка цен: {patch_message}", "success")
@@ -3595,6 +3606,551 @@ st.markdown(f"""
 </div></div>
 """, unsafe_allow_html=True)
 
+
+
+
+
+def get_price_patch_history_path() -> Path:
+    try:
+        return Path(__file__).resolve().with_name("price_patch_history.sqlite")
+    except Exception:
+        return Path.cwd() / "price_patch_history.sqlite"
+
+
+def ensure_price_patch_history() -> None:
+    path = get_price_patch_history_path()
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS price_patch_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                changed_at TEXT,
+                article_norm TEXT,
+                article TEXT,
+                sheet_name TEXT,
+                old_price REAL,
+                new_price REAL,
+                change_source TEXT,
+                note TEXT
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def load_price_patch_history_df(limit: int = 200) -> pd.DataFrame:
+    path = get_price_patch_history_path()
+    if not path.exists():
+        return pd.DataFrame()
+    ensure_price_patch_history()
+    conn = sqlite3.connect(path)
+    try:
+        df = pd.read_sql_query(
+            "SELECT * FROM price_patch_history ORDER BY id DESC LIMIT ?",
+            conn,
+            params=(int(limit),),
+        )
+    except Exception:
+        return pd.DataFrame()
+    finally:
+        conn.close()
+    if df.empty:
+        return df
+    for col in ["changed_at", "article_norm", "article", "sheet_name", "change_source", "note"]:
+        if col in df.columns:
+            df[col] = df[col].fillna("").map(normalize_text)
+    return df
+
+
+def build_price_snapshot_for_updates(sheets: dict[str, pd.DataFrame] | None, updates_text: str) -> dict[tuple[str, str, str], dict[str, Any]]:
+    updates = parse_price_updates(updates_text)
+    snapshot: dict[tuple[str, str, str], dict[str, Any]] = {}
+    if not updates or not isinstance(sheets, dict):
+        return snapshot
+    target_codes = [code for code, _ in updates if normalize_article(code)]
+    if not target_codes:
+        return snapshot
+    for sheet_name, df in sheets.items():
+        if df is None or df.empty:
+            continue
+        for target in target_codes:
+            mask = df["article_norm"].eq(target)
+            if "row_codes" in df.columns:
+                row_mask = df["row_codes"].apply(lambda codes: target in (codes or []) if isinstance(codes, list) else False)
+                mask = mask | row_mask
+            matched = df[mask]
+            if matched.empty:
+                continue
+            for _, row in matched.iterrows():
+                article_txt = normalize_text(row.get("article", ""))
+                key = (target, sheet_name, normalize_article(article_txt) or target)
+                snapshot[key] = {
+                    "article_norm": target,
+                    "article": article_txt or target,
+                    "sheet_name": sheet_name,
+                    "price": safe_float(row.get("sale_price"), 0.0),
+                }
+    return snapshot
+
+
+def log_price_patch_history_diff(before: dict[tuple[str, str, str], dict[str, Any]], after: dict[tuple[str, str, str], dict[str, Any]], source: str = "manual", note: str = "") -> int:
+    ensure_price_patch_history()
+    rows: list[tuple[str, str, str, str, float, float, str, str]] = []
+    changed_at = datetime.now().replace(microsecond=0).isoformat(sep=" ")
+    all_keys = set(before.keys()) | set(after.keys())
+    for key in all_keys:
+        prev = before.get(key)
+        cur = after.get(key)
+        old_price = safe_float((prev or {}).get("price"), 0.0)
+        new_price = safe_float((cur or {}).get("price"), 0.0)
+        if abs(old_price - new_price) < 1e-9:
+            continue
+        row = cur or prev or {}
+        rows.append(
+            (
+                changed_at,
+                normalize_text(row.get("article_norm", key[0])),
+                normalize_text(row.get("article", key[2])),
+                normalize_text(row.get("sheet_name", key[1])),
+                old_price,
+                new_price,
+                normalize_text(source),
+                normalize_text(note),
+            )
+        )
+    if not rows:
+        return 0
+    conn = sqlite3.connect(get_price_patch_history_path())
+    try:
+        conn.executemany(
+            """
+            INSERT INTO price_patch_history (
+                changed_at, article_norm, article, sheet_name, old_price, new_price, change_source, note
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return len(rows)
+
+
+def infer_brand_from_product_name(name: object) -> str:
+    text = contains_text(name)
+    if not text:
+        return ""
+    patterns = [
+        ("KONICA MINOLTA", "Konica Minolta"),
+        ("KONICA-MINOLTA", "Konica Minolta"),
+        ("KYOCERA", "Kyocera"),
+        ("BROTHER", "Brother"),
+        ("CANON", "Canon"),
+        ("PANTUM", "Pantum"),
+        ("XEROX", "Xerox"),
+        ("LEXMARK", "Lexmark"),
+        ("RICOH", "Ricoh"),
+        ("SAMSUNG", "Samsung"),
+        ("SHARP", "Sharp"),
+        ("PANASONIC", "Panasonic"),
+        ("EPSON", "Epson"),
+        ("OKI", "OKI"),
+        ("HP", "HP"),
+    ]
+    for marker, label in patterns:
+        if marker in text:
+            return label
+    return ""
+
+
+def parse_dt_safe(value: object) -> Optional[datetime]:
+    txt = normalize_text(value)
+    if not txt:
+        return None
+    for parser in (datetime.fromisoformat,):
+        try:
+            return parser(txt)
+        except Exception:
+            continue
+    return None
+
+
+def combine_avito_sources(avito_df: pd.DataFrame | None, registry_df: pd.DataFrame | None) -> pd.DataFrame:
+    frames: list[pd.DataFrame] = []
+    if isinstance(avito_df, pd.DataFrame) and not avito_df.empty:
+        cur = avito_df.copy()
+        if "registry_key" not in cur.columns:
+            cur["registry_key"] = cur.apply(build_avito_registry_key, axis=1)
+        if "title_codes" not in cur.columns:
+            cur["title_codes"] = cur.get("title", "").map(extract_article_candidates_from_text)
+        if "title_norm" not in cur.columns:
+            cur["title_norm"] = cur.get("title", "").map(contains_text)
+        frames.append(cur)
+    if isinstance(registry_df, pd.DataFrame) and not registry_df.empty:
+        reg = registry_df.copy()
+        if "registry_key" not in reg.columns:
+            reg["registry_key"] = reg.apply(build_avito_registry_key, axis=1)
+        if "title_codes" not in reg.columns:
+            reg["title_codes"] = reg.get("title", "").map(extract_article_candidates_from_text)
+        if "title_norm" not in reg.columns:
+            reg["title_norm"] = reg.get("title", "").map(contains_text)
+        frames.append(reg)
+    if not frames:
+        return pd.DataFrame()
+    merged = pd.concat(frames, ignore_index=True, sort=False)
+    merged = merged.drop_duplicates(subset=["registry_key"], keep="first").reset_index(drop=True)
+    for col in ["ad_id", "title", "price", "price_raw", "url", "account", "status", "last_changed_at", "last_seen", "first_seen"]:
+        if col in merged.columns:
+            merged[col] = merged[col].fillna("").map(normalize_text)
+    return merged
+
+
+def build_avito_code_index(avito_df: pd.DataFrame | None) -> tuple[pd.DataFrame, dict[str, list[dict[str, Any]]]]:
+    if avito_df is None or avito_df.empty:
+        return pd.DataFrame(), {}
+    index: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    records = avito_df.to_dict(orient="records")
+    for rec in records:
+        codes = rec.get("title_codes", []) or []
+        codes = unique_norm_codes(codes)
+        for code in codes:
+            index[code].append(rec)
+    return avito_df, index
+
+
+def match_avito_candidates_for_codes(index: dict[str, list[dict[str, Any]]], codes: list[str]) -> list[dict[str, Any]]:
+    hits: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for code in unique_norm_codes(codes):
+        for rec in index.get(code, []):
+            key = normalize_text(rec.get("registry_key")) or normalize_text(rec.get("ad_id")) or normalize_text(rec.get("title"))
+            if key in seen:
+                continue
+            seen.add(key)
+            hits.append(rec)
+    return hits
+
+
+def safe_days_since(dt_value: object) -> Optional[int]:
+    dt = parse_dt_safe(dt_value)
+    if not dt:
+        return None
+    try:
+        delta = datetime.now() - dt
+        return max(int(delta.days), 0)
+    except Exception:
+        return None
+
+
+@st.cache_data(show_spinner=False, ttl=900, max_entries=6)
+def build_operational_analytics_bundle(
+    sheet_df: pd.DataFrame,
+    photo_df: pd.DataFrame | None,
+    avito_df: pd.DataFrame | None,
+    avito_registry_df: pd.DataFrame | None,
+    min_qty: float,
+    sheet_name: str,
+) -> dict[str, Any]:
+    enriched = apply_photo_map(sheet_df, photo_df)
+    if enriched is None or enriched.empty:
+        return {}
+    merged_avito = combine_avito_sources(avito_df, avito_registry_df)
+    _, avito_index = build_avito_code_index(merged_avito)
+
+    rows_meta: list[dict[str, Any]] = []
+    source_counter: Counter[str] = Counter()
+    task_counts = Counter()
+    account_rows: list[dict[str, Any]] = []
+
+    for _, row in enriched.iterrows():
+        article = normalize_text(row.get("article", ""))
+        article_norm = normalize_article(article)
+        name = normalize_text(row.get("name", ""))
+        own_price = safe_float(row.get("sale_price"), 0.0)
+        own_qty = parse_qty_generic(row.get("free_qty"))
+        codes = row.get("row_codes", []) or build_row_compare_codes(article, name)
+        matched_ads = match_avito_candidates_for_codes(avito_index, codes)
+        ad_count = len(matched_ads)
+        accounts = unique_text_values([rec.get("account", "") for rec in matched_ads])
+        best_offer = get_best_offer(row, min_qty=min_qty)
+        better_market = bool(best_offer and safe_float(best_offer.get("price"), 0.0) > 0 and safe_float(best_offer.get("price"), 0.0) < own_price)
+        delta_rub = own_price - safe_float((best_offer or {}).get("price"), 0.0) if better_market else 0.0
+        delta_pct = ((delta_rub / own_price) * 100.0) if better_market and own_price > 0 else 0.0
+        priority_score = round(max(delta_pct, 0.0) * max(own_qty, 0.0) * max(ad_count, 1), 2)
+        photo_url = normalize_text(row.get("photo_url", ""))
+        has_photo = bool(photo_url)
+        has_model = bool(normalize_text(row.get("meta_model", "")))
+        has_fits = bool(normalize_text(row.get("meta_fits_models", "")))
+        template_ok = has_photo and (has_model or has_fits)
+        days_since_change_candidates = [safe_days_since(rec.get("last_changed_at", "")) for rec in matched_ads]
+        days_since_change_candidates = [x for x in days_since_change_candidates if x is not None]
+        days_since_change = min(days_since_change_candidates) if days_since_change_candidates else None
+        stale = bool(days_since_change is not None and days_since_change >= 30)
+        weak_ad = ad_count > 0 and not template_ok
+        reasons: list[str] = []
+        if own_qty > 0 and better_market:
+            reasons.append("дорого")
+            task_counts["price_review"] += 1
+        if own_qty > 0 and not has_photo:
+            reasons.append("нет фото")
+            task_counts["no_photo"] += 1
+        if own_qty > 0 and ad_count == 0:
+            reasons.append("нет объявления")
+            task_counts["no_avito"] += 1
+        elif own_qty > 0 and weak_ad:
+            reasons.append("слабое объявление")
+            task_counts["weak_avito"] += 1
+        if own_qty > 0 and stale:
+            reasons.append("давно не обновлялось")
+            task_counts["stale"] += 1
+        if better_market and best_offer:
+            source_counter[normalize_text(best_offer.get("source", ""))] += 1
+        brand_guess = infer_brand_from_product_name(name)
+
+        row_meta = {
+            "Лист": sheet_name,
+            "Артикул": article,
+            "Название": name,
+            "Бренд": brand_guess,
+            "Наша цена": own_price,
+            "Наш остаток": own_qty,
+            "Лучшая цена дистрибьютора": safe_float((best_offer or {}).get("price"), 0.0) if best_offer else None,
+            "Лучший поставщик": normalize_text((best_offer or {}).get("source", "")) if best_offer else "",
+            "Остаток дистрибьютора": safe_float((best_offer or {}).get("qty"), 0.0) if best_offer else None,
+            "Разница, руб": delta_rub if better_market else None,
+            "Разница, %": round(delta_pct, 2) if better_market else None,
+            "Приоритет": priority_score if better_market else 0.0,
+            "Фото": "Да" if has_photo else "Нет",
+            "Шаблон": "OK" if template_ok else "Пустой",
+            "Модель": "Да" if has_model else "Нет",
+            "Подходит к моделям": "Да" if has_fits else "Нет",
+            "Объявлений Авито": ad_count,
+            "Аккаунты Авито": ", ".join(accounts),
+            "Последнее изменение, дней": days_since_change if days_since_change is not None else "",
+            "Причины": ", ".join(reasons),
+            "article_norm": article_norm,
+            "family": split_article_family_suffix(article_norm)[0],
+            "color": simplify_template_color(normalize_text(row.get("meta_color", "")) or extract_color_from_text(name)),
+        }
+        rows_meta.append(row_meta)
+        for account in accounts:
+            account_rows.append(
+                {
+                    "Аккаунт": account,
+                    "Артикул": article,
+                    "Бренд": brand_guess,
+                    "Лист": sheet_name,
+                    "Есть фото": has_photo,
+                    "Есть объявление": ad_count > 0,
+                    "Лучше рынка": better_market,
+                    "Шаблон OK": template_ok,
+                }
+            )
+
+    meta_df = pd.DataFrame(rows_meta)
+    top_df = meta_df[meta_df["Разница, %"].notna()].copy() if not meta_df.empty else pd.DataFrame()
+    if not top_df.empty:
+        top_df = top_df.sort_values(["Приоритет", "Разница, %", "Наш остаток"], ascending=[False, False, False]).reset_index(drop=True)
+
+    action_df = meta_df[meta_df["Причины"].map(bool)].copy() if not meta_df.empty else pd.DataFrame()
+    if not action_df.empty:
+        action_df = action_df.sort_values(["Наш остаток", "Разница, %"], ascending=[False, False], na_position="last").reset_index(drop=True)
+
+    quality = {
+        "with_photo": int((meta_df["Фото"] == "Да").sum()) if not meta_df.empty else 0,
+        "without_photo": int((meta_df["Фото"] == "Нет").sum()) if not meta_df.empty else 0,
+        "template_ok": int((meta_df["Шаблон"] == "OK").sum()) if not meta_df.empty else 0,
+        "without_model_or_fits": int(((meta_df["Модель"] == "Нет") | (meta_df["Подходит к моделям"] == "Нет")).sum()) if not meta_df.empty else 0,
+        "in_price_not_in_avito": int((meta_df["Объявлений Авито"] == 0).sum()) if not meta_df.empty else 0,
+        "in_avito_not_in_stock": int(((meta_df["Объявлений Авито"] > 0) & (pd.to_numeric(meta_df["Наш остаток"], errors="coerce").fillna(0) <= 0)).sum()) if not meta_df.empty else 0,
+    }
+    quality_df = pd.DataFrame(
+        [
+            {"Показатель": "С фото", "Количество": quality["with_photo"]},
+            {"Показатель": "Без фото", "Количество": quality["without_photo"]},
+            {"Показатель": "Шаблон заполнен", "Количество": quality["template_ok"]},
+            {"Показатель": "Нет модели / подходит к моделям", "Количество": quality["without_model_or_fits"]},
+            {"Показатель": "Есть в прайсе, но нет в Avito", "Количество": quality["in_price_not_in_avito"]},
+            {"Показатель": "Есть в Avito, но нет в наличии", "Количество": quality["in_avito_not_in_stock"]},
+        ]
+    )
+
+    account_df = pd.DataFrame(account_rows)
+    if not account_df.empty:
+        account_summary = account_df.groupby("Аккаунт", dropna=False).agg(
+            Позиций=("Артикул", "count"),
+            Без_фото=("Есть фото", lambda s: int((~pd.Series(s)).sum())),
+            Дороже_рынка=("Лучше рынка", lambda s: int(pd.Series(s).sum())),
+            Слабый_шаблон=("Шаблон OK", lambda s: int((~pd.Series(s)).sum())),
+        ).reset_index().rename(columns={"Без_фото": "Без фото", "Дороже_рынка": "Дороже рынка", "Слабый_шаблон": "Слабый шаблон"})
+    else:
+        account_summary = pd.DataFrame(columns=["Аккаунт", "Позиций", "Без фото", "Дороже рынка", "Слабый шаблон"])
+
+    series_rows: list[dict[str, Any]] = []
+    if not meta_df.empty:
+        for family, grp in meta_df.groupby("family"):
+            if not normalize_text(family) or len(grp) < 2:
+                continue
+            colors = unique_text_values(grp["color"].tolist())
+            issue_count = int((grp["Фото"] == "Нет").sum()) + int((grp["Объявлений Авито"] == 0).sum()) + int(grp["Разница, %"].notna().sum())
+            canonical = [c for c in colors if c in {"чёрный", "черный", "голубой", "пурпурный", "жёлтый", "желтый"}]
+            missing = []
+            palette = ["чёрный", "голубой", "пурпурный", "жёлтый"]
+            normalized_colors = {c.replace("ё", "е") for c in canonical}
+            if normalized_colors:
+                for color in palette:
+                    if color.replace("ё", "е") not in normalized_colors:
+                        missing.append(color)
+            series_rows.append(
+                {
+                    "Серия": family,
+                    "Позиций": len(grp),
+                    "Цвета": ", ".join(colors),
+                    "Не хватает": ", ".join(missing),
+                    "Без фото": int((grp["Фото"] == "Нет").sum()),
+                    "Без Avito": int((grp["Объявлений Авито"] == 0).sum()),
+                    "Дороже рынка": int(grp["Разница, %"].notna().sum()),
+                    "Проблем в серии": issue_count,
+                }
+            )
+    series_df = pd.DataFrame(series_rows)
+    if not series_df.empty:
+        series_df = series_df.sort_values(["Проблем в серии", "Позиций"], ascending=[False, False]).reset_index(drop=True)
+
+    source_df = pd.DataFrame(
+        [{"Источник": source, "Сколько раз лучший": count} for source, count in source_counter.most_common()]
+    )
+
+    patch_history_df = load_price_patch_history_df(limit=50)
+
+    tasks_df = pd.DataFrame(
+        [
+            {"Задача": "Пересмотреть по цене", "Количество": int(task_counts.get("price_review", 0))},
+            {"Задача": "Добавить фото", "Количество": int(task_counts.get("no_photo", 0))},
+            {"Задача": "Доработать/добавить Avito", "Количество": int(task_counts.get("no_avito", 0) + task_counts.get("weak_avito", 0))},
+            {"Задача": "Проверить давно не обновлявшиеся", "Количество": int(task_counts.get("stale", 0))},
+            {"Задача": "Проверить неполные серии", "Количество": int((series_df["Не хватает"].map(bool)).sum()) if not series_df.empty else 0},
+        ]
+    )
+
+    return {
+        "meta_df": meta_df,
+        "top_df": top_df,
+        "action_df": action_df,
+        "quality_df": quality_df,
+        "account_df": account_summary,
+        "series_df": series_df,
+        "source_df": source_df,
+        "patch_history_df": patch_history_df,
+        "tasks_df": tasks_df,
+        "quality": quality,
+    }
+
+
+def analytics_bundle_to_excel_bytes(bundle: dict[str, Any]) -> bytes:
+    bio = io.BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+        for key, sheet_name in [
+            ("top_df", "Приоритет цены"),
+            ("action_df", "Что делать"),
+            ("account_df", "Аккаунты Avito"),
+            ("quality_df", "Качество карточек"),
+            ("series_df", "Серии"),
+            ("source_df", "Источники"),
+            ("patch_history_df", "История правок"),
+            ("tasks_df", "Сегодня"),
+        ]:
+            df = bundle.get(key)
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                df.to_excel(writer, index=False, sheet_name=sheet_name[:31])
+    bio.seek(0)
+    return bio.read()
+
+
+def render_operational_analytics_block(sheet_df: pd.DataFrame, photo_df: pd.DataFrame | None, avito_df: pd.DataFrame | None, min_qty: float, sheet_name: str, tab_key: str) -> None:
+    registry_df = load_avito_registry_df()
+    bundle = build_operational_analytics_bundle(sheet_df, photo_df, avito_df, registry_df, min_qty, sheet_name)
+    if not bundle:
+        st.info("Для аналитики нет данных.")
+        return
+    quality = bundle.get("quality", {})
+    tasks_df = bundle.get("tasks_df", pd.DataFrame())
+    top_df = bundle.get("top_df", pd.DataFrame())
+    action_df = bundle.get("action_df", pd.DataFrame())
+    account_df = bundle.get("account_df", pd.DataFrame())
+    quality_df = bundle.get("quality_df", pd.DataFrame())
+    series_df = bundle.get("series_df", pd.DataFrame())
+    source_df = bundle.get("source_df", pd.DataFrame())
+    patch_history_df = bundle.get("patch_history_df", pd.DataFrame())
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Без фото", int(quality.get("without_photo", 0)))
+    m2.metric("Нет в Avito", int(quality.get("in_price_not_in_avito", 0)))
+    m3.metric("Дороже рынка", int(len(top_df) if isinstance(top_df, pd.DataFrame) else 0))
+    m4.metric("История ручных правок", int(len(patch_history_df) if isinstance(patch_history_df, pd.DataFrame) else 0))
+
+    render_info_banner(
+        "Что делать сегодня",
+        "Сначала посмотри приоритет на пересмотр цены, потом проблемные позиции с фото/Avito, потом качество карточек и серии.",
+        icon="🧭",
+        chips=[f"лист: {sheet_name}", "ленивый расчёт", "ядро поиска не затрагивается"],
+        tone="green",
+    )
+
+    if isinstance(tasks_df, pd.DataFrame) and not tasks_df.empty:
+        st.dataframe(tasks_df, use_container_width=True, hide_index=True)
+
+    with st.expander("1. Приоритет на пересмотр цены", expanded=False):
+        if isinstance(top_df, pd.DataFrame) and not top_df.empty:
+            view = top_df[["Артикул", "Название", "Наша цена", "Лучшая цена дистрибьютора", "Лучший поставщик", "Разница, руб", "Разница, %", "Наш остаток", "Остаток дистрибьютора", "Приоритет"]].head(100)
+            st.dataframe(view, use_container_width=True, hide_index=True)
+        else:
+            st.caption("На текущем листе нет позиций, где рынок дешевле нас.")
+
+    with st.expander("2. Что лежит и требует вмешательства", expanded=False):
+        if isinstance(action_df, pd.DataFrame) and not action_df.empty:
+            view = action_df[["Артикул", "Название", "Наш остаток", "Причины", "Объявлений Авито", "Фото", "Шаблон", "Лучший поставщик", "Разница, %"]].head(150)
+            st.dataframe(view, use_container_width=True, hide_index=True)
+        else:
+            st.caption("Явных проблемных позиций на текущем листе не найдено.")
+
+    with st.expander("3. Аналитика по аккаунтам Avito", expanded=False):
+        if isinstance(account_df, pd.DataFrame) and not account_df.empty:
+            st.dataframe(account_df, use_container_width=True, hide_index=True)
+        else:
+            st.caption("В Avito пока нет данных по аккаунтам для этого листа.")
+
+    with st.expander("4. Покрытие качества карточек", expanded=False):
+        st.dataframe(quality_df, use_container_width=True, hide_index=True)
+
+    with st.expander("5. Серийная аналитика", expanded=False):
+        if isinstance(series_df, pd.DataFrame) and not series_df.empty:
+            st.dataframe(series_df.head(100), use_container_width=True, hide_index=True)
+        else:
+            st.caption("На текущем листе не найдено серий, требующих отдельной сводки.")
+
+    with st.expander("6. История ручных правок", expanded=False):
+        if isinstance(patch_history_df, pd.DataFrame) and not patch_history_df.empty:
+            st.dataframe(patch_history_df[["changed_at", "article", "sheet_name", "old_price", "new_price", "change_source", "note"]], use_container_width=True, hide_index=True)
+        else:
+            st.caption("История ручных правок пока пустая.")
+
+    with st.expander("7. Надёжность источников", expanded=False):
+        if isinstance(source_df, pd.DataFrame) and not source_df.empty:
+            st.dataframe(source_df, use_container_width=True, hide_index=True)
+        else:
+            st.caption("Пока нет данных по лучшим поставщикам.")
+
+    st.download_button(
+        "⬇️ Скачать аналитику в Excel",
+        analytics_bundle_to_excel_bytes(bundle),
+        file_name=f"analytics_{tab_key}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key=f"download_analytics_{tab_key}",
+    )
 
 def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> None:
     search_key = f"search_input_{tab_key}"
@@ -3822,12 +4378,13 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
                 tech = tech[["article", "name", "Наша цена", "Наш склад", "Лучший поставщик", "Лучшая цена", "Фото"]].rename(columns={"article": "Артикул", "name": "Название"})
                 st.dataframe(tech, use_container_width=True, hide_index=True)
 
-            lazy_c0, lazy_c1, lazy_c2, lazy_c3, lazy_c4 = st.columns(5)
+            lazy_c0, lazy_c1, lazy_c2, lazy_c3, lazy_c4, lazy_c5 = st.columns(6)
             lazy_c0.checkbox("Показать шаблоны", key=f"lazy_templates_{tab_key}")
             lazy_c1.checkbox("Показать цены у всех", key=f"lazy_all_prices_{tab_key}")
             lazy_c2.checkbox("Файл для руководителя", key=f"lazy_analysis_{tab_key}")
             lazy_c3.checkbox("Показать Авито", key=f"lazy_avito_{tab_key}")
             lazy_c4.checkbox("Считать отчёт по листу", key=f"lazy_report_{tab_key}")
+            lazy_c5.checkbox("Аналитика / задачи", key=f"lazy_analytics_{tab_key}")
 
             if st.session_state.get(f"lazy_templates_{tab_key}", False):
                 result_enriched_for_templates = apply_photo_map(result_df, photo_df) if isinstance(result_df, pd.DataFrame) else result_df
