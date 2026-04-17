@@ -4875,15 +4875,61 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
             c1.metric("Строк в отчёте", len(report_df))
             c2.metric("Порог", f"{fmt_qty(st.session_state.distributor_threshold)}%")
             c3.metric("Источников", len(source_pairs))
-            st.dataframe(report_df, use_container_width=True, hide_index=True, height=420)
-            st.download_button(
-                "⬇️ Скачать отчёт по листу",
-                report_to_excel_bytes(report_df),
-                file_name=f"moy_tovar_report_{tab_key}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-                key=f"download_report_{tab_key}",
+
+            f1, f2, f3 = st.columns(3)
+            only_hot = f1.checkbox(
+                "Только ходовые",
+                key=f"report_only_hot_{tab_key}",
+                help="Показывать только позиции, которые есть в watchlist ходовых.",
             )
+            only_buy = f2.checkbox(
+                "Только можно брать",
+                key=f"report_only_buy_{tab_key}",
+                help="Показывать только позиции, где в watchlist сейчас есть BUY-сигнал.",
+            )
+            only_attention = f3.checkbox(
+                "Только требует внимания",
+                key=f"report_only_attention_{tab_key}",
+                help="Показывать позиции, где в watchlist есть RESTOCK / WATCH / NO_MATCH.",
+            )
+
+            filtered_report_df = report_df.copy()
+
+            if only_hot:
+                filtered_report_df = filtered_report_df[
+                    filtered_report_df["Ходовая"].astype(str).str.strip().eq("Да")
+                ]
+
+            if only_buy:
+                filtered_report_df = filtered_report_df[
+                    filtered_report_df["Действие"]
+                    .fillna("")
+                    .astype(str)
+                    .str.upper()
+                    .str.contains("BUY", regex=False)
+                ]
+
+            if only_attention:
+                filtered_report_df = filtered_report_df[
+                    filtered_report_df["Действие"]
+                    .fillna("")
+                    .astype(str)
+                    .str.upper()
+                    .str.contains("RESTOCK|WATCH|NO_MATCH", regex=True)
+                ]
+
+            if filtered_report_df.empty:
+                st.info("По выбранным фильтрам строк не найдено.")
+            else:
+                st.dataframe(filtered_report_df, use_container_width=True, hide_index=True, height=420)
+                st.download_button(
+                    "⬇️ Скачать отчёт по листу",
+                    report_to_excel_bytes(filtered_report_df),
+                    file_name=f"moy_tovar_report_{tab_key}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                    key=f"download_report_{tab_key}",
+                )
         st.markdown('</div>', unsafe_allow_html=True)
 
 
