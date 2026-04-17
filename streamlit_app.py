@@ -2847,6 +2847,16 @@ def render_results_table(df: pd.DataFrame, price_mode: str, round100: bool, cust
 
         item_photo_html = f"<div class='item-photo'>{photo_html}</div>" if show_photos else ""
 
+        free_qty = safe_float(row.get("free_qty"), 0.0)
+        total_qty = safe_float(row.get("total_qty"), free_qty)
+        transit_qty = safe_float(row.get("transit_qty"), 0.0)
+        stock_html = f"""
+        <div class='stock-main'>{fmt_qty(free_qty)}</div>
+        <div class='stock-sub'>Свободно: {fmt_qty(free_qty)}</div>
+        <div class='stock-sub'>Всего: {fmt_qty(total_qty)}</div>
+        <div class='stock-sub'>Транзит: {fmt_qty(transit_qty)}</div>
+        """
+
         rows_html.append(
             f"""
             <tr>
