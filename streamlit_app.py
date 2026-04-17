@@ -188,6 +188,8 @@ CATALOG_COLUMN_ALIASES = {
     "name": ["Наименование", "Номенклатура", "Название", "name"],
     "price": ["Наша цена", "Цена", "Цена продажи", "price"],
     "qty": ["Наш склад", "Свободно", "Остаток", "Количество", "qty"],
+    "total_qty": ["Всего", "Итого", "Общий остаток", "Всего шт", "Итого шт"],
+    "transit_qty": ["Транзит", "В транзите", "В пути", "Поступает", "Транзит шт"],
 }
 
 PHOTO_COLUMN_ALIASES = {
@@ -1017,7 +1019,11 @@ def load_comparison_workbook(file_name: str, file_bytes: bytes) -> dict[str, pd.
         df["name"] = df[mapping["name"]].map(normalize_text)
         df["sale_price"] = df[mapping["price"]].apply(safe_float)
         df["free_qty"] = df[mapping["qty"]].apply(parse_qty_generic)
-        df["total_qty"] = df["free_qty"]
+        total_col = mapping.get("total_qty")
+        transit_col = mapping.get("transit_qty")
+        df["total_qty"] = df[total_col].apply(parse_qty_generic) if total_col else df["free_qty"]
+        df["transit_qty"] = df[transit_col].apply(parse_qty_generic) if transit_col else 0.0
+        df["has_extended_stock"] = bool(total_col or transit_col)
         df["search_blob"] = (df["article"] + " " + df["name"]).map(contains_text)
         df["search_blob_compact"] = (df["article"] + " " + df["name"]).map(compact_text)
         df["name_tokens"] = df["name"].map(tokenize_text)
@@ -2854,7 +2860,7 @@ def render_results_table(df: pd.DataFrame, price_mode: str, round100: bool, cust
                   </div>
                 </div>
               </td>
-              <td>{fmt_qty(row['free_qty'])}</td>
+              <td class='stock-cell'>{stock_html}</td>
               <td class='sale-col'>{fmt_price(row['sale_price'])} руб.</td>
               <td class='selected-col'>{fmt_price(selected_raw)} руб.</td>
               <td class='compare-col'>{compare_html}</td>
@@ -2882,6 +2888,9 @@ def render_results_table(df: pd.DataFrame, price_mode: str, round100: bool, cust
       .sale-col {{ font-weight:800; white-space:nowrap; }}
       .selected-col {{ background: linear-gradient(180deg, #f4f8ff 0%, #eef4ff 100%); border-left:1px solid #c7d7ff; border-right:1px solid #c7d7ff; font-weight:900; color:#315efb; white-space:nowrap; }}
       .compare-col {{ min-width:230px; }}
+      .stock-cell {{ min-width:110px; }}
+      .stock-main {{ font-weight:900; font-size:18px; color:#0f172a; line-height:1.05; margin-bottom:6px; }}
+      .stock-sub {{ font-size:12px; color:#64748b; line-height:1.4; }}
       .best-box {{ border-radius:18px; padding:11px 12px; min-width:190px; border:1px solid #dce6f7; background:linear-gradient(180deg, #f8fbff 0%, #f3f8ff 100%); box-shadow: inset 0 1px 0 rgba(255,255,255,.72); }}
       .best-box-empty {{ text-align:center; background:linear-gradient(180deg, #fafcff 0%, #f5f7fb 100%); border-color:#e2e8f0; min-height:76px; display:flex; align-items:center; justify-content:center; }}
       .best-empty-title {{ color:#64748b; font-weight:800; }}
