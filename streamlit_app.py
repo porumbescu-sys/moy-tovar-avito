@@ -336,7 +336,7 @@ def hot_watchlist_summary_text() -> str:
         return "watchlist не загружен"
     buy_count = int((hot_df.get("buy_signal_30pct", pd.Series(dtype=object)).fillna("").map(normalize_text).str.upper() == "BUY").sum())
     ab_count = int(hot_df.get("abc_class", pd.Series(dtype=object)).fillna("").map(normalize_text).isin(["A", "B"]).sum())
-    return f"Ходовые: {len(hot_df)} • A/B: {ab_count} • BUY: {buy_count}"
+    return f"Ходовых: {len(hot_df)} • сильный спрос: {ab_count} • можно брать: {buy_count}"
 
 def load_persisted_watchlist_source_into_state() -> bool:
     target = get_persisted_watchlist_file_path()
@@ -2992,20 +2992,38 @@ def render_results_table(df: pd.DataFrame, price_mode: str, round100: bool, cust
 
         hot_html = ""
         if bool(row.get("hot_flag", False)):
-            hot_parts = []
-            abc = normalize_text(row.get("hot_abc_class", ""))
+            abc = normalize_text(row.get("hot_abc_class", "")).upper()
             sales_pm = safe_float(row.get("hot_sales_per_month"), 0.0)
-            if abc:
-                hot_parts.append(f"класс {abc}")
-            if sales_pm > 0:
-                hot_parts.append(f"{sales_pm:.1f}/мес")
-            action_today = normalize_text(row.get("hot_action_today", ""))
+            action_today = normalize_text(row.get("hot_action_today", "")).upper()
             buy_signal = normalize_text(row.get("hot_buy_signal", "")).upper()
-            primary = "🔥 Ходовая"
+
+            demand_map = {
+                "A": "Спрос высокий",
+                "B": "Спрос хороший",
+                "C": "Спрос умеренный",
+            }
+            action_map = {
+                "BUY": "Сейчас можно брать",
+                "WATCH": "Сейчас брать невыгодно",
+                "RESTOCK": "Нужно пополнить",
+                "NO_MATCH_IN_COMPARISON": "Нет совпадения в comparison",
+            }
+
+            primary = "🔥 Товар ходовой"
+            note_parts = []
+            if abc:
+                note_parts.append(demand_map.get(abc, f"Класс {abc}"))
+            if sales_pm > 0:
+                note_parts.append(f"≈ {sales_pm:.1f} шт/мес")
+            note = " • ".join(note_parts)
+
+            action_text = action_map.get(action_today, "")
             if buy_signal == "BUY":
-                primary = "🔥 Ходовая • BUY"
-            note = " • ".join(hot_parts)
-            action_html = f"<div class='hot-sub-badge'>{html.escape(action_today)}</div>" if action_today else ""
+                action_text = "Сейчас можно брать"
+            elif not action_text:
+                action_text = "Сейчас брать невыгодно"
+
+            action_html = f"<div class='hot-sub-badge'>{html.escape(action_text)}</div>" if action_text else ""
             hot_html = f"<div class='hot-badge'>{html.escape(primary)}</div>{('<div class="hot-meta">' + html.escape(note) + '</div>') if note else ''}{action_html}"
 
         if best:
@@ -3223,16 +3241,27 @@ def render_results_insight_dashboard(result_df: pd.DataFrame, compare_map: dict[
         hot_count = int(result_df["hot_flag"].fillna(False).map(bool).sum())
         if "hot_buy_signal" in result_df.columns:
             hot_buy_count = int(result_df["hot_buy_signal"].fillna("").map(normalize_text).str.upper().eq("BUY").sum())
+    hot_label = "Ходовые в поиске"
+    hot_note = "Watchlist не совпал с результатами"
+    hot_help = "Товар ходовой → товар хорошо продавался за выбранный период"
+    if hot_count:
+        hot_label = "Товар ходовой"
+        if hot_buy_count > 0:
+            hot_note = "Сейчас можно брать"
+            hot_help += "\nСейчас можно брать → лучший поставщик сейчас заметно дешевле нашей цены"
+        else:
+            hot_note = "Сейчас брать невыгодно"
+            hot_help += "\nСейчас брать невыгодно → лучший поставщик сейчас не дешевле нашей цены"
     cards = [
-        ("🔎", "Найдено позиций", str(found_count), "Сколько строк вошло в текущий поиск"),
-        ("💚", "Есть цена лучше", str(better_rows), "Сколько позиций реально дешевле у поставщиков"),
-        ("📈", "Средняя выгода", (f"{avg_gain:.1f}%" if gains else "—"), "Считается приложением, не берётся из готовых колонок Excel"),
-        ("🔥", "Ходовые в поиске", str(hot_count), (f"BUY-сигналов: {hot_buy_count}" if hot_count else "Watchlist не совпал с результатами")),
-        ("🧩", "Источников найдено", str(len(source_pairs)), ", ".join([x["source"] for x in source_pairs]) if source_pairs else "Нет колонок источников"),
+        ("🔎", "Найдено позиций", str(found_count), "Сколько строк вошло в текущий поиск", ""),
+        ("💚", "Есть цена лучше", str(better_rows), "Сколько позиций реально дешевле у поставщиков", ""),
+        ("📈", "Средняя выгода", (f"{avg_gain:.1f}%" if gains else "—"), "Считается приложением, не берётся из готовых колонок Excel", ""),
+        ("🔥", hot_label, str(hot_count), hot_note, hot_help),
+        ("🧩", "Источников найдено", str(len(source_pairs)), ", ".join([x["source"] for x in source_pairs]) if source_pairs else "Нет колонок источников", ""),
     ]
     html_cards = "".join(
-        f"<div class='insight-card'><div class='insight-top'><span class='insight-icon'>{icon}</span><span class='insight-label'>{label}</span></div><div class='insight-value'>{value}</div><div class='insight-note'>{note}</div></div>"
-        for icon, label, value, note in cards
+        f"<div class='insight-card'><div class='insight-top'><span class='insight-icon'>{icon}</span><span class='insight-label'>{label}</span>{(f\"<span class='insight-help' title='{html.escape(help_text)}'>?</span>\" if help_text else '')}</div><div class='insight-value'>{value}</div><div class='insight-note'>{note}</div></div>"
+        for icon, label, value, note, help_text in cards
     )
     st.markdown(f"<div class='insight-grid'>{html_cards}</div>", unsafe_allow_html=True)
 
@@ -4922,6 +4951,6 @@ def hot_watchlist_summary_text() -> str:
         return "watchlist не загружен"
     buy_count = int((hot_df.get("buy_signal_30pct", pd.Series(dtype=object)).fillna("").map(normalize_text).str.upper() == "BUY").sum())
     ab_count = int(hot_df.get("abc_class", pd.Series(dtype=object)).fillna("").map(normalize_text).isin(["A", "B"]).sum())
-    return f"Ходовые: {len(hot_df)} • A/B: {ab_count} • BUY: {buy_count}"
+    return f"Ходовых: {len(hot_df)} • сильный спрос: {ab_count} • можно брать: {buy_count}"
 
 
