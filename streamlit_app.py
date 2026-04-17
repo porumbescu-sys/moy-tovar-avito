@@ -241,7 +241,12 @@ def load_hot_watchlist_file(file_name: str, file_bytes: bytes) -> pd.DataFrame:
             "sales_per_month": safe_float(r.get("sales_per_month"), 0.0),
             "abc_class": normalize_text(r.get("abc_class", "")),
             "velocity_band": normalize_text(r.get("velocity_band", "")),
+            "ledger_end_qty": safe_float(r.get("ledger_end_qty"), 0.0),
+            "our_price_now": safe_float(r.get("our_price_now"), 0.0),
+            "our_stock_now": safe_float(r.get("our_stock_now"), 0.0),
             "best_supplier": normalize_text(r.get("best_supplier", "")),
+            "best_supplier_price_now": safe_float(r.get("best_supplier_price_now"), 0.0),
+            "best_supplier_stock_now": safe_float(r.get("best_supplier_stock_now"), 0.0),
             "best_supplier_gap_pct": safe_float(r.get("best_supplier_gap_pct"), 0.0),
             "buy_signal_30pct": normalize_text(r.get("buy_signal_30pct", "")),
             "days_of_cover": safe_float(r.get("days_of_cover"), 0.0),
@@ -337,6 +342,65 @@ def hot_watchlist_summary_text() -> str:
     buy_count = int((hot_df.get("buy_signal_30pct", pd.Series(dtype=object)).fillna("").map(normalize_text).str.upper() == "BUY").sum())
     ab_count = int(hot_df.get("abc_class", pd.Series(dtype=object)).fillna("").map(normalize_text).isin(["A", "B"]).sum())
     return f"Ходовых: {len(hot_df)} • сильный спрос: {ab_count} • можно брать: {buy_count}"
+
+def build_hot_buy_watchlist_table() -> pd.DataFrame:
+    hot_df = st.session_state.get("hot_items_df")
+    if not isinstance(hot_df, pd.DataFrame) or hot_df.empty:
+        return pd.DataFrame()
+    work = hot_df.copy()
+    buy_mask = work.get("buy_signal_30pct", pd.Series(dtype=object)).fillna("").map(normalize_text).str.upper().eq("BUY")
+    work = work.loc[buy_mask].copy()
+    if work.empty:
+        return pd.DataFrame()
+    work["gap_pct_display"] = work.get("best_supplier_gap_pct", pd.Series(dtype=float)).fillna(0.0).map(lambda x: round(float(x) * 100.0, 1))
+    out = pd.DataFrame({
+        "Лист": work.get("current_sheet", ""),
+        "Артикул": work.get("comparison_article", work.get("watch_article", "")),
+        "Товар": work.get("watch_name", ""),
+        "Спрос, шт/мес": work.get("sales_per_month", 0.0),
+        "Наша цена": work.get("our_price_now", 0.0),
+        "Наш остаток": work.get("our_stock_now", 0.0),
+        "Лучший поставщик": work.get("best_supplier", ""),
+        "Цена поставщика": work.get("best_supplier_price_now", 0.0),
+        "Остаток поставщика": work.get("best_supplier_stock_now", 0.0),
+        "Ниже нашей цены, %": work.get("gap_pct_display", 0.0),
+        "Дней запаса": work.get("days_of_cover", 0.0),
+        "Приоритет": work.get("priority_score", 0.0),
+        "Действие": work.get("action_today", ""),
+    })
+    for col in ["Спрос, шт/мес", "Наша цена", "Наш остаток", "Цена поставщика", "Остаток поставщика", "Ниже нашей цены, %", "Дней запаса", "Приоритет"]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+    out = out.sort_values(["Приоритет", "Спрос, шт/мес"], ascending=[False, False], kind="stable").reset_index(drop=True)
+    return out
+
+
+def render_hot_buy_watchlist_lazy_panel() -> None:
+    if not st.session_state.get("show_hot_buy_watchlist_table", False):
+        return
+    buy_df = build_hot_buy_watchlist_table()
+    st.markdown('<div class="result-wrap">', unsafe_allow_html=True)
+    render_block_header(
+        "Ходовые позиции — сейчас можно брать",
+        "Ленивая таблица только по BUY-сигналам из watchlist. Считается и показывается только когда включён чекбокс в sidebar.",
+        icon="🔥",
+        help_text="Показывает только ходовые позиции, где лучший поставщик минимум на 35% дешевле нашей цены. Таблица не грузится, пока чекбокс в блоке Watchlist выключен.",
+    )
+    if buy_df.empty:
+        st.info("Сейчас в watchlist нет позиций со статусом «можно брать».")
+    else:
+        c1, c2 = st.columns([1.2, 1])
+        c1.metric("Позиций можно брать", len(buy_df))
+        c2.download_button(
+            "⬇️ Скачать BUY-watchlist в Excel",
+            dataframe_to_excel_bytes(buy_df),
+            file_name="hot_buy_watchlist.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="download_hot_buy_watchlist",
+            use_container_width=True,
+        )
+        st.dataframe(buy_df, use_container_width=True, height=min(640, 80 + len(buy_df) * 35))
+    st.markdown('</div>', unsafe_allow_html=True)
 
 
 def hot_supplier_note(row: pd.Series | dict | None, best: dict | None, threshold_pct: float = 35.0) -> tuple[str, str]:
@@ -3796,6 +3860,11 @@ with st.sidebar:
     st.markdown(f'<div class="sidebar-status">Watchlist: {html.escape(st.session_state.get("hot_items_name", "ещё не загружен"))}</div>', unsafe_allow_html=True)
     st.markdown(f'<div class="sidebar-mini">Файл на сервере: {html.escape(str(get_persisted_watchlist_file_path()))}</div>', unsafe_allow_html=True)
     st.markdown(f'<div class="sidebar-mini">{html.escape(hot_watchlist_summary_text())}</div>', unsafe_allow_html=True)
+    hot_df_state = st.session_state.get("hot_items_df")
+    hot_buy_total = 0
+    if isinstance(hot_df_state, pd.DataFrame) and not hot_df_state.empty:
+        hot_buy_total = int(hot_df_state.get("buy_signal_30pct", pd.Series(dtype=object)).fillna("").map(normalize_text).str.upper().eq("BUY").sum())
+    st.checkbox(f"Показать таблицу «можно брать» ({hot_buy_total})", key="show_hot_buy_watchlist_table", help="Лениво открывает таблицу только по ходовым позициям со статусом BUY. Пока чекбокс выключен, таблица не строится.")
     st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown('<div class="sidebar-card">', unsafe_allow_html=True)
@@ -4806,6 +4875,7 @@ else:
     switch_r.checkbox("Показать фото", key="show_photos_global")
 
     active_sheet_name, active_tab_label, active_tab_key = label_to_spec[st.session_state.get("active_workspace_label", "Оригинал")]
+    render_hot_buy_watchlist_lazy_panel()
     render_sheet_workspace(active_sheet_name, active_tab_label, active_tab_key)
 
 def normalize_watchlist_sheet_name(value: Any) -> str:
