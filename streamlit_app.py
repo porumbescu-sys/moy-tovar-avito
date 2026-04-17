@@ -338,6 +338,23 @@ def hot_watchlist_summary_text() -> str:
     ab_count = int(hot_df.get("abc_class", pd.Series(dtype=object)).fillna("").map(normalize_text).isin(["A", "B"]).sum())
     return f"Ходовых: {len(hot_df)} • сильный спрос: {ab_count} • можно брать: {buy_count}"
 
+
+def hot_supplier_note(row: pd.Series | dict | None, best: dict | None, threshold_pct: float = 35.0) -> tuple[str, str]:
+    help_text = "Товар ходовой → товар хорошо продавался за выбранный период"
+    if not best:
+        help_text += f"\nСейчас брать невыгодно → нет поставщика с ценой минимум на {threshold_pct:.0f}% ниже нашей цены"
+        return "Сейчас брать невыгодно", help_text
+
+    source = normalize_text((best or {}).get("source", ""))
+    delta_pct = safe_float((best or {}).get("delta_percent"), 0.0)
+    if delta_pct >= float(threshold_pct):
+        action_text = f"Сейчас можно брать у {source}" if source else "Сейчас можно брать"
+        help_text += f"\nСейчас можно брать → лучший поставщик сейчас минимум на {threshold_pct:.0f}% дешевле нашей цены"
+        return action_text, help_text
+
+    help_text += f"\nСейчас брать невыгодно → нет поставщика с ценой минимум на {threshold_pct:.0f}% ниже нашей цены"
+    return "Сейчас брать невыгодно", help_text
+
 def load_persisted_watchlist_source_into_state() -> bool:
     target = get_persisted_watchlist_file_path()
     if not target.exists():
@@ -3236,10 +3253,10 @@ def render_results_insight_dashboard(result_df: pd.DataFrame, compare_map: dict[
         hot_label = "Товар ходовой"
         if hot_buy_count > 0:
             hot_note = "Сейчас можно брать"
-            hot_help += "\nСейчас можно брать → лучший поставщик сейчас заметно дешевле нашей цены"
+            hot_help += "\nСейчас можно брать → лучший поставщик сейчас минимум на 35% дешевле нашей цены"
         else:
             hot_note = "Сейчас брать невыгодно"
-            hot_help += "\nСейчас брать невыгодно → лучший поставщик сейчас не дешевле нашей цены"
+            hot_help += "\nСейчас брать невыгодно → нет поставщика с ценой минимум на 35% ниже нашей цены"
     cards = [
         ("🔎", "Найдено позиций", str(found_count), "Сколько строк вошло в текущий поиск", ""),
         ("💚", "Есть цена лучше", str(better_rows), "Сколько позиций реально дешевле у поставщиков", ""),
@@ -4943,5 +4960,22 @@ def hot_watchlist_summary_text() -> str:
     buy_count = int((hot_df.get("buy_signal_30pct", pd.Series(dtype=object)).fillna("").map(normalize_text).str.upper() == "BUY").sum())
     ab_count = int(hot_df.get("abc_class", pd.Series(dtype=object)).fillna("").map(normalize_text).isin(["A", "B"]).sum())
     return f"Ходовых: {len(hot_df)} • сильный спрос: {ab_count} • можно брать: {buy_count}"
+
+
+def hot_supplier_note(row: pd.Series | dict | None, best: dict | None, threshold_pct: float = 35.0) -> tuple[str, str]:
+    help_text = "Товар ходовой → товар хорошо продавался за выбранный период"
+    if not best:
+        help_text += f"\nСейчас брать невыгодно → нет поставщика с ценой минимум на {threshold_pct:.0f}% ниже нашей цены"
+        return "Сейчас брать невыгодно", help_text
+
+    source = normalize_text((best or {}).get("source", ""))
+    delta_pct = safe_float((best or {}).get("delta_percent"), 0.0)
+    if delta_pct >= float(threshold_pct):
+        action_text = f"Сейчас можно брать у {source}" if source else "Сейчас можно брать"
+        help_text += f"\nСейчас можно брать → лучший поставщик сейчас минимум на {threshold_pct:.0f}% дешевле нашей цены"
+        return action_text, help_text
+
+    help_text += f"\nСейчас брать невыгодно → нет поставщика с ценой минимум на {threshold_pct:.0f}% ниже нашей цены"
+    return "Сейчас брать невыгодно", help_text
 
 
