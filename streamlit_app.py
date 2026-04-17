@@ -13,10 +13,12 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import quote_plus, unquote, urljoin, urlparse
 
+REQUESTS_IMPORT_ERROR: str | None = None
 try:
     import requests
-except Exception:
+except ImportError as exc:
     requests = None
+    REQUESTS_IMPORT_ERROR = str(exc)
 
 import openpyxl
 import pandas as pd
@@ -26,6 +28,7 @@ import streamlit.components.v1 as components
 st.set_page_config(page_title="Мой Товар", page_icon="📦", layout="wide")
 
 APP_TITLE = "Мой Товар"
+APP_VERSION = "v54.6.0"
 
 
 SERVER_DATA_DIRNAME = "data"
@@ -85,6 +88,44 @@ def save_uploaded_source_file(target_path: Path, file_bytes: bytes, original_nam
         "saved_at": datetime.utcnow().isoformat(timespec="seconds"),
         "size": len(file_bytes),
     }, ensure_ascii=False, indent=2), encoding="utf-8")
+
+def clear_loader_caches() -> None:
+    """Сбрасываем только тяжёлые loader-кеши после обновления server-side файлов."""
+    try:
+        load_comparison_workbook.clear()
+    except Exception:
+        pass
+    try:
+        load_photo_map_file.clear()
+    except Exception:
+        pass
+    try:
+        load_avito_file.clear()
+    except Exception:
+        pass
+
+
+def log_operation(message: str, level: str = "info") -> None:
+    try:
+        if "operation_log" not in st.session_state or not isinstance(st.session_state.get("operation_log"), list):
+            st.session_state["operation_log"] = []
+        stamp = datetime.utcnow().strftime("%H:%M:%S")
+        st.session_state["operation_log"].append({"time": stamp, "level": level, "message": normalize_text(message)})
+        st.session_state["operation_log"] = st.session_state["operation_log"][-25:]
+    except Exception:
+        pass
+
+
+def render_operation_log_sidebar() -> None:
+    log_items = st.session_state.get("operation_log", [])
+    with st.expander("История действий", expanded=False):
+        if not log_items:
+            st.caption("Пока пусто")
+            return
+        for item in reversed(log_items[-12:]):
+            icon = "✅" if item.get("level") == "success" else ("⚠️" if item.get("level") == "warning" else "•")
+            st.markdown(f"{icon} **{html.escape(str(item.get('time', '')))}** — {html.escape(str(item.get('message', '')))}", unsafe_allow_html=True)
+
 
 
 def load_persisted_photo_source_into_state() -> bool:
@@ -956,7 +997,7 @@ def cell_display_and_url(cell) -> tuple[str, str]:
     return display, url
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=3600, max_entries=6)
 def load_comparison_workbook(file_name: str, file_bytes: bytes) -> dict[str, pd.DataFrame]:
     wb = pd.ExcelFile(io.BytesIO(file_bytes))
     sheets: dict[str, pd.DataFrame] = {}
@@ -1034,7 +1075,7 @@ def load_comparison_workbook(file_name: str, file_bytes: bytes) -> dict[str, pd.
     return sheets
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=3600, max_entries=6)
 def load_photo_map_file(file_name: str, file_bytes: bytes) -> pd.DataFrame:
     suffix = Path(file_name).suffix.lower()
 
@@ -1186,7 +1227,7 @@ def apply_photo_map(df: pd.DataFrame | None, photo_df: pd.DataFrame | None) -> p
     return out
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=3600, max_entries=6)
 def load_avito_file(file_name: str, file_bytes: bytes) -> pd.DataFrame:
     suffix = Path(file_name).suffix.lower()
     if suffix == ".csv":
@@ -1909,6 +1950,7 @@ def init_state() -> None:
         "patch_message": "",
         "distributor_threshold": 20.0,
         "distributor_min_qty": 1.0,
+        "operation_log": [],
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -3362,6 +3404,8 @@ with st.sidebar:
         """,
         unsafe_allow_html=True,
     )
+    if REQUESTS_IMPORT_ERROR:
+        st.caption("requests не установлен: веб-функции отключены")
 
     st.markdown('<div class="sidebar-card">', unsafe_allow_html=True)
     render_sidebar_card_header("Comparison-файл", "📘", "Главный файл приложения. Содержит листы Сравнение, Уценка, Совместимые. Можно хранить последний файл на сервере в /data.")
@@ -3370,6 +3414,7 @@ with st.sidebar:
         try:
             comp_bytes = uploaded.getvalue()
             save_uploaded_source_file(get_persisted_comparison_file_path(), comp_bytes, uploaded.name)
+            clear_loader_caches()
             st.session_state.comparison_sheets = load_comparison_workbook(uploaded.name, comp_bytes)
             st.session_state.comparison_name = uploaded.name + " • сохранён в /data"
             st.session_state.comparison_version = datetime.utcnow().isoformat()
@@ -3378,10 +3423,13 @@ with st.sidebar:
                 st.session_state.selected_sheet = available[0]
             rebuild_current_df()
             refresh_all_search_results()
+            log_operation(f"Обновлён comparison-файл: {uploaded.name}", "success")
         except Exception as exc:
+            log_operation(f"Ошибка comparison-файла: {exc}", "warning")
             st.error(f"Ошибка файла: {exc}")
     else:
-        load_persisted_comparison_source_into_state()
+        if not (isinstance(st.session_state.get("comparison_sheets"), dict) and st.session_state.get("comparison_sheets")):
+            load_persisted_comparison_source_into_state()
     st.markdown(f'<div class="sidebar-status">Файл: {html.escape(st.session_state.get("comparison_name", "ещё не загружен"))}</div>', unsafe_allow_html=True)
     st.markdown(f'<div class="sidebar-mini">Файл на сервере: {html.escape(str(get_persisted_comparison_file_path()))}</div>', unsafe_allow_html=True)
     st.markdown('<div class="sidebar-mini">Рабочие разделы переключаются сверху: <b>Оригинал</b>, <b>Уценка</b>, <b>Совместимые</b>. Рендерится только активный раздел — это быстрее.</div>', unsafe_allow_html=True)
@@ -3394,6 +3442,7 @@ with st.sidebar:
         try:
             photo_bytes = photo_uploaded.getvalue()
             save_uploaded_source_file(get_persisted_photo_file_path(), photo_bytes, photo_uploaded.name)
+            clear_loader_caches()
             photo_sig = hashlib.md5(photo_bytes).hexdigest()
             loaded_photo_df = load_photo_map_file(photo_uploaded.name, photo_bytes)
             if st.session_state.get("photo_last_sync_sig", "") != photo_sig:
@@ -3415,11 +3464,14 @@ with st.sidebar:
             st.session_state.photo_name = photo_uploaded.name + " • сохранён в /data"
             rebuild_current_df()
             refresh_all_search_results()
+            log_operation(f"Обновлён каталог фото: {photo_uploaded.name}", "success")
         except Exception as exc:
+            log_operation(f"Ошибка файла фото: {exc}", "warning")
             st.error(f"Ошибка файла фото: {exc}")
     else:
-        if not load_persisted_photo_source_into_state():
-            ensure_photo_registry_loaded()
+        if not isinstance(st.session_state.get("photo_df"), pd.DataFrame):
+            if not load_persisted_photo_source_into_state():
+                ensure_photo_registry_loaded()
     st.markdown(f'<div class="sidebar-status">Фото: {html.escape(st.session_state.get("photo_name", "ещё не загружен"))}</div>', unsafe_allow_html=True)
     st.markdown(f'<div class="sidebar-mini">Файл на сервере: {html.escape(str(get_persisted_photo_file_path()))}</div>', unsafe_allow_html=True)
     st.markdown('<div class="sidebar-mini">Автопоиск фото на внешних сайтах отключён. Используются только данные из Каталога расходки и локального реестра.</div>', unsafe_allow_html=True)
@@ -3435,6 +3487,7 @@ with st.sidebar:
         try:
             avito_bytes = avito_uploaded.getvalue()
             save_uploaded_source_file(get_persisted_avito_file_path(), avito_bytes, avito_uploaded.name)
+            clear_loader_caches()
             avito_sig = hashlib.md5(avito_bytes).hexdigest()
             st.session_state.avito_df = load_avito_file(avito_uploaded.name, avito_bytes)
             st.session_state.avito_name = avito_uploaded.name + " • сохранён в /data"
@@ -3445,10 +3498,13 @@ with st.sidebar:
                     f"Синхронизация: новых {sync_stats.get('new', 0)}, изменённых {sync_stats.get('changed', 0)}, без изменений {sync_stats.get('unchanged', 0)}. Исходник сохранён в /data"
                 )
                 st.session_state.avito_last_sync_sig = avito_sig
+            log_operation(f"Обновлён файл Авито: {avito_uploaded.name}", "success")
         except Exception as exc:
+            log_operation(f"Ошибка файла Авито: {exc}", "warning")
             st.error(f"Ошибка файла Авито: {exc}")
     else:
-        load_persisted_avito_source_into_state()
+        if not isinstance(st.session_state.get("avito_df"), pd.DataFrame):
+            load_persisted_avito_source_into_state()
     st.markdown(f'<div class="sidebar-status">Авито: {html.escape(st.session_state.get("avito_name", "ещё не загружен"))}</div>', unsafe_allow_html=True)
     st.markdown(f'<div class="sidebar-mini">Файл на сервере: {html.escape(str(get_persisted_avito_file_path()))}</div>', unsafe_allow_html=True)
     if st.session_state.get("avito_registry_message"):
@@ -3475,14 +3531,17 @@ with st.sidebar:
                 updated_bytes, patch_message = patch_comparison_workbook_bytes(persisted_path.read_bytes(), st.session_state.price_patch_input)
                 if updated_bytes is not None:
                     save_uploaded_source_file(persisted_path, updated_bytes, original_name.replace(" • из /data", "").replace(" • сохранён в /data", ""))
+                    clear_loader_caches()
                     st.session_state.comparison_sheets = load_comparison_workbook(original_name, updated_bytes)
                     st.session_state.comparison_name = original_name + " • из /data"
                     st.session_state.comparison_version = datetime.utcnow().isoformat()
                     rebuild_current_df()
                     refresh_all_search_results()
                 st.session_state.patch_message = patch_message
+                log_operation(f"Быстрая правка цен: {patch_message}", "success")
             except Exception as exc:
                 st.session_state.patch_message = f"Ошибка правки файла: {exc}"
+                log_operation(f"Ошибка быстрой правки цен: {exc}", "warning")
         elif isinstance(sheets_state, dict) and sheets_state:
             updated_sheets, patch_message = apply_price_updates_to_sheets(sheets_state, st.session_state.price_patch_input)
             st.session_state.comparison_sheets = updated_sheets
@@ -3490,8 +3549,10 @@ with st.sidebar:
             rebuild_current_df()
             st.session_state.patch_message = patch_message
             refresh_all_search_results()
+            log_operation(f"Быстрая правка цен: {patch_message}", "success")
         else:
             st.session_state.patch_message = "Сначала загрузите comparison-файл."
+            log_operation("Быстрая правка цен: comparison-файл не загружен", "warning")
     if st.session_state.get("patch_message"):
         st.markdown(f'<div class="sidebar-mini">{html.escape(st.session_state.patch_message)}</div>', unsafe_allow_html=True)
     else:
@@ -3513,6 +3574,8 @@ with st.sidebar:
     st.markdown('<div class="sidebar-mini">Текст сохраняется локально и останется до следующего изменения.</div>', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
+    render_operation_log_sidebar()
+
 comparison_name = st.session_state.get("comparison_name", "ещё не загружен")
 sheets = st.session_state.get("comparison_sheets", {})
 loaded_sheet_count = len(sheets) if isinstance(sheets, dict) else 0
@@ -3525,7 +3588,7 @@ price_label = current_price_label(price_mode, custom_discount)
 
 st.markdown(f"""
 <div class="topbar"><div class="topbar-grid">
-<div class="brand-box"><div class="logo">📦</div><div><div class="brand-title">{APP_TITLE}</div><div class="brand-sub">Один comparison-файл • поиск • фото • пересчёт цен поставщиков</div></div></div>
+<div class="brand-box"><div class="logo">📦</div><div><div class="brand-title">{APP_TITLE}</div><div class="brand-sub">Один comparison-файл • поиск • фото • пересчёт цен поставщиков • {APP_VERSION}</div></div></div>
 <div class="stat-box"><div class="stat-cap">Файл</div><div class="stat-val">{html.escape(comparison_name)}</div></div>
 <div class="stat-box"><div class="stat-cap">Вкладок</div><div class="stat-val">{loaded_sheet_count if loaded_sheet_count else '—'}</div></div>
 <div class="stat-box"><div class="stat-cap">Всего строк</div><div class="stat-val">{rows_count}</div></div>
