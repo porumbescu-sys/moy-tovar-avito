@@ -343,27 +343,64 @@ def dataframe_to_excel_bytes(df: pd.DataFrame) -> bytes:
         (df if isinstance(df, pd.DataFrame) else pd.DataFrame()).to_excel(writer, index=False, sheet_name="Watchlist")
     return out.getvalue()
 
+
+def watch_is_buy_candidate(rec: Any, threshold_pct: float = 35.0) -> bool:
+    if rec is None:
+        return False
+    if isinstance(rec, pd.Series):
+        rec = rec.to_dict()
+    if not isinstance(rec, dict):
+        return False
+    our_price = safe_float(rec.get("our_price_now"), 0.0)
+    supplier_price = safe_float(rec.get("best_supplier_price_now"), 0.0)
+    gap_pct = safe_float(rec.get("best_supplier_gap_pct"), 0.0) * 100.0
+    supplier_name = normalize_text(rec.get("best_supplier", ""))
+    return (
+        our_price > 0
+        and supplier_price > 0
+        and bool(supplier_name)
+        and gap_pct >= float(threshold_pct)
+    )
+
+
+def translate_watch_action(action: Any, threshold_pct: float = 35.0) -> str:
+    raw = normalize_text(action)
+    if not raw:
+        return ""
+    tokens = [t.strip().upper() for t in raw.replace("|", ";").split(";") if t.strip()]
+    translated = []
+    for token in tokens:
+        if token == "BUY":
+            translated.append(f"Можно брать (-{int(threshold_pct)}%+)")
+        elif token == "RESTOCK":
+            translated.append("Пополнить запас")
+        elif token == "WATCH":
+            translated.append("Наблюдать")
+        elif token in {"NO_MATCH", "NO_MATCH_IN_COMPARISON"}:
+            translated.append("Нет в сравнении")
+        else:
+            translated.append(token)
+    seen = []
+    for item in translated:
+        if item not in seen:
+            seen.append(item)
+    return "; ".join(seen)
+
 def hot_watchlist_summary_text() -> str:
     hot_df = st.session_state.get("hot_items_df")
     if not isinstance(hot_df, pd.DataFrame) or hot_df.empty:
         return "watchlist не загружен"
-    buy_count = int((hot_df.get("buy_signal_30pct", pd.Series(dtype=object)).fillna("").map(normalize_text).str.upper() == "BUY").sum())
+    buy_count = int(sum(1 for _, rec in hot_df.iterrows() if watch_is_buy_candidate(rec, threshold_pct=35.0)))
     ab_count = int(hot_df.get("abc_class", pd.Series(dtype=object)).fillna("").map(normalize_text).isin(["A", "B"]).sum())
-    return f"Ходовых: {len(hot_df)} • сильный спрос: {ab_count} • можно брать: {buy_count}"
+    return f"Ходовых: {len(hot_df)} • сильный спрос: {ab_count} • можно брать сейчас: {buy_count}"
 
 def build_hot_buy_watchlist_table() -> pd.DataFrame:
     hot_df = st.session_state.get("hot_items_df")
     if not isinstance(hot_df, pd.DataFrame) or hot_df.empty:
         return pd.DataFrame()
     work = hot_df.copy()
-    buy_mask = work.get("buy_signal_30pct", pd.Series(dtype=object)).fillna("").map(normalize_text).str.upper().eq("BUY")
+    buy_mask = pd.Series([watch_is_buy_candidate(rec, threshold_pct=35.0) for _, rec in work.iterrows()], index=work.index)
     work = work.loc[buy_mask].copy()
-    if work.empty:
-        return pd.DataFrame()
-    work = work[
-        pd.to_numeric(work.get("our_price_now", 0.0), errors="coerce").fillna(0.0).gt(0)
-        & pd.to_numeric(work.get("best_supplier_price_now", 0.0), errors="coerce").fillna(0.0).gt(0)
-    ].copy()
     if work.empty:
         return pd.DataFrame()
     work["gap_pct_display"] = work.get("best_supplier_gap_pct", pd.Series(dtype=float)).fillna(0.0).map(lambda x: round(float(x) * 100.0, 1))
@@ -396,7 +433,7 @@ def render_hot_buy_watchlist_lazy_panel() -> None:
     st.markdown('<div class="result-wrap">', unsafe_allow_html=True)
     render_block_header(
         "Ходовые позиции — сейчас можно брать",
-        "Ленивая таблица только по BUY-сигналам из watchlist. Считается и показывается только когда включён чекбокс в sidebar.",
+        "Ленивая таблица только по ходовым позициям, где лучший поставщик сейчас минимум на 35% дешевле нашей цены. Считается и показывается только когда включён чекбокс в sidebar.",
         icon="🔥",
         help_text="Показывает только ходовые позиции, где лучший поставщик минимум на 35% дешевле нашей цены. Таблица не грузится, пока чекбокс в блоке Watchlist выключен.",
     )
@@ -404,9 +441,9 @@ def render_hot_buy_watchlist_lazy_panel() -> None:
         st.info("Сейчас в watchlist нет позиций со статусом «можно брать».")
     else:
         c1, c2 = st.columns([1.2, 1])
-        c1.metric("Позиций можно брать", len(buy_df))
+        c1.metric("Позиций можно брать сейчас", len(buy_df))
         c2.download_button(
-            "⬇️ Скачать BUY-watchlist в Excel",
+            "⬇️ Скачать таблицу «можно брать» в Excel",
             dataframe_to_excel_bytes(buy_df),
             file_name="hot_buy_watchlist.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -2644,17 +2681,10 @@ def all_prices_to_excel_bytes(df: pd.DataFrame) -> bytes:
     return bio.read()
 
 
-def build_report_df(
-    df: pd.DataFrame,
-    threshold_percent: float,
-    min_qty: float,
-    tab_label: str = "",
-    hot_lookup: dict[str, list[dict[str, Any]]] | None = None,
-) -> pd.DataFrame:
+def build_report_df(df: pd.DataFrame, threshold_percent: float, min_qty: float) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
     if df is None or df.empty:
         return pd.DataFrame()
-    hot_lookup = hot_lookup or {}
     for _, row in df.iterrows():
         own_price = safe_float(row.get("sale_price"), 0.0)
         own_qty = safe_float(row.get("free_qty"), 0.0)
@@ -2663,40 +2693,24 @@ def build_report_df(
         best = get_best_offer(row, min_qty=min_qty)
         if not best:
             continue
-        best_price = safe_float(best.get("price"), 0.0)
-        best_qty = safe_float(best.get("qty"), 0.0)
         delta = safe_float(best.get("delta"), 0.0)
         delta_pct = safe_float(best.get("delta_percent"), 0.0)
-        if best_price <= 0 or delta <= 0 or delta_pct < float(threshold_percent):
+        if delta <= 0 or delta_pct < float(threshold_percent):
             continue
-
-        hot_rec = pick_hot_watch_rec(row, hot_lookup) if hot_lookup else None
         rows.append({
-            "Лист": tab_label,
             "Артикул": row.get("article", ""),
-            "Товар": row.get("name", ""),
-            "Спрос, шт/мес": safe_float((hot_rec or {}).get("sales_per_month"), 0.0) if hot_rec else None,
-            "Наша цена": own_price,
+            "Название": row.get("name", ""),
             "Наш остаток": own_qty,
-            "Лучший поставщик": best.get("source", ""),
-            "Цена поставщика": best_price,
-            "Остаток поставщика": best_qty,
-            "Ниже нашей цены, %": round(delta_pct, 2),
-            "Дней запаса": safe_float((hot_rec or {}).get("days_of_cover"), 0.0) if hot_rec else None,
-            "Приоритет": safe_float((hot_rec or {}).get("priority_score"), 0.0) if hot_rec else None,
-            "Действие": translate_watch_action((hot_rec or {}).get("action_today", ""), threshold_pct=35.0) if hot_rec else "",
+            "Наша цена": own_price,
+            "Лучший дистрибьютер": best["source"],
+            "Цена дистрибьютора": best["price"],
+            "Остаток дистрибьютора": best["qty"],
             "Разница, руб": delta,
-            "Ходовая": "Да" if hot_rec else "",
+            "Разница, %": round(delta_pct, 2),
         })
     if not rows:
         return pd.DataFrame()
-    out = pd.DataFrame(rows)
-    out["_sort_priority"] = pd.to_numeric(out.get("Приоритет"), errors="coerce").fillna(-1.0)
-    out = out.sort_values(
-        ["_sort_priority", "Ниже нашей цены, %", "Разница, руб", "Артикул"],
-        ascending=[False, False, False, True],
-        kind="stable",
-    ).drop(columns=["_sort_priority"]).reset_index(drop=True)
+    out = pd.DataFrame(rows).sort_values(["Разница, %", "Разница, руб", "Артикул"], ascending=[False, False, True]).reset_index(drop=True)
     return out
 
 
@@ -3895,13 +3909,26 @@ with st.sidebar:
         if not isinstance(st.session_state.get("hot_items_df"), pd.DataFrame):
             load_persisted_watchlist_source_into_state()
     st.markdown(f'<div class="sidebar-status">Watchlist: {html.escape(st.session_state.get("hot_items_name", "ещё не загружен"))}</div>', unsafe_allow_html=True)
-    st.markdown(f'<div class="sidebar-mini">Файл на сервере: {html.escape(str(get_persisted_watchlist_file_path()))}</div>', unsafe_allow_html=True)
-    st.markdown(f'<div class="sidebar-mini">{html.escape(hot_watchlist_summary_text())}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="sidebar-mini">Файл на сервере: {html.escape(str(get_persisted_watchlist_file_path()))}</div>', unsafe_allow_html=True)    st.markdown(f'<div class="sidebar-mini">{html.escape(hot_watchlist_summary_text())}</div>', unsafe_allow_html=True)
     hot_df_state = st.session_state.get("hot_items_df")
     hot_buy_total = 0
     if isinstance(hot_df_state, pd.DataFrame) and not hot_df_state.empty:
-        hot_buy_total = int(hot_df_state.get("buy_signal_30pct", pd.Series(dtype=object)).fillna("").map(normalize_text).str.upper().eq("BUY").sum())
-    st.checkbox(f"Показать таблицу «можно брать» ({hot_buy_total})", key="show_hot_buy_watchlist_table", help="Лениво открывает таблицу только по ходовым позициям со статусом BUY. Пока чекбокс выключен, таблица не строится.")
+        hot_buy_total = int(sum(1 for _, rec in hot_df_state.iterrows() if watch_is_buy_candidate(rec, threshold_pct=35.0)))
+    if hot_buy_total > 0:
+        st.checkbox(
+            f"Показать таблицу «можно брать сейчас» ({hot_buy_total})",
+            key="show_hot_buy_watchlist_table",
+            help="Показывает только ходовые позиции, где лучший поставщик сейчас минимум на 35% дешевле нашей цены.",
+        )
+        st.markdown(
+            '<div class="sidebar-mini">Таблица откроется только по позициям, где поставщик сейчас минимум на 35% дешевле нашей цены.</div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            '<div class="sidebar-mini">Сейчас позиций для выгодной закупки не найдено.</div>',
+            unsafe_allow_html=True,
+        )
     st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown('<div class="sidebar-card">', unsafe_allow_html=True)
@@ -4856,18 +4883,11 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
         st.markdown('<div class="result-wrap">', unsafe_allow_html=True)
         render_block_header(
             f"{tab_label} — отчёт по листу",
-            "Полный отчёт по выбранному листу: где поставщик реально дешевле нас на заданный процент. Если загружен watchlist, отчёт дополняется спросом, днями запаса, приоритетом и действием.",
+            "Полный отчёт по выбранному листу: где поставщик реально дешевле нас на заданный процент.",
             icon="📊",
             help_text="Отчёт строится по всему текущему листу, а не только по поисковой выдаче. Порог и минимальный остаток меняются в sidebar.",
         )
-        report_hot_lookup = build_hot_watchlist_lookup(st.session_state.get("hot_items_df"), tab_label)
-        report_df = build_report_df(
-            base_sheet_df,
-            st.session_state.distributor_threshold,
-            st.session_state.distributor_min_qty,
-            tab_label=tab_label,
-            hot_lookup=report_hot_lookup,
-        )
+        report_df = build_report_df(base_sheet_df, st.session_state.distributor_threshold, st.session_state.distributor_min_qty)
         if report_df.empty:
             st.info("По текущему листу нет позиций, которые проходят ваш порог выгоды.")
         else:
@@ -4875,67 +4895,15 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
             c1.metric("Строк в отчёте", len(report_df))
             c2.metric("Порог", f"{fmt_qty(st.session_state.distributor_threshold)}%")
             c3.metric("Источников", len(source_pairs))
-
-            f1, f2, f3 = st.columns(3)
-            only_hot = f1.checkbox(
-                "Только ходовые",
-                key=f"report_only_hot_{tab_key}",
-                help="Показывать только товары, которые хорошо продаются за выбранный период.",
+            st.dataframe(report_df, use_container_width=True, hide_index=True, height=420)
+            st.download_button(
+                "⬇️ Скачать отчёт по листу",
+                report_to_excel_bytes(report_df),
+                file_name=f"moy_tovar_report_{tab_key}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key=f"download_report_{tab_key}",
             )
-            only_buy = f2.checkbox(
-                "Только можно брать",
-                key=f"report_only_buy_{tab_key}",
-                help="Показывать только позиции, где лучший поставщик сейчас минимум на 35% дешевле нашей цены.",
-            )
-            only_attention = f3.checkbox(
-                "Только требует внимания",
-                key=f"report_only_attention_{tab_key}",
-                help="Показывать только позиции, где нужно действие: пополнить запас, наблюдать или позиция не найдена в сравнении.",
-            )
-
-            st.caption(
-                "Только ходовые — товары с хорошим спросом. "
-                "Только можно брать — позиции, где поставщик сейчас минимум на 35% дешевле нашей цены. "
-                "Только требует внимания — позиции, где нужно действие: пополнить запас, наблюдать или проверить сравнение."
-            )
-
-            filtered_report_df = report_df.copy()
-
-            if only_hot:
-                filtered_report_df = filtered_report_df[
-                    filtered_report_df["Ходовая"].astype(str).str.strip().eq("Да")
-                ]
-
-            if only_buy:
-                filtered_report_df = filtered_report_df[
-                    filtered_report_df["Действие"]
-                    .fillna("")
-                    .astype(str)
-                    .str.upper()
-                    .str.contains("МОЖНО БРАТЬ", regex=False)
-                ]
-
-            if only_attention:
-                filtered_report_df = filtered_report_df[
-                    filtered_report_df["Действие"]
-                    .fillna("")
-                    .astype(str)
-                    .str.upper()
-                    .str.contains("ПОПОЛНИТЬ ЗАПАС|НАБЛЮДАТЬ|НЕТ В СРАВНЕНИИ", regex=True)
-                ]
-
-            if filtered_report_df.empty:
-                st.info("По выбранным фильтрам строк не найдено.")
-            else:
-                st.dataframe(filtered_report_df, use_container_width=True, hide_index=True, height=420)
-                st.download_button(
-                    "⬇️ Скачать отчёт по листу",
-                    report_to_excel_bytes(filtered_report_df),
-                    file_name=f"moy_tovar_report_{tab_key}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True,
-                    key=f"download_report_{tab_key}",
-                )
         st.markdown('</div>', unsafe_allow_html=True)
 
 
@@ -5127,13 +5095,56 @@ def dataframe_to_excel_bytes(df: pd.DataFrame) -> bytes:
         (df if isinstance(df, pd.DataFrame) else pd.DataFrame()).to_excel(writer, index=False, sheet_name="Watchlist")
     return out.getvalue()
 
+
+def watch_is_buy_candidate(rec: Any, threshold_pct: float = 35.0) -> bool:
+    if rec is None:
+        return False
+    if isinstance(rec, pd.Series):
+        rec = rec.to_dict()
+    if not isinstance(rec, dict):
+        return False
+    our_price = safe_float(rec.get("our_price_now"), 0.0)
+    supplier_price = safe_float(rec.get("best_supplier_price_now"), 0.0)
+    gap_pct = safe_float(rec.get("best_supplier_gap_pct"), 0.0) * 100.0
+    supplier_name = normalize_text(rec.get("best_supplier", ""))
+    return (
+        our_price > 0
+        and supplier_price > 0
+        and bool(supplier_name)
+        and gap_pct >= float(threshold_pct)
+    )
+
+
+def translate_watch_action(action: Any, threshold_pct: float = 35.0) -> str:
+    raw = normalize_text(action)
+    if not raw:
+        return ""
+    tokens = [t.strip().upper() for t in raw.replace("|", ";").split(";") if t.strip()]
+    translated = []
+    for token in tokens:
+        if token == "BUY":
+            translated.append(f"Можно брать (-{int(threshold_pct)}%+)")
+        elif token == "RESTOCK":
+            translated.append("Пополнить запас")
+        elif token == "WATCH":
+            translated.append("Наблюдать")
+        elif token in {"NO_MATCH", "NO_MATCH_IN_COMPARISON"}:
+            translated.append("Нет в сравнении")
+        else:
+            translated.append(token)
+    seen = []
+    for item in translated:
+        if item not in seen:
+            seen.append(item)
+    return "; ".join(seen)
+
 def hot_watchlist_summary_text() -> str:
     hot_df = st.session_state.get("hot_items_df")
     if not isinstance(hot_df, pd.DataFrame) or hot_df.empty:
         return "watchlist не загружен"
-    buy_count = int((hot_df.get("buy_signal_30pct", pd.Series(dtype=object)).fillna("").map(normalize_text).str.upper() == "BUY").sum())
+    buy_count = int(sum(1 for _, rec in hot_df.iterrows() if watch_is_buy_candidate(rec, threshold_pct=35.0)))
     ab_count = int(hot_df.get("abc_class", pd.Series(dtype=object)).fillna("").map(normalize_text).isin(["A", "B"]).sum())
-    return f"Ходовых: {len(hot_df)} • сильный спрос: {ab_count} • можно брать: {buy_count}"
+    return f"Ходовых: {len(hot_df)} • сильный спрос: {ab_count} • можно брать сейчас: {buy_count}"
 
 
 def hot_supplier_note(row: pd.Series | dict | None, best: dict | None, threshold_pct: float = 35.0) -> tuple[str, str]:
