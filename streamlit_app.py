@@ -2248,6 +2248,7 @@ def create_review_task(
     clear_task_registry_cache()
 
 
+
 def safe_int(value: Any, default: int = 0) -> int:
     try:
         if value is None:
