@@ -336,7 +336,7 @@ def hot_watchlist_summary_text() -> str:
         return "watchlist не загружен"
     buy_count = int((hot_df.get("buy_signal_30pct", pd.Series(dtype=object)).fillna("").map(normalize_text).str.upper() == "BUY").sum())
     ab_count = int(hot_df.get("abc_class", pd.Series(dtype=object)).fillna("").map(normalize_text).isin(["A", "B"]).sum())
-    return f"Ходовых: {len(hot_df)} • сильный спрос: {ab_count} • можно брать: {buy_count}"
+    return f"Ходовые: {len(hot_df)} • A/B: {ab_count} • BUY: {buy_count}"
 
 def load_persisted_watchlist_source_into_state() -> bool:
     target = get_persisted_watchlist_file_path()
@@ -2992,38 +2992,20 @@ def render_results_table(df: pd.DataFrame, price_mode: str, round100: bool, cust
 
         hot_html = ""
         if bool(row.get("hot_flag", False)):
-            abc = normalize_text(row.get("hot_abc_class", "")).upper()
+            hot_parts = []
+            abc = normalize_text(row.get("hot_abc_class", ""))
             sales_pm = safe_float(row.get("hot_sales_per_month"), 0.0)
-            action_today = normalize_text(row.get("hot_action_today", "")).upper()
-            buy_signal = normalize_text(row.get("hot_buy_signal", "")).upper()
-
-            demand_map = {
-                "A": "Спрос высокий",
-                "B": "Спрос хороший",
-                "C": "Спрос умеренный",
-            }
-            action_map = {
-                "BUY": "Сейчас можно брать",
-                "WATCH": "Сейчас брать невыгодно",
-                "RESTOCK": "Нужно пополнить",
-                "NO_MATCH_IN_COMPARISON": "Нет совпадения в comparison",
-            }
-
-            primary = "🔥 Товар ходовой"
-            note_parts = []
             if abc:
-                note_parts.append(demand_map.get(abc, f"Класс {abc}"))
+                hot_parts.append(f"класс {abc}")
             if sales_pm > 0:
-                note_parts.append(f"≈ {sales_pm:.1f} шт/мес")
-            note = " • ".join(note_parts)
-
-            action_text = action_map.get(action_today, "")
+                hot_parts.append(f"{sales_pm:.1f}/мес")
+            action_today = normalize_text(row.get("hot_action_today", ""))
+            buy_signal = normalize_text(row.get("hot_buy_signal", "")).upper()
+            primary = "🔥 Ходовая"
             if buy_signal == "BUY":
-                action_text = "Сейчас можно брать"
-            elif not action_text:
-                action_text = "Сейчас брать невыгодно"
-
-            action_html = f"<div class='hot-sub-badge'>{html.escape(action_text)}</div>" if action_text else ""
+                primary = "🔥 Ходовая • BUY"
+            note = " • ".join(hot_parts)
+            action_html = f"<div class='hot-sub-badge'>{html.escape(action_today)}</div>" if action_today else ""
             hot_html = f"<div class='hot-badge'>{html.escape(primary)}</div>{('<div class="hot-meta">' + html.escape(note) + '</div>') if note else ''}{action_html}"
 
         if best:
@@ -4951,6 +4933,6 @@ def hot_watchlist_summary_text() -> str:
         return "watchlist не загружен"
     buy_count = int((hot_df.get("buy_signal_30pct", pd.Series(dtype=object)).fillna("").map(normalize_text).str.upper() == "BUY").sum())
     ab_count = int(hot_df.get("abc_class", pd.Series(dtype=object)).fillna("").map(normalize_text).isin(["A", "B"]).sum())
-    return f"Ходовых: {len(hot_df)} • сильный спрос: {ab_count} • можно брать: {buy_count}"
+    return f"Ходовые: {len(hot_df)} • A/B: {ab_count} • BUY: {buy_count}"
 
 
