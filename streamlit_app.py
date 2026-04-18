@@ -380,7 +380,7 @@ def build_hot_buy_watchlist_table() -> pd.DataFrame:
         "Ниже нашей цены, %": work.get("gap_pct_display", 0.0),
         "Дней запаса": work.get("days_of_cover", 0.0),
         "Приоритет": work.get("priority_score", 0.0),
-        "Действие": [translate_watch_action(x, threshold_pct=35.0) for x in work.get("action_today", "")],
+        "Действие": work.get("action_today", ""),
     })
     for col in ["Спрос, шт/мес", "Наша цена", "Наш остаток", "Цена поставщика", "Остаток поставщика", "Ниже нашей цены, %", "Дней запаса", "Приоритет"]:
         if col in out.columns:
@@ -2684,7 +2684,7 @@ def build_report_df(
             "Ниже нашей цены, %": round(delta_pct, 2),
             "Дней запаса": safe_float((hot_rec or {}).get("days_of_cover"), 0.0) if hot_rec else None,
             "Приоритет": safe_float((hot_rec or {}).get("priority_score"), 0.0) if hot_rec else None,
-            "Действие": translate_watch_action((hot_rec or {}).get("action_today", ""), threshold_pct=35.0) if hot_rec else "",
+            "Действие": normalize_text((hot_rec or {}).get("action_today", "")) if hot_rec else "",
             "Разница, руб": delta,
             "Ходовая": "Да" if hot_rec else "",
         })
@@ -4880,23 +4880,17 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
             only_hot = f1.checkbox(
                 "Только ходовые",
                 key=f"report_only_hot_{tab_key}",
-                help="Показывать только товары, которые хорошо продаются за выбранный период.",
+                help="Показывать только позиции, которые есть в watchlist ходовых.",
             )
             only_buy = f2.checkbox(
                 "Только можно брать",
                 key=f"report_only_buy_{tab_key}",
-                help="Показывать только позиции, где лучший поставщик сейчас минимум на 35% дешевле нашей цены.",
+                help="Показывать только позиции, где в watchlist сейчас есть BUY-сигнал.",
             )
             only_attention = f3.checkbox(
                 "Только требует внимания",
                 key=f"report_only_attention_{tab_key}",
-                help="Показывать только позиции, где нужно действие: пополнить запас, наблюдать или позиция не найдена в сравнении.",
-            )
-
-            st.caption(
-                "Только ходовые — товары с хорошим спросом. "
-                "Только можно брать — позиции, где поставщик сейчас минимум на 35% дешевле нашей цены. "
-                "Только требует внимания — позиции, где нужно действие: пополнить запас, наблюдать или проверить сравнение."
+                help="Показывать позиции, где в watchlist есть RESTOCK / WATCH / NO_MATCH.",
             )
 
             filtered_report_df = report_df.copy()
@@ -4912,7 +4906,7 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
                     .fillna("")
                     .astype(str)
                     .str.upper()
-                    .str.contains("МОЖНО БРАТЬ", regex=False)
+                    .str.contains("BUY", regex=False)
                 ]
 
             if only_attention:
@@ -4921,7 +4915,7 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
                     .fillna("")
                     .astype(str)
                     .str.upper()
-                    .str.contains("ПОПОЛНИТЬ ЗАПАС|НАБЛЮДАТЬ|НЕТ В СРАВНЕНИИ", regex=True)
+                    .str.contains("RESTOCK|WATCH|NO_MATCH", regex=True)
                 ]
 
             if filtered_report_df.empty:
