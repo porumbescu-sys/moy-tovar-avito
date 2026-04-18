@@ -2248,7 +2248,6 @@ def create_review_task(
     clear_task_registry_cache()
 
 
-
 def safe_int(value: Any, default: int = 0) -> int:
     try:
         if value is None:
@@ -5335,6 +5334,305 @@ def render_operational_analytics_block(sheet_df: pd.DataFrame, photo_df: pd.Data
         key=f"download_analytics_{tab_key}",
     )
 
+
+def build_crm_header_stats(
+    sheet_df: pd.DataFrame | None,
+    photo_df: pd.DataFrame | None,
+    avito_df: pd.DataFrame | None,
+    sheet_name: str,
+    tab_label: str,
+    min_qty: float,
+) -> dict[str, int]:
+    stats = {
+        "tasks_open": 0,
+        "tasks_overdue": 0,
+        "can_buy": 0,
+        "without_photo": 0,
+        "without_avito": 0,
+    }
+
+    task_df = load_task_registry_df()
+    if isinstance(task_df, pd.DataFrame) and not task_df.empty:
+        sheet_mask = (
+            task_df.get("sheet_name", pd.Series(dtype=object))
+            .fillna("")
+            .map(normalize_text)
+            .eq(normalize_text(sheet_name))
+        )
+        task_sheet = task_df.loc[sheet_mask].copy()
+        if not task_sheet.empty:
+            effective_status = task_sheet.apply(lambda r: task_effective_status(r), axis=1)
+            stats["tasks_open"] = int(effective_status.isin(["NEW", "ACTIVE", "OVERDUE"]).sum())
+            stats["tasks_overdue"] = int(effective_status.eq("OVERDUE").sum())
+
+    hot_buy_df = build_hot_buy_watchlist_table()
+    if isinstance(hot_buy_df, pd.DataFrame) and not hot_buy_df.empty and "Лист" in hot_buy_df.columns:
+        stats["can_buy"] = int((hot_buy_df["Лист"].fillna("").astype(str) == tab_label).sum())
+
+    if isinstance(sheet_df, pd.DataFrame) and not sheet_df.empty:
+        registry_df = load_avito_registry_df()
+        bundle = build_operational_analytics_bundle(sheet_df, photo_df, avito_df, registry_df, float(min_qty), str(tab_label))
+        quality = bundle.get("quality", {}) if isinstance(bundle, dict) else {}
+        stats["without_photo"] = int(quality.get("without_photo", 0) or 0)
+        stats["without_avito"] = int(quality.get("in_price_not_in_avito", 0) or 0)
+    return stats
+
+
+def render_crm_header_bar(
+    sheet_df: pd.DataFrame | None,
+    photo_df: pd.DataFrame | None,
+    avito_df: pd.DataFrame | None,
+    sheet_name: str,
+    tab_label: str,
+    min_qty: float,
+) -> None:
+    stats = build_crm_header_stats(sheet_df, photo_df, avito_df, sheet_name, tab_label, min_qty)
+    st.markdown('<div class="result-wrap">', unsafe_allow_html=True)
+    render_block_header(
+        "CRM — быстрый центр управления",
+        "Короткая шапка с главными рабочими зонами: задачи, выгодные закупки, проблемы по карточкам.",
+        icon="🧭",
+        help_text="Эта шапка ничего не меняет в comparison. Она только помогает быстро открыть нужный рабочий блок без долгой прокрутки.",
+    )
+    c1, c2, c3, c4, c5 = st.columns(5)
+    with c1:
+        open_tasks = bool(st.checkbox(
+            f"🔔 Задачи ({stats['tasks_open']})",
+            value=bool(st.session_state.get("show_task_center_global", False)),
+            key=f"crm_show_tasks_{sheet_name}",
+            help="Открывает единый центр задач: новые, активные, просроченные и выполненные.",
+        ))
+        st.session_state["show_task_center_global"] = open_tasks
+        st.caption(f"Просрочено: {stats['tasks_overdue']}")
+    with c2:
+        open_buy = bool(st.checkbox(
+            f"💸 Можно брать ({stats['can_buy']})",
+            value=bool(st.session_state.get("show_hot_buy_watchlist_table", False)),
+            key=f"crm_show_buy_{sheet_name}",
+            help="Открывает ленивую таблицу по ходовым позициям, где поставщик сейчас даёт выгодный вход по цене.",
+        ))
+        st.session_state["show_hot_buy_watchlist_table"] = open_buy
+        st.caption("Показывает только выгодные позиции")
+    with c3:
+        st.metric("🖼️ Нет фото", stats["without_photo"])
+        st.caption("Сколько позиций на листе без фото")
+    with c4:
+        st.metric("🛒 Без Avito", stats["without_avito"])
+        st.caption("Сколько позиций на листе без объявления")
+    with c5:
+        st.metric("Лист", tab_label)
+        st.caption("CRM-метрики именно по текущему листу")
+    st.markdown('</div>', unsafe_allow_html=True)
+
+
+def render_crm_card_center(
+    result_df: pd.DataFrame | None,
+    display_result_df: pd.DataFrame | None,
+    compare_map: dict[str, dict[str, Any]] | None,
+    avito_df: pd.DataFrame | None,
+    sheet_name: str,
+    tab_label: str,
+    tab_key: str,
+    price_mode: str,
+    round100: bool,
+    custom_discount: float,
+) -> None:
+    if not isinstance(display_result_df, pd.DataFrame) or display_result_df.empty:
+        return
+
+    rows = display_result_df.copy()
+    options = []
+    option_map: dict[str, pd.Series] = {}
+    for _, row in rows.iterrows():
+        art = normalize_text(row.get("article", ""))
+        name = normalize_text(row.get("name", ""))
+        label = f"{art} — {name[:120]}"
+        options.append(label)
+        option_map[label] = row
+
+    st.markdown('<div class="result-wrap">', unsafe_allow_html=True)
+    render_block_header(
+        "CRM-карточка товара",
+        "Один компактный экран по позиции: обзор, цены, Avito, заметки и задачи. Старые блоки остаются ниже как вторичный режим.",
+        icon="🧩",
+        help_text="Нужна, чтобы не бегать по странице: всё важное по найденной позиции собрано в одном месте.",
+    )
+    selected_label = st.selectbox(
+        "Позиция для CRM-карточки",
+        options,
+        index=0 if options else None,
+        key=f"crm_card_select_{tab_key}",
+        help="Выбери найденную позицию, чтобы открыть её краткую CRM-карточку.",
+    )
+    if not selected_label:
+        st.markdown('</div>', unsafe_allow_html=True)
+        return
+
+    row = option_map[selected_label]
+    art = normalize_text(row.get("article", ""))
+    art_norm = normalize_text(row.get("article_norm", ""))
+    name = normalize_text(row.get("name", ""))
+    photo_url = normalize_text(row.get("photo_url", ""))
+    note = normalize_text(row.get("manual_note", ""))
+    model = normalize_text(row.get("meta_model", ""))
+    mcode = normalize_text(row.get("meta_manufacturer_code", ""))
+    fits = normalize_text(row.get("meta_fits_models", ""))
+    own_price = get_selected_price_raw(row, price_mode, round100, custom_discount)
+    own_stock = parse_qty_generic(row.get("free_qty"))
+    best = get_best_offer(row, min_qty=float(st.session_state.get("distributor_min_qty", 1.0)))
+    best_source = normalize_text((best or {}).get("source", ""))
+    best_price = safe_float((best or {}).get("price"), 0.0)
+    best_qty = safe_float((best or {}).get("qty"), 0.0)
+    matched_ads = pd.DataFrame()
+    if isinstance(avito_df, pd.DataFrame) and not avito_df.empty:
+        one_row = pd.DataFrame([row.to_dict()])
+        matched_ads = find_avito_ads(avito_df, one_row)
+
+    t_overview, t_prices, t_avito, t_notes = st.tabs(["Обзор", "Цены", "Avito", "Заметки / задачи"])
+
+    with t_overview:
+        c1, c2 = st.columns([1, 2])
+        with c1:
+            if photo_url:
+                st.image(photo_url, use_container_width=True)
+            else:
+                st.info("Фото не найдено")
+        with c2:
+            st.markdown(f"### {html.escape(art)}")
+            st.caption(name)
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Наша цена", fmt_price(own_price))
+            m2.metric("Наш склад", fmt_qty(own_stock))
+            m3.metric("Лучший поставщик", best_source or "—")
+            if note:
+                st.info(f"Заметка: {note}")
+            if model or mcode or fits:
+                if model:
+                    st.write(f"**Модель:** {model}")
+                if mcode:
+                    st.write(f"**Код производителя:** {mcode}")
+                if fits:
+                    st.write(f"**Подходит к моделям:** {fits}")
+
+    with t_prices:
+        st.caption("Здесь видно нашу цену и лучший рынок по текущей позиции. Это быстрый обзор, а полный блок 'Показать цены у всех' остаётся ниже.")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Наша цена", fmt_price(own_price))
+        c2.metric("Лучший поставщик", best_source or "—")
+        c3.metric("Цена поставщика", fmt_price(best_price) if best_price > 0 else "—")
+        c4.metric("Остаток поставщика", fmt_qty(best_qty) if best_qty > 0 else "—")
+        if isinstance(compare_map, dict):
+            data = compare_map.get(art_norm) or compare_map.get(art) or {}
+            if data:
+                rows_prices = []
+                for item in data.get("offers", [])[:20]:
+                    rows_prices.append({
+                        "Поставщик": normalize_text(item.get("source", "")),
+                        "Цена": fmt_price(safe_float(item.get("price"), 0.0)),
+                        "Остаток": fmt_qty(safe_float(item.get("qty"), 0.0)),
+                    })
+                if rows_prices:
+                    st.dataframe(pd.DataFrame(rows_prices), use_container_width=True, hide_index=True)
+
+    with t_avito:
+        st.caption("Связанные объявления Avito по этой позиции. Отсюда можно быстро понять, на каком аккаунте она висит и есть ли вообще объявление.")
+        if isinstance(matched_ads, pd.DataFrame) and not matched_ads.empty:
+            try:
+                render_avito_block(avito_df, pd.DataFrame([row.to_dict()]))
+            except Exception:
+                view_cols = [c for c in ["ad_id", "title", "account", "price", "last_changed_at"] if c in matched_ads.columns]
+                st.dataframe(matched_ads[view_cols], use_container_width=True, hide_index=True)
+        else:
+            st.info("Связанные объявления Avito не найдены.")
+
+    with t_notes:
+        st.caption("Здесь можно быстро поправить карточку и сразу создать задачу на пересмотр без переходов вниз по странице.")
+        current_photo = photo_url
+        current_name = name
+        current_model = model
+        current_code = mcode
+        current_fits = fits
+        current_note = note
+
+        with st.form(f"crm_card_form_{tab_key}_{art_norm}", clear_on_submit=False):
+            cc1, cc2 = st.columns([1.2, 1.8])
+            with cc1:
+                photo_url_new = st.text_input("Фото (ссылка)", value=current_photo, key=f"crm_card_photo_{tab_key}_{art_norm}")
+            with cc2:
+                name_new = st.text_area("Название", value=current_name, height=90, key=f"crm_card_name_{tab_key}_{art_norm}")
+            mm1, mm2 = st.columns(2)
+            model_new = mm1.text_input("Модель", value=current_model, key=f"crm_card_model_{tab_key}_{art_norm}")
+            code_new = mm2.text_input("Код производителя", value=current_code, key=f"crm_card_code_{tab_key}_{art_norm}")
+            fits_new = st.text_area("Подходит к моделям", value=current_fits, height=80, key=f"crm_card_fits_{tab_key}_{art_norm}")
+            note_new = st.text_area("Заметка", value=current_note, height=70, key=f"crm_card_note_{tab_key}_{art_norm}")
+
+            st.markdown("#### 🔔 Создать задачу по карточке")
+            st.caption("Заметка — это просто комментарий. Задача — отдельное напоминание со сроком, статусом и причиной.")
+            tt1, tt2, tt3 = st.columns([1.1, 1.4, 1.7])
+            make_task = tt1.checkbox(
+                "Создать задачу",
+                key=f"crm_card_make_task_{tab_key}_{art_norm}",
+                help="Создаёт напоминание по этой позиции. Оно попадёт в общий центр задач и не пропадёт после загрузки нового файла.",
+            )
+            due_date = tt2.date_input(
+                "Когда проверить",
+                value=(datetime.utcnow().date() + timedelta(days=14)),
+                key=f"crm_card_due_{tab_key}_{art_norm}",
+            )
+            task_reason = tt3.selectbox(
+                "Причина",
+                ["Пересмотреть цену", "Проверить после правки", "Нет продаж", "Проверить фото/карточку", "Проверить спрос", "Другое"],
+                key=f"crm_card_reason_{tab_key}_{art_norm}",
+            )
+            task_note = st.text_area(
+                "Комментарий к задаче",
+                value="",
+                height=65,
+                key=f"crm_card_task_note_{tab_key}_{art_norm}",
+                placeholder="Например: снизили цену, проверить продажи через 14 дней.",
+            )
+
+            sb1, sb2 = st.columns(2)
+            save_clicked = sb1.form_submit_button("💾 Сохранить карточку", use_container_width=True, type="primary")
+            reset_clicked = sb2.form_submit_button("↺ Сбросить ручные правки", use_container_width=True)
+
+        if save_clicked:
+            save_card_override(
+                sheet_name,
+                art,
+                art_norm,
+                {
+                    "photo_url": photo_url_new,
+                    "name_override": name_new,
+                    "meta_model": model_new,
+                    "meta_manufacturer_code": code_new,
+                    "meta_fits_models": fits_new,
+                    "note": note_new,
+                },
+            )
+            if make_task:
+                create_review_task(
+                    article=art,
+                    article_norm=art_norm,
+                    sheet_name=sheet_name,
+                    name_snapshot=name_new or current_name,
+                    due_date=due_date,
+                    reason=task_reason,
+                    note=task_note or note_new,
+                    source="crm_card",
+                )
+            st.success(f"Карточка {art} сохранена.")
+            if make_task:
+                st.info(f"Задача по {art} создана до {due_date}.")
+            st.rerun()
+
+        if reset_clicked:
+            delete_card_override(sheet_name, art_norm)
+            st.success(f"Ручные правки для {art} сброшены.")
+            st.rerun()
+
+    st.markdown('</div>', unsafe_allow_html=True)
+
 def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> None:
     search_key = f"search_input_{tab_key}"
     search_widget_key = f"search_input_widget_{tab_key}"
@@ -5572,6 +5870,19 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
                     tech = tech[["article", "name", "Наша цена", "Наш склад", "Лучший поставщик", "Лучшая цена", "Фото"]].rename(columns={"article": "Артикул", "name": "Название"})
                 st.dataframe(tech, use_container_width=True, hide_index=True)
 
+            render_crm_card_center(
+                result_df,
+                display_result_df,
+                compare_map,
+                st.session_state.get("avito_df"),
+                sheet_name,
+                tab_label,
+                tab_key,
+                price_mode,
+                round100,
+                custom_discount,
+            )
+
             render_card_editor_panel(display_result_df, sheet_name, tab_key)
 
             lazy_c0, lazy_c1, lazy_c2, lazy_c3, lazy_c4, lazy_c5 = st.columns(6)
@@ -5794,6 +6105,15 @@ else:
     switch_r.checkbox("Показать фото", key="show_photos_global")
 
     active_sheet_name, active_tab_label, active_tab_key = label_to_spec[st.session_state.get("active_workspace_label", "Оригинал")]
+    active_sheet_df = sheets.get(active_sheet_name) if isinstance(sheets, dict) else None
+    render_crm_header_bar(
+        active_sheet_df,
+        st.session_state.get("photo_df"),
+        st.session_state.get("avito_df"),
+        active_sheet_name,
+        active_tab_label,
+        st.session_state.get("distributor_min_qty", 1.0),
+    )
     render_task_center_lazy_panel()
     render_hot_buy_watchlist_lazy_panel()
     render_sheet_workspace(active_sheet_name, active_tab_label, active_tab_key)
