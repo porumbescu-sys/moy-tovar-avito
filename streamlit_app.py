@@ -5564,9 +5564,15 @@ def render_crm_card_center(
     own_price = safe_float(row.get("sale_price"), 0.0)
     own_stock = parse_qty_generic(row.get("free_qty"))
     best = get_best_offer(row, min_qty=float(st.session_state.get("distributor_min_qty", 1.0)))
-    best_source = normalize_text((best or {}).get("source", ""))
-    best_price = safe_float((best or {}).get("price"), 0.0)
-    best_qty = safe_float((best or {}).get("qty"), 0.0)
+
+    # В CRM-карточке "Лучший поставщик" показываем только если он реально дешевле нашей цены.
+    # Если рынок дороже нас, не вводим в заблуждение и не показываем поставщика как "лучшего".
+    best_delta = safe_float((best or {}).get("delta"), 0.0)
+    best_is_better_than_us = bool(best) and best_delta > 0
+
+    best_source = normalize_text((best or {}).get("source", "")) if best_is_better_than_us else ""
+    best_price = safe_float((best or {}).get("price"), 0.0) if best_is_better_than_us else 0.0
+    best_qty = safe_float((best or {}).get("qty"), 0.0) if best_is_better_than_us else 0.0
     matched_ads = pd.DataFrame()
     if isinstance(avito_df, pd.DataFrame) and not avito_df.empty:
         one_row = pd.DataFrame([row.to_dict()])
@@ -5605,6 +5611,8 @@ def render_crm_card_center(
         c2.metric("Лучший поставщик", best_source or "—")
         c3.metric("Цена поставщика", fmt_price(best_price) if best_price > 0 else "—")
         c4.metric("Остаток поставщика", fmt_qty(best_qty) if best_qty > 0 else "—")
+        if best and not best_is_better_than_us:
+            st.info("Сейчас дешевле нашей цены поставщика нет.")
         if isinstance(compare_map, dict):
             data = compare_map.get(art_norm) or compare_map.get(art) or {}
             if data:
