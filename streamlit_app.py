@@ -4580,6 +4580,11 @@ def render_operational_analytics_block(sheet_df: pd.DataFrame, photo_df: pd.Data
         st.dataframe(tasks_df, use_container_width=True, hide_index=True)
 
     with st.expander("1. Приоритет на пересмотр цены", expanded=False):
+        st.caption(
+            "Что показывает: где мы дороже рынка и что стоит пересмотреть в первую очередь. "
+            "Как считается приоритет: Разница, % × Наш остаток × Количество связанных объявлений Avito (минимум 1). "
+            "Как пользоваться: чем выше приоритет, тем полезнее сначала проверить именно эту позицию."
+        )
         if isinstance(top_df, pd.DataFrame) and not top_df.empty:
             view = top_df[["Артикул", "Название", "Наша цена", "Лучшая цена дистрибьютора", "Лучший поставщик", "Разница, руб", "Разница, %", "Наш остаток", "Остаток дистрибьютора", "Приоритет"]].head(100)
             st.dataframe(view, use_container_width=True, hide_index=True)
@@ -4587,6 +4592,11 @@ def render_operational_analytics_block(sheet_df: pd.DataFrame, photo_df: pd.Data
             st.caption("На текущем листе нет позиций, где рынок дешевле нас.")
 
     with st.expander("2. Что лежит и требует вмешательства", expanded=False):
+        st.caption(
+            "Что показывает: позиции, где уже есть проблема или задача. "
+            "Причины могут быть такие: дорого, нет фото, нет объявления, слабое объявление, давно не обновлялось. "
+            "Как пользоваться: это твой список того, что нужно доработать в первую очередь."
+        )
         if isinstance(action_df, pd.DataFrame) and not action_df.empty:
             view = action_df[["Артикул", "Название", "Наш остаток", "Причины", "Объявлений Авито", "Фото", "Шаблон", "Лучший поставщик", "Разница, %"]].head(150)
             st.dataframe(view, use_container_width=True, hide_index=True)
@@ -4594,27 +4604,52 @@ def render_operational_analytics_block(sheet_df: pd.DataFrame, photo_df: pd.Data
             st.caption("Явных проблемных позиций на текущем листе не найдено.")
 
     with st.expander("3. Аналитика по аккаунтам Avito", expanded=False):
+        st.caption(
+            "Что показывает: как позиции распределены по аккаунтам Avito. "
+            "Можно понять, на каком аккаунте больше карточек, где больше позиций без фото и где больше дорогих позиций. "
+            "Как пользоваться: помогает управлять аккаунтами не на глаз, а по факту."
+        )
         if isinstance(account_df, pd.DataFrame) and not account_df.empty:
             st.dataframe(account_df, use_container_width=True, hide_index=True)
         else:
             st.caption("В Avito пока нет данных по аккаунтам для этого листа.")
 
     with st.expander("4. Покрытие качества карточек", expanded=False):
+        st.caption(
+            "Что показывает: насколько хорошо заполнены карточки товаров на текущем листе. "
+            "Здесь видно, сколько позиций с фото, без фото, с моделью, с полем 'подходит к моделям', есть ли Avito и есть ли остаток. "
+            "Как пользоваться: это быстрый контроль качества карточек."
+        )
         st.dataframe(quality_df, use_container_width=True, hide_index=True)
 
     with st.expander("5. Серийная аналитика", expanded=False):
+        st.caption(
+            "Что показывает: серии товаров, где есть несколько связанных артикулов, цветов или вариантов. "
+            "Помогает увидеть неполные серии, серии без фото, без Avito или с ценовыми перекосами. "
+            "Как пользоваться: полезно, чтобы не продавать серию обрывками."
+        )
         if isinstance(series_df, pd.DataFrame) and not series_df.empty:
             st.dataframe(series_df.head(100), use_container_width=True, hide_index=True)
         else:
             st.caption("На текущем листе не найдено серий, требующих отдельной сводки.")
 
     with st.expander("6. История ручных правок", expanded=False):
+        st.caption(
+            "Что показывает: журнал ручных изменений цен. "
+            "Видно когда меняли, какой артикул, на каком листе, было / стало и источник изменения. "
+            "Как пользоваться: помогает понять, что менялось руками, а что пришло из нового comparison-файла."
+        )
         if isinstance(patch_history_df, pd.DataFrame) and not patch_history_df.empty:
             st.dataframe(patch_history_df[["changed_at", "article", "sheet_name", "old_price", "new_price", "change_source", "note"]], use_container_width=True, hide_index=True)
         else:
             st.caption("История ручных правок пока пустая.")
 
     with st.expander("7. Надёжность источников", expanded=False):
+        st.caption(
+            "Что показывает: как часто каждый поставщик оказывался лучшим по цене на текущем листе. "
+            "Это не гарантия, а практический индикатор, кого стоит чаще мониторить. "
+            "Как пользоваться: помогает понять, какие источники чаще всего дают хорошие цены."
+        )
         if isinstance(source_df, pd.DataFrame) and not source_df.empty:
             st.dataframe(source_df, use_container_width=True, hide_index=True)
         else:
