@@ -2149,8 +2149,22 @@ def apply_card_overrides(df: pd.DataFrame | None, sheet_name: str) -> pd.DataFra
     work = work.drop_duplicates(subset=["article_norm"], keep="last")
     by_key = {normalize_text(r["article_norm"]): r for _, r in work.iterrows() if normalize_text(r.get("article_norm", ""))}
     out = df.copy()
-    if "manual_note" not in out.columns:
-        out["manual_note"] = ""
+
+    text_cols = [
+        "photo_url",
+        "source_sheet",
+        "name",
+        "meta_model",
+        "meta_manufacturer_code",
+        "meta_fits_models",
+        "manual_note",
+    ]
+    for col in text_cols:
+        if col not in out.columns:
+            out[col] = ""
+        else:
+            out[col] = out[col].astype(object)
+
     for idx, row in out.iterrows():
         key = normalize_text(row.get("article_norm", ""))
         if not key:
