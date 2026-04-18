@@ -8,7 +8,7 @@ import math
 import re
 import sqlite3
 import hashlib
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 from collections import Counter, defaultdict
@@ -2039,916 +2039,6 @@ def ensure_persisted_source_files_loaded() -> None:
 
 
 
-
-
-def get_card_override_path() -> Path:
-    try:
-        return Path(__file__).resolve().with_name("card_overrides.sqlite")
-    except NameError:
-        return Path.cwd() / "card_overrides.sqlite"
-
-
-def ensure_card_override_db() -> None:
-    path = get_card_override_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(path) as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS card_overrides (
-                sheet_name TEXT NOT NULL,
-                article_norm TEXT NOT NULL,
-                article TEXT,
-                photo_url TEXT,
-                name_override TEXT,
-                meta_model TEXT,
-                meta_manufacturer_code TEXT,
-                meta_fits_models TEXT,
-                note TEXT,
-                updated_at TEXT,
-                PRIMARY KEY (sheet_name, article_norm)
-            )
-            """
-        )
-        conn.commit()
-
-
-@st.cache_data(ttl=1800, max_entries=5)
-def load_card_overrides_df() -> pd.DataFrame:
-    path = get_card_override_path()
-    if not path.exists():
-        return pd.DataFrame()
-    with sqlite3.connect(path) as conn:
-        df = pd.read_sql_query("SELECT * FROM card_overrides", conn)
-    if df.empty:
-        return df
-    for col in ["sheet_name", "article_norm", "article", "photo_url", "name_override", "meta_model", "meta_manufacturer_code", "meta_fits_models", "note", "updated_at"]:
-        if col in df.columns:
-            df[col] = df[col].fillna("").map(normalize_text)
-    return df
-
-
-def clear_card_override_cache() -> None:
-    try:
-        load_card_overrides_df.clear()
-    except Exception:
-        pass
-
-
-def save_card_override(sheet_name: str, article: str, article_norm: str, payload: dict[str, Any]) -> None:
-    ensure_card_override_db()
-    now = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
-    clean = {k: normalize_text(v) for k, v in (payload or {}).items()}
-    with sqlite3.connect(get_card_override_path()) as conn:
-        conn.execute(
-            """
-            INSERT INTO card_overrides (
-                sheet_name, article_norm, article, photo_url, name_override,
-                meta_model, meta_manufacturer_code, meta_fits_models, note, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(sheet_name, article_norm) DO UPDATE SET
-                article=excluded.article,
-                photo_url=excluded.photo_url,
-                name_override=excluded.name_override,
-                meta_model=excluded.meta_model,
-                meta_manufacturer_code=excluded.meta_manufacturer_code,
-                meta_fits_models=excluded.meta_fits_models,
-                note=excluded.note,
-                updated_at=excluded.updated_at
-            """,
-            (
-                normalize_text(sheet_name), normalize_text(article_norm), normalize_text(article),
-                clean.get("photo_url", ""), clean.get("name_override", ""), clean.get("meta_model", ""),
-                clean.get("meta_manufacturer_code", ""), clean.get("meta_fits_models", ""), clean.get("note", ""), now
-            ),
-        )
-        conn.commit()
-    clear_card_override_cache()
-
-
-def delete_card_override(sheet_name: str, article_norm: str) -> None:
-    ensure_card_override_db()
-    with sqlite3.connect(get_card_override_path()) as conn:
-        conn.execute(
-            "DELETE FROM card_overrides WHERE sheet_name=? AND article_norm=?",
-            (normalize_text(sheet_name), normalize_text(article_norm)),
-        )
-        conn.commit()
-    clear_card_override_cache()
-
-
-
-def get_task_registry_path() -> Path:
-    try:
-        return Path(__file__).resolve().with_name("review_tasks.sqlite")
-    except NameError:
-        return Path.cwd() / "review_tasks.sqlite"
-
-
-def ensure_task_registry_db() -> None:
-    path = get_task_registry_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(path) as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS review_tasks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                article_norm TEXT NOT NULL,
-                article TEXT,
-                sheet_name TEXT,
-                name_snapshot TEXT,
-                created_at TEXT,
-                due_date TEXT,
-                status TEXT,
-                reason TEXT,
-                note TEXT,
-                completed_at TEXT,
-                source TEXT
-            )
-            """
-        )
-        conn.commit()
-
-
-@st.cache_data(ttl=300, max_entries=4)
-def load_task_registry_df() -> pd.DataFrame:
-    path = get_task_registry_path()
-    if not path.exists():
-        return pd.DataFrame(
-            columns=[
-                "id", "article_norm", "article", "sheet_name", "name_snapshot",
-                "created_at", "due_date", "status", "reason", "note", "completed_at", "source"
-            ]
-        )
-    ensure_task_registry_db()
-    with sqlite3.connect(path) as conn:
-        df = pd.read_sql_query("SELECT * FROM review_tasks ORDER BY id DESC", conn)
-    if df.empty:
-        return df
-    text_cols = [
-        "article_norm", "article", "sheet_name", "name_snapshot",
-        "created_at", "due_date", "status", "reason", "note", "completed_at", "source"
-    ]
-    for col in text_cols:
-        if col in df.columns:
-            df[col] = df[col].fillna("").map(normalize_text)
-    return df
-
-
-def clear_task_registry_cache() -> None:
-    try:
-        load_task_registry_df.clear()
-    except Exception:
-        pass
-
-
-def create_review_task(
-    article: str,
-    article_norm: str,
-    sheet_name: str,
-    name_snapshot: str,
-    due_date: Any,
-    reason: str = "",
-    note: str = "",
-    source: str = "manual_review",
-) -> None:
-    ensure_task_registry_db()
-    now = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
-    due_txt = ""
-    if due_date:
-        try:
-            if hasattr(due_date, "isoformat"):
-                due_txt = due_date.isoformat()
-            else:
-                due_txt = str(due_date)
-        except Exception:
-            due_txt = str(due_date)
-    with sqlite3.connect(get_task_registry_path()) as conn:
-        conn.execute(
-            """
-            INSERT INTO review_tasks (
-                article_norm, article, sheet_name, name_snapshot,
-                created_at, due_date, status, reason, note, completed_at, source
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                normalize_text(article_norm),
-                normalize_text(article),
-                normalize_text(sheet_name),
-                normalize_text(name_snapshot),
-                now,
-                normalize_text(due_txt),
-                "NEW",
-                normalize_text(reason),
-                normalize_text(note),
-                "",
-                normalize_text(source),
-            ),
-        )
-        conn.commit()
-    clear_task_registry_cache()
-
-
-def safe_int(value: Any, default: int = 0) -> int:
-    try:
-        if value is None:
-            return int(default)
-        if isinstance(value, bool):
-            return int(value)
-        text_value = str(value).strip()
-        if not text_value:
-            return int(default)
-        return int(float(text_value.replace(",", ".")))
-    except Exception:
-        return int(default)
-
-def update_review_task_status(task_id: Any, status: str) -> None:
-    ensure_task_registry_db()
-    task_id = safe_int(task_id, 0)
-    if task_id <= 0:
-        return
-    new_status = normalize_text(status).upper()
-    completed_at = ""
-    if new_status == "DONE":
-        completed_at = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
-    with sqlite3.connect(get_task_registry_path()) as conn:
-        conn.execute(
-            "UPDATE review_tasks SET status=?, completed_at=? WHERE id=?",
-            (new_status, completed_at, int(task_id)),
-        )
-        conn.commit()
-    clear_task_registry_cache()
-
-
-def task_effective_status(row: dict[str, Any] | pd.Series) -> str:
-    raw_status = normalize_text((row or {}).get("status", "")).upper() if isinstance(row, dict) else normalize_text(row.get("status", "")).upper()
-    due_txt = normalize_text((row or {}).get("due_date", "")) if isinstance(row, dict) else normalize_text(row.get("due_date", ""))
-    if raw_status in {"DONE", "CANCELLED"}:
-        return raw_status
-    if due_txt:
-        try:
-            due_dt = datetime.fromisoformat(due_txt).date()
-            if due_dt < datetime.utcnow().date():
-                return "OVERDUE"
-        except Exception:
-            pass
-    if raw_status == "ACTIVE":
-        return "ACTIVE"
-    return "NEW"
-
-
-def task_status_ru(status: str) -> str:
-    mapping = {
-        "NEW": "Новая",
-        "ACTIVE": "Активная",
-        "OVERDUE": "Просрочена",
-        "DONE": "Выполнена",
-        "CANCELLED": "Отменена",
-    }
-    return mapping.get(normalize_text(status).upper(), normalize_text(status))
-
-
-def build_task_view_df(sheet_filter: str | None = None) -> pd.DataFrame:
-    df = load_task_registry_df()
-    if not isinstance(df, pd.DataFrame) or df.empty:
-        return pd.DataFrame(
-            columns=[
-                "ID", "Артикул", "Название", "Лист", "Создана", "Срок",
-                "Статус", "Причина", "Комментарий", "Источник"
-            ]
-        )
-    work = df.copy()
-    work["effective_status"] = work.apply(lambda r: task_effective_status(r), axis=1)
-    if sheet_filter and normalize_text(sheet_filter):
-        work = work[work.get("sheet_name", pd.Series(dtype=object)).fillna("").map(normalize_text).eq(normalize_text(sheet_filter))]
-    work["ID"] = pd.to_numeric(work.get("id", 0), errors="coerce").fillna(0).astype(int)
-    work["Артикул"] = work.get("article", "")
-    work["Название"] = work.get("name_snapshot", "")
-    work["Лист"] = work.get("sheet_name", "")
-    work["Создана"] = work.get("created_at", "")
-    work["Срок"] = work.get("due_date", "")
-    work["Статус"] = work["effective_status"].map(task_status_ru)
-    work["Причина"] = work.get("reason", "")
-    work["Комментарий"] = work.get("note", "")
-    work["Источник"] = work.get("source", "")
-    return work[["ID", "Артикул", "Название", "Лист", "Создана", "Срок", "Статус", "Причина", "Комментарий", "Источник"]].copy()
-
-
-def task_summary_counts() -> dict[str, int]:
-    df = load_task_registry_df()
-    if not isinstance(df, pd.DataFrame) or df.empty:
-        return {"new": 0, "active": 0, "overdue": 0, "done": 0, "open": 0}
-    eff = [task_effective_status(r) for _, r in df.iterrows()]
-    return {
-        "new": sum(1 for x in eff if x == "NEW"),
-        "active": sum(1 for x in eff if x == "ACTIVE"),
-        "overdue": sum(1 for x in eff if x == "OVERDUE"),
-        "done": sum(1 for x in eff if x == "DONE"),
-        "open": sum(1 for x in eff if x in {"NEW", "ACTIVE", "OVERDUE"}),
-    }
-
-
-def tasks_summary_text() -> str:
-    c = task_summary_counts()
-    if c["open"] <= 0:
-        return "Задач нет"
-    return f"новых: {c['new']} • активных: {c['active']} • просрочено: {c['overdue']}"
-
-
-def trigger_search_from_task(article: str, sheet_label: str) -> None:
-    sheet_label = normalize_text(sheet_label) or "Оригинал"
-    mapping = {"Оригинал": "original", "Уценка": "discount", "Совместимые": "compatible"}
-    if sheet_label in mapping:
-        st.session_state["active_workspace_label"] = sheet_label
-        trigger_search_from_article(article, mapping[sheet_label])
-    else:
-        trigger_search_from_article(article, st.session_state.get("active_workspace_label", "original"))
-
-
-def apply_task_filters(task_df: pd.DataFrame, status_filter: str, period_filter: str, sheet_filter: str) -> pd.DataFrame:
-    if not isinstance(task_df, pd.DataFrame) or task_df.empty:
-        return pd.DataFrame(columns=task_df.columns if isinstance(task_df, pd.DataFrame) else [])
-    out = task_df.copy()
-
-    if sheet_filter and sheet_filter != "Все листы":
-        out = out[out["Лист"].astype(str) == sheet_filter]
-
-    if status_filter == "Новые":
-        out = out[out["Статус"].eq("Новая")]
-    elif status_filter == "Активные":
-        out = out[out["Статус"].eq("Активная")]
-    elif status_filter == "Просроченные":
-        out = out[out["Статус"].eq("Просрочена")]
-    elif status_filter == "Выполненные":
-        out = out[out["Статус"].eq("Выполнена")]
-    elif status_filter == "Не выполненные":
-        out = out[~out["Статус"].isin(["Выполнена", "Отменена"])]
-
-    today = datetime.utcnow().date()
-    if period_filter and period_filter != "Все":
-        due = pd.to_datetime(out["Срок"], errors="coerce").dt.date
-        if period_filter == "Сегодня":
-            out = out[due == today]
-        elif period_filter == "7 дней":
-            out = out[(due.notna()) & (due >= today) & (due <= (today + timedelta(days=7)))]
-        elif period_filter == "14 дней":
-            out = out[(due.notna()) & (due >= today) & (due <= (today + timedelta(days=14)))]
-        elif period_filter == "30 дней":
-            out = out[(due.notna()) & (due >= today) & (due <= (today + timedelta(days=30)))]
-        elif period_filter == "Просроченные":
-            out = out[out["Статус"].eq("Просрочена")]
-    return out
-
-
-def render_tasks_table_ui(task_df: pd.DataFrame, key_prefix: str, default_sheet: str | None = None) -> None:
-    if not isinstance(task_df, pd.DataFrame) or task_df.empty:
-        st.info("Задач пока нет.")
-        return
-
-    filters = st.columns([1.25, 1.25, 1.2])
-    status_filter = filters[0].selectbox(
-        "Статус",
-        ["Все", "Новые", "Активные", "Просроченные", "Выполненные", "Не выполненные"],
-        key=f"task_status_filter_{key_prefix}",
-        help="Фильтрует задачи по статусу: новые, активные, просроченные, выполненные или все сразу.",
-    )
-    period_filter = filters[1].selectbox(
-        "Период",
-        ["Все", "Сегодня", "7 дней", "14 дней", "30 дней", "Просроченные"],
-        key=f"task_period_filter_{key_prefix}",
-        help="Фильтр по сроку задачи: на сегодня, на ближайшие дни или только просроченные.",
-    )
-    sheet_options = ["Все листы"] + sorted([x for x in task_df["Лист"].fillna("").astype(str).unique().tolist() if str(x).strip()])
-    default_index = sheet_options.index(default_sheet) if default_sheet in sheet_options else 0
-    sheet_filter = filters[2].selectbox(
-        "Лист",
-        sheet_options,
-        index=default_index,
-        key=f"task_sheet_filter_{key_prefix}",
-        help="Ограничивает список задач выбранным листом: Оригинал, Уценка или Совместимые.",
-    )
-
-    st.caption(
-        "Статус — показывает, на каком этапе задача: новая, активная, просроченная или выполненная. "
-        "Период — помогает увидеть срочные и просроченные задачи. "
-        "Лист — ограничивает список выбранным разделом comparison."
-    )
-
-    filtered = apply_task_filters(task_df, status_filter, period_filter, sheet_filter)
-    if filtered.empty:
-        st.info("По выбранным фильтрам задач не найдено.")
-        return
-
-    st.dataframe(filtered, use_container_width=True, hide_index=True, height=min(520, 120 + len(filtered) * 36))
-
-    labels = []
-    row_map = {}
-    for _, row in filtered.iterrows():
-        label = f"{row['Артикул']} • {row['Статус']} • срок: {row['Срок'] or '—'}"
-        labels.append(label)
-        row_map[label] = row
-    pick_col, b1, b2, b3 = st.columns([4, 1.1, 1.1, 1.1])
-    selected = pick_col.selectbox(
-        "Открыть или изменить задачу",
-        labels,
-        key=f"task_selected_{key_prefix}",
-        help="Выбери задачу, чтобы открыть карточку товара, отметить её выполненной или вернуть в работу.",
-    )
-    if not selected:
-        return
-    row = row_map[selected]
-    if b1.button("Открыть", key=f"task_open_{key_prefix}", use_container_width=True):
-        trigger_search_from_task(str(row.get("Артикул", "")), str(row.get("Лист", "")))
-    if b2.button("Выполнено", key=f"task_done_{key_prefix}", use_container_width=True):
-        update_review_task_status(row.get("ID", 0), "DONE")
-        st.success(f"Задача по {row.get('Артикул', '')} отмечена как выполненная.")
-        st.rerun()
-    if b3.button("Вернуть в работу", key=f"task_active_{key_prefix}", use_container_width=True):
-        update_review_task_status(row.get("ID", 0), "ACTIVE")
-        st.success(f"Задача по {row.get('Артикул', '')} возвращена в работу.")
-        st.rerun()
-
-
-def render_task_center_lazy_panel() -> None:
-    if not st.session_state.get("show_task_center_global", False):
-        return
-    counts = task_summary_counts()
-    task_df = build_task_view_df()
-    st.markdown('<div class="result-wrap">', unsafe_allow_html=True)
-    render_block_header(
-        "Задачи / напоминания",
-        "Список задач по карточкам: что проверить, к какому сроку и по какой причине.",
-        icon="🔔",
-        help_text="Это отдельный слой задач поверх карточек. Задачи не меняют comparison-файл и не пропадают при загрузке нового файла.",
-    )
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Открытых задач", counts.get("open", 0))
-    m2.metric("Новые", counts.get("new", 0))
-    m3.metric("Активные", counts.get("active", 0))
-    m4.metric("Просроченные", counts.get("overdue", 0))
-    st.caption(
-        "Что показывает: задачи на пересмотр карточек и цен. "
-        "Как пользоваться: смотри срочные задачи, открывай карточку и после проверки отмечай задачу выполненной."
-    )
-    render_tasks_table_ui(task_df, "global_tasks")
-    st.markdown('</div>', unsafe_allow_html=True)
-
-def apply_card_overrides(df: pd.DataFrame | None, sheet_name: str) -> pd.DataFrame | None:
-    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
-        return df
-    overrides = load_card_overrides_df()
-    if overrides.empty:
-        return df
-    sheet_name_norm = normalize_text(sheet_name)
-    work = overrides[overrides.get("sheet_name", pd.Series(dtype=object)).fillna("").map(normalize_text).eq(sheet_name_norm)].copy()
-    if work.empty:
-        return df
-    work = work.drop_duplicates(subset=["article_norm"], keep="last")
-    by_key = {normalize_text(r["article_norm"]): r for _, r in work.iterrows() if normalize_text(r.get("article_norm", ""))}
-    out = df.copy()
-
-    text_cols = [
-        "photo_url",
-        "source_sheet",
-        "name",
-        "meta_model",
-        "meta_manufacturer_code",
-        "meta_fits_models",
-        "manual_note",
-    ]
-    for col in text_cols:
-        if col not in out.columns:
-            out[col] = ""
-        else:
-            out[col] = out[col].astype(object)
-
-    for idx, row in out.iterrows():
-        key = normalize_text(row.get("article_norm", ""))
-        if not key:
-            continue
-        ov = by_key.get(key)
-        if ov is None:
-            continue
-        photo_url = normalize_text(ov.get("photo_url", ""))
-        if photo_url:
-            out.at[idx, "photo_url"] = photo_url
-            out.at[idx, "source_sheet"] = "manual_override"
-        name_override = normalize_text(ov.get("name_override", ""))
-        if name_override:
-            out.at[idx, "name"] = name_override
-        meta_model = normalize_text(ov.get("meta_model", ""))
-        if meta_model:
-            out.at[idx, "meta_model"] = meta_model
-        meta_code = normalize_text(ov.get("meta_manufacturer_code", ""))
-        if meta_code:
-            out.at[idx, "meta_manufacturer_code"] = meta_code
-        meta_fits = normalize_text(ov.get("meta_fits_models", ""))
-        if meta_fits:
-            out.at[idx, "meta_fits_models"] = meta_fits
-        note = normalize_text(ov.get("note", ""))
-        if note:
-            out.at[idx, "manual_note"] = note
-    return out
-
-
-def trigger_search_from_article(article: str, tab_key: str) -> None:
-    query = normalize_query_for_display(article)
-    if not query:
-        return
-    st.session_state[f"search_input_{tab_key}"] = query
-    st.session_state[f"submitted_query_{tab_key}"] = query
-    st.session_state[f"search_input_widget_pending_{tab_key}"] = query
-    st.session_state[f"last_result_{tab_key}"] = None
-    st.session_state[f"last_result_sig_{tab_key}"] = None
-    st.rerun()
-
-
-def render_analytics_jump_helper(df: pd.DataFrame | None, tab_key: str, box_key: str) -> None:
-    if not isinstance(df, pd.DataFrame) or df.empty or "Артикул" not in df.columns:
-        return
-    articles = [normalize_text(x) for x in df["Артикул"].tolist() if normalize_text(x)]
-    articles = unique_preserve_order(articles)
-    if not articles:
-        return
-    c1, c2 = st.columns([4, 1.2])
-    selected_article = c1.selectbox(
-        "Открыть позицию в обычном поиске",
-        articles,
-        key=f"analytics_open_select_{box_key}_{tab_key}",
-        help="Быстрый переход из аналитики в обычную карточку товара.",
-    )
-    if c2.button("Открыть", key=f"analytics_open_btn_{box_key}_{tab_key}", use_container_width=True):
-        trigger_search_from_article(selected_article, tab_key)
-
-
-
-
-def compute_crm_strip_metrics_for_sheet(
-    sheet_df: pd.DataFrame | None,
-    photo_df: pd.DataFrame | None,
-    avito_df: pd.DataFrame | None,
-    min_qty: float,
-    sheet_name: str,
-) -> dict[str, int]:
-    metrics = {"no_photo": 0, "no_avito": 0, "can_buy": 0}
-    if not isinstance(sheet_df, pd.DataFrame) or sheet_df.empty:
-        return metrics
-    try:
-        registry_df = load_avito_registry_df()
-        bundle = build_operational_analytics_bundle(sheet_df, photo_df, avito_df, registry_df, min_qty, sheet_name)
-        quality = (bundle or {}).get("quality", {}) if isinstance(bundle, dict) else {}
-        metrics["no_photo"] = int(quality.get("without_photo", 0) or 0)
-        metrics["no_avito"] = int(quality.get("in_price_not_in_avito", 0) or 0)
-    except Exception:
-        pass
-    try:
-        buy_df = build_hot_buy_watchlist_table()
-        if isinstance(buy_df, pd.DataFrame) and not buy_df.empty and "Лист" in buy_df.columns:
-            metrics["can_buy"] = int((buy_df["Лист"].fillna("").astype(str) == str(sheet_name)).sum())
-        elif isinstance(buy_df, pd.DataFrame):
-            metrics["can_buy"] = int(len(buy_df))
-    except Exception:
-        pass
-    return metrics
-
-
-def render_crm_summary_strip(
-    task_counts: dict[str, int],
-    crm_metrics: dict[str, int],
-    active_sheet_label: str,
-) -> None:
-    st.markdown('<div class="result-wrap">', unsafe_allow_html=True)
-    render_block_header(
-        "CRM-центр",
-        f"Быстрый рабочий слой по разделу «{active_sheet_label}»: задачи, сигналы закупки и проблемные зоны. Нажми на нужный блок и переходи сразу к работе.",
-        icon="🧭",
-        help_text="CRM-центр не меняет comparison-файл. Он собирает в одном месте задачи, сигналы закупки и проблемные зоны, чтобы не бегать по странице.",
-    )
-    c1, c2, c3, c4, c5 = st.columns(5)
-    if c1.button(f"🔔 Задачи: {int(task_counts.get('open', 0))}", use_container_width=True, key=f"crm_open_tasks_{active_sheet_label}"):
-        st.session_state["show_task_center_global"] = True
-    c1.caption("Открывает единый центр задач и напоминаний.")
-    c2.metric("Просрочено", int(task_counts.get("overdue", 0) or 0))
-    c2.caption("Сколько задач уже нужно было проверить.")
-    if c3.button(f"💰 Можно брать: {int(crm_metrics.get('can_buy', 0))}", use_container_width=True, key=f"crm_open_buy_{active_sheet_label}"):
-        st.session_state["show_hot_buy_watchlist_table"] = True
-    c3.caption("Позиции, где поставщик сейчас минимум на 35% дешевле нашей цены.")
-    c4.metric("Нет фото", int(crm_metrics.get("no_photo", 0) or 0))
-    c4.caption("Позиции на текущем листе без фото.")
-    c5.metric("Без Avito", int(crm_metrics.get("no_avito", 0) or 0))
-    c5.caption("Позиции текущего листа без объявления в Avito.")
-    st.markdown('</div>', unsafe_allow_html=True)
-
-
-def render_crm_card_center(
-    result_df: pd.DataFrame | None,
-    compare_map: dict[str, Any] | None,
-    avito_df: pd.DataFrame | None,
-    min_qty: float,
-    sheet_name: str,
-    tab_key: str,
-    show_photos: bool = True,
-) -> None:
-    if not isinstance(result_df, pd.DataFrame) or result_df.empty:
-        return
-
-    rows = result_df.copy()
-    options = []
-    row_by_label = {}
-    for _, row in rows.iterrows():
-        art = normalize_text(row.get("article", ""))
-        name = normalize_text(row.get("name", ""))
-        label = f"{art} — {name[:100]}"
-        options.append(label)
-        row_by_label[label] = row
-
-    selected_label = st.selectbox(
-        "Позиция в CRM-центре",
-        options,
-        index=0 if options else None,
-        key=f"crm_card_select_{tab_key}",
-        help="Выбери позицию, чтобы видеть всё важное в одном месте: обзор, цены, Avito и задачи.",
-    )
-    if not selected_label:
-        return
-
-    row = row_by_label[selected_label]
-    article = normalize_text(row.get("article", ""))
-    article_norm = normalize_text(row.get("article_norm", ""))
-    name = normalize_text(row.get("name", ""))
-    photo_url = normalize_text(row.get("photo_url", ""))
-    note_current = normalize_text(row.get("manual_note", ""))
-    meta_model = normalize_text(row.get("meta_model", ""))
-    meta_code = normalize_text(row.get("meta_manufacturer_code", ""))
-    meta_fits = normalize_text(row.get("meta_fits_models", ""))
-    sale_price = safe_float(row.get("sale_price"), 0.0)
-    free_qty = parse_qty_generic(row.get("free_qty"))
-    total_qty = parse_qty_generic(row.get("total_qty"))
-    transit_qty = parse_qty_generic(row.get("transit_qty"))
-    best = get_best_offer(row, min_qty=min_qty)
-    matched_avito = pd.DataFrame()
-    try:
-        registry_df = load_avito_registry_df()
-        merged_avito = combine_avito_sources(avito_df, registry_df)
-        _, avito_index = build_avito_code_index(merged_avito)
-        codes = row.get("row_codes", []) or build_row_compare_codes(article, name)
-        matched = match_avito_candidates_for_codes(avito_index, codes)
-        matched_avito = pd.DataFrame(matched) if matched else pd.DataFrame()
-    except Exception:
-        matched_avito = pd.DataFrame()
-
-    st.markdown('<div class="result-wrap">', unsafe_allow_html=True)
-    render_block_header(
-        "CRM-карточка товара",
-        "Всё важное по выбранной позиции в одном месте: обзор, цены, Avito и заметки/задачи. Старые блоки остаются ниже как вторичный режим.",
-        icon="🗂️",
-        help_text="Это компактный CRM-экран по одной позиции. Здесь удобно быстро понять состояние карточки, сравнить цены и поставить задачу на пересмотр.",
-    )
-
-    t1, t2, t3, t4 = st.tabs(["Обзор", "Цены", "Avito", "Заметки / задачи"])
-
-    with t1:
-        c1, c2 = st.columns([1, 2.2])
-        with c1:
-            if show_photos and photo_url:
-                try:
-                    st.image(photo_url, use_container_width=True)
-                except Exception:
-                    st.caption("Фото не удалось открыть.")
-            else:
-                st.caption("Фото не показано.")
-        with c2:
-            st.markdown(f"### {html.escape(article)}")
-            st.write(name)
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Свободно", fmt_qty(free_qty))
-            m2.metric("Всего", fmt_qty(total_qty))
-            m3.metric("Транзит", fmt_qty(transit_qty))
-            if meta_model:
-                st.write(f"**Модель:** {meta_model}")
-            if meta_code:
-                st.write(f"**Код производителя:** {meta_code}")
-            if meta_fits:
-                st.write(f"**Подходит к моделям:** {meta_fits}")
-            if note_current:
-                st.info(f"**Заметка:** {note_current}")
-
-    with t2:
-        m1, m2 = st.columns(2)
-        m1.metric("Наша цена", fmt_price_with_rub(sale_price))
-        m2.metric("Наш остаток", fmt_qty(free_qty))
-        if best:
-            st.success(
-                f"Лучший поставщик: {normalize_text(best.get('source', ''))} • "
-                f"{fmt_price_with_rub(safe_float(best.get('price'), 0.0))} • "
-                f"остаток {fmt_qty(safe_float(best.get('qty'), 0.0))}"
-            )
-        else:
-            st.caption("Сейчас нет поставщика, который проходит фильтр по остатку.")
-        if compare_map:
-            row_key = str(article_norm or article)
-            offers = compare_map.get(row_key, []) or []
-            if offers:
-                offers_df = pd.DataFrame(offers)
-                if not offers_df.empty:
-                    shown = offers_df.copy()
-                    if "price" in shown.columns:
-                        shown["Цена"] = shown["price"].map(fmt_price)
-                    if "qty" in shown.columns:
-                        shown["Остаток"] = shown["qty"].map(fmt_qty)
-                    if "gap_pct" in shown.columns:
-                        shown["Разница к нам, %"] = shown["gap_pct"].map(lambda x: round(float(x), 2) if pd.notna(x) else "")
-                    cols = [c for c in ["source", "Цена", "Остаток", "Разница к нам, %"] if c in shown.columns]
-                    if cols:
-                        st.dataframe(shown[cols].rename(columns={"source": "Поставщик"}), use_container_width=True, hide_index=True)
-
-    with t3:
-        st.caption("Что показывает: связанные объявления Avito по этой позиции. Как пользоваться: отсюда видно, есть ли объявление, на каком аккаунте оно находится и что нужно доработать.")
-        if isinstance(matched_avito, pd.DataFrame) and not matched_avito.empty:
-            show_cols = [c for c in ["account", "title", "price", "ad_id", "last_changed_at"] if c in matched_avito.columns]
-            shown = matched_avito[show_cols].copy()
-            shown = shown.rename(columns={
-                "account": "Аккаунт",
-                "title": "Название объявления",
-                "price": "Цена",
-                "ad_id": "ID",
-                "last_changed_at": "Последнее изменение",
-            })
-            if "Цена" in shown.columns:
-                shown["Цена"] = shown["Цена"].map(fmt_price)
-            st.dataframe(shown, use_container_width=True, hide_index=True)
-        else:
-            st.info("По этой позиции связанные объявления Avito не найдены.")
-
-    with t4:
-        st.caption("Что показывает: заметка по карточке и задачи на пересмотр. Как пользоваться: заметка — это просто комментарий, задача — отдельное напоминание с датой и статусом.")
-        current_tasks = build_task_view_df(sheet_filter=sheet_name)
-        if isinstance(current_tasks, pd.DataFrame) and not current_tasks.empty:
-            current_tasks = current_tasks[current_tasks["Артикул"].fillna("").astype(str).eq(article)]
-        tleft, tright = st.columns([1.2, 1])
-        with tleft:
-            with st.form(f"crm_note_form_{tab_key}_{article_norm}", clear_on_submit=False):
-                note_new = st.text_area("Заметка", value=note_current, height=90, key=f"crm_note_val_{tab_key}_{article_norm}")
-                save_note = st.form_submit_button("💾 Сохранить заметку", use_container_width=True)
-            if save_note:
-                save_card_override(
-                    sheet_name,
-                    article,
-                    article_norm,
-                    {
-                        "photo_url": photo_url,
-                        "name_override": name,
-                        "meta_model": meta_model,
-                        "meta_manufacturer_code": meta_code,
-                        "meta_fits_models": meta_fits,
-                        "note": note_new,
-                    },
-                )
-                st.success("Заметка сохранена.")
-                st.rerun()
-        with tright:
-            with st.form(f"crm_task_form_{tab_key}_{article_norm}", clear_on_submit=True):
-                due_date = st.date_input("Срок проверки", value=(datetime.utcnow().date() + timedelta(days=14)), key=f"crm_due_{tab_key}_{article_norm}")
-                reason = st.selectbox("Причина", ["Пересмотреть цену", "Проверить после правки", "Нет продаж", "Проверить фото/карточку", "Проверить спрос", "Другое"], key=f"crm_reason_{tab_key}_{article_norm}")
-                task_note = st.text_area("Комментарий", value="", height=70, key=f"crm_task_note_{tab_key}_{article_norm}")
-                create_task = st.form_submit_button("🔔 Создать задачу", use_container_width=True, type="primary")
-            if create_task:
-                create_review_task(
-                    article=article,
-                    article_norm=article_norm,
-                    sheet_name=sheet_name,
-                    name_snapshot=name,
-                    due_date=due_date,
-                    reason=reason,
-                    note=task_note,
-                    source="crm_card",
-                )
-                st.success("Задача создана.")
-                st.session_state["show_task_center_global"] = True
-                st.rerun()
-
-        if isinstance(current_tasks, pd.DataFrame) and not current_tasks.empty:
-            st.markdown("#### Задачи по этой позиции")
-            st.dataframe(
-                current_tasks[["Создана", "Срок", "Статус", "Причина", "Комментарий", "Источник"]],
-                use_container_width=True,
-                hide_index=True,
-            )
-        else:
-            st.caption("По этой позиции задач пока нет.")
-    st.markdown('</div>', unsafe_allow_html=True)
-
-def render_card_editor_panel(result_df: pd.DataFrame | None, sheet_name: str, tab_key: str) -> None:
-    if not isinstance(result_df, pd.DataFrame) or result_df.empty:
-        return
-    if not st.checkbox("✏️ Редактировать карточку", key=f"show_card_editor_{tab_key}", help="Открывает безопасный редактор карточки. Правки сохраняются поверх файла и не пропадают после новой загрузки comparison."):
-        return
-
-    rows = result_df.copy()
-    options = []
-    option_map = {}
-    for _, row in rows.iterrows():
-        art = normalize_text(row.get("article", ""))
-        key = normalize_text(row.get("article_norm", ""))
-        name = normalize_text(row.get("name", ""))
-        label = f"{art} — {name[:120]}"
-        options.append(label)
-        option_map[label] = row
-
-    default_label = options[0] if options else None
-    selected_label = st.selectbox("Позиция для редактирования", options, index=0 if default_label else None, key=f"card_editor_select_{tab_key}")
-    if not selected_label:
-        return
-    row = option_map[selected_label]
-    art = normalize_text(row.get("article", ""))
-    art_norm = normalize_text(row.get("article_norm", ""))
-    current_photo = normalize_text(row.get("photo_url", ""))
-    current_name = normalize_text(row.get("name", ""))
-    current_model = normalize_text(row.get("meta_model", ""))
-    current_code = normalize_text(row.get("meta_manufacturer_code", ""))
-    current_fits = normalize_text(row.get("meta_fits_models", ""))
-    current_note = normalize_text(row.get("manual_note", ""))
-
-    st.caption("Правки сохраняются как ручные overrides и накладываются поверх comparison-файла после каждой новой загрузки.")
-    with st.form(f"card_editor_form_{tab_key}_{art_norm}", clear_on_submit=False):
-        col1, col2 = st.columns([1.2, 1.8])
-        with col1:
-            photo_url = st.text_input("Фото (ссылка)", value=current_photo, key=f"card_edit_photo_{tab_key}_{art_norm}")
-            if current_photo:
-                st.link_button("Открыть текущее фото", current_photo, use_container_width=True)
-        with col2:
-            name_override = st.text_area("Название", value=current_name, height=90, key=f"card_edit_name_{tab_key}_{art_norm}")
-        cmeta1, cmeta2 = st.columns(2)
-        meta_model = cmeta1.text_input("Модель", value=current_model, key=f"card_edit_model_{tab_key}_{art_norm}")
-        meta_code = cmeta2.text_input("Код производителя", value=current_code, key=f"card_edit_code_{tab_key}_{art_norm}")
-        meta_fits = st.text_area("Подходит к моделям", value=current_fits, height=80, key=f"card_edit_fits_{tab_key}_{art_norm}")
-        note = st.text_area("Заметка", value=current_note, height=70, key=f"card_edit_note_{tab_key}_{art_norm}")
-
-        st.markdown("### 🔔 Напоминание / задача")
-        st.caption("Можно создать задачу на пересмотр позиции через несколько дней. Задача сохранится отдельно и не пропадёт после загрузки нового файла.")
-        t1, t2, t3 = st.columns([1.1, 1.4, 1.7])
-        create_task_flag = t1.checkbox(
-            "Создать задачу",
-            key=f"card_edit_make_task_{tab_key}_{art_norm}",
-            help="Создаёт напоминание по этой карточке с датой проверки и комментарием.",
-        )
-        task_due_date = t2.date_input(
-            "Когда проверить",
-            value=(datetime.utcnow().date() + timedelta(days=14)),
-            key=f"card_edit_task_due_{tab_key}_{art_norm}",
-        )
-        task_reason = t3.selectbox(
-            "Причина",
-            ["Пересмотреть цену", "Проверить после правки", "Нет продаж", "Проверить фото/карточку", "Проверить спрос", "Другое"],
-            key=f"card_edit_task_reason_{tab_key}_{art_norm}",
-            help="Коротко описывает, зачем создана задача.",
-        )
-        task_note = st.text_area(
-            "Комментарий к задаче",
-            value="",
-            height=65,
-            key=f"card_edit_task_note_{tab_key}_{art_norm}",
-            placeholder="Например: снизили цену, проверить продажи через 14 дней.",
-        )
-
-        b1, b2 = st.columns(2)
-        save_clicked = b1.form_submit_button("💾 Сохранить карточку", use_container_width=True, type="primary")
-        reset_clicked = b2.form_submit_button("↺ Сбросить ручные правки", use_container_width=True)
-
-    if save_clicked:
-        save_card_override(
-            sheet_name,
-            art,
-            art_norm,
-            {
-                "photo_url": photo_url,
-                "name_override": name_override,
-                "meta_model": meta_model,
-                "meta_manufacturer_code": meta_code,
-                "meta_fits_models": meta_fits,
-                "note": note,
-            },
-        )
-        if create_task_flag:
-            create_review_task(
-                article=art,
-                article_norm=art_norm,
-                sheet_name=sheet_name,
-                name_snapshot=name_override or current_name,
-                due_date=task_due_date,
-                reason=task_reason,
-                note=task_note or note,
-                source="card_editor",
-            )
-        st.success(f"Карточка {art} сохранена.")
-        if create_task_flag:
-            st.info(f"Задача по {art} создана до {task_due_date}.")
-        st.rerun()
-
-    if reset_clicked:
-        delete_card_override(sheet_name, art_norm)
-        st.success(f"Ручные правки для {art} сброшены.")
-        st.rerun()
-
 def ensure_photo_web_cache_table() -> None:
     path = get_photo_registry_path()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -4104,10 +3194,6 @@ def render_results_table(df: pd.DataFrame, price_mode: str, round100: bool, cust
             badge_html = "<div class='match-badge match-badge-soft'>По названию / бренду</div>"
 
         hot_html = ""
-        manual_note_html = ""
-        manual_note = normalize_text(row.get("manual_note", ""))
-        if manual_note:
-            manual_note_html = f"<div class='manual-note'>{html.escape(manual_note)}</div>"
         if bool(row.get("hot_flag", False)):
             abc = normalize_text(row.get("hot_abc_class", "")).upper()
             sales_pm = safe_float(row.get("hot_sales_per_month"), 0.0)
@@ -4189,7 +3275,6 @@ def render_results_table(df: pd.DataFrame, price_mode: str, round100: bool, cust
                     <div class='name-cell'>{html.escape(str(row['name']))}</div>
                     {badge_html}
                     {hot_html}
-                    {manual_note_html}
                   </div>
                 </div>
               </td>
@@ -4218,7 +3303,6 @@ def render_results_table(df: pd.DataFrame, price_mode: str, round100: bool, cust
       .match-badge-exact {{ background:#e8f7ee; color:#15803d; }}
       .match-badge-linked {{ background:#e8f1ff; color:#1d4ed8; }}
       .match-badge-soft {{ background:#fff4e5; color:#b45309; }}
-      .manual-note {{ margin-top:8px; font-size:12px; color:#475569; background:#f8fafc; border:1px dashed #cbd5e1; padding:6px 8px; border-radius:10px; max-width:560px; }}
       .sale-col {{ font-weight:800; white-space:nowrap; }}
       .selected-col {{ background: linear-gradient(180deg, #f4f8ff 0%, #eef4ff 100%); border-left:1px solid #c7d7ff; border-right:1px solid #c7d7ff; font-weight:900; color:#315efb; white-space:nowrap; }}
       .compare-col {{ min-width:230px; }}
@@ -5504,7 +4588,6 @@ def render_operational_analytics_block(sheet_df: pd.DataFrame, photo_df: pd.Data
         if isinstance(top_df, pd.DataFrame) and not top_df.empty:
             view = top_df[["Артикул", "Название", "Наша цена", "Лучшая цена дистрибьютора", "Лучший поставщик", "Разница, руб", "Разница, %", "Наш остаток", "Остаток дистрибьютора", "Приоритет"]].head(100)
             st.dataframe(view, use_container_width=True, hide_index=True)
-            render_analytics_jump_helper(view, tab_key, "top")
         else:
             st.caption("На текущем листе нет позиций, где рынок дешевле нас.")
 
@@ -5517,7 +4600,6 @@ def render_operational_analytics_block(sheet_df: pd.DataFrame, photo_df: pd.Data
         if isinstance(action_df, pd.DataFrame) and not action_df.empty:
             view = action_df[["Артикул", "Название", "Наш остаток", "Причины", "Объявлений Авито", "Фото", "Шаблон", "Лучший поставщик", "Разница, %"]].head(150)
             st.dataframe(view, use_container_width=True, hide_index=True)
-            render_analytics_jump_helper(view, tab_key, "action")
         else:
             st.caption("Явных проблемных позиций на текущем листе не найдено.")
 
@@ -5547,9 +4629,7 @@ def render_operational_analytics_block(sheet_df: pd.DataFrame, photo_df: pd.Data
             "Как пользоваться: полезно, чтобы не продавать серию обрывками."
         )
         if isinstance(series_df, pd.DataFrame) and not series_df.empty:
-            series_view = series_df.head(100)
-            st.dataframe(series_view, use_container_width=True, hide_index=True)
-            render_analytics_jump_helper(series_view, tab_key, "series")
+            st.dataframe(series_df.head(100), use_container_width=True, hide_index=True)
         else:
             st.caption("На текущем листе не найдено серий, требующих отдельной сводки.")
 
@@ -5574,14 +4654,6 @@ def render_operational_analytics_block(sheet_df: pd.DataFrame, photo_df: pd.Data
             st.dataframe(source_df, use_container_width=True, hide_index=True)
         else:
             st.caption("Пока нет данных по лучшим поставщикам.")
-
-    with st.expander("8. Задачи / напоминания ❔", expanded=False):
-        st.caption(
-            "Что показывает: задачи по карточкам на пересмотр, проверку или доработку. "
-            "Как пользоваться: открывай карточку из задачи, проверяй позицию и отмечай задачу выполненной."
-        )
-        task_df = build_task_view_df(sheet_name)
-        render_tasks_table_ui(task_df, f"analytics_tasks_{tab_key}", default_sheet=sheet_name)
 
     st.download_button(
         "⬇️ Скачать аналитику в Excel",
@@ -5619,8 +4691,7 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
         st.session_state[search_widget_key] = ""
         st.session_state[clear_flag_key] = False
 
-    base_sheet_raw = sheets.get(sheet_name) if isinstance(sheets, dict) else None
-    base_sheet_df = apply_card_overrides(base_sheet_raw.copy(), sheet_name) if isinstance(base_sheet_raw, pd.DataFrame) else None
+    base_sheet_df = sheets.get(sheet_name) if isinstance(sheets, dict) else None
     show_photos = bool(st.session_state.get("show_photos_global", True))
     photo_df = st.session_state.get("photo_df")
     source_pairs = get_source_pairs(base_sheet_df) if isinstance(base_sheet_df, pd.DataFrame) else []
@@ -5778,8 +4849,6 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
         st.session_state[result_key] = result_df
     if isinstance(result_df, pd.DataFrame) and show_photos:
         display_result_df = apply_photo_map(result_df, photo_df)
-    if isinstance(display_result_df, pd.DataFrame):
-        display_result_df = apply_card_overrides(display_result_df, sheet_name)
     if isinstance(display_result_df, pd.DataFrame) and isinstance(hot_items_df, pd.DataFrame) and not hot_items_df.empty:
         display_result_df = apply_hot_watchlist(display_result_df, hot_items_df, tab_label=tab_label)
 
@@ -5805,7 +4874,6 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
             compare_map = build_distributor_compare(result_df, min_qty=min_dist_qty)
             render_results_insight_dashboard(display_result_df, compare_map, source_pairs)
             render_results_table(display_result_df.head(200), price_mode, round100, custom_discount, distributor_map=compare_map, show_photos=show_photos)
-            render_crm_card_center(display_result_df.head(200), compare_map, st.session_state.get("avito_df"), min_dist_qty, sheet_name, tab_key, show_photos=show_photos)
             st.download_button(
                 "⬇️ Скачать результаты в Excel",
                 to_excel_bytes(display_result_df, price_mode, round100, custom_discount, min_dist_qty),
@@ -5829,8 +4897,6 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
                     tech = tech[["article", "name", "Наша цена", "Наш склад", "Лучший поставщик", "Лучшая цена", "Фото"]].rename(columns={"article": "Артикул", "name": "Название"})
                 st.dataframe(tech, use_container_width=True, hide_index=True)
 
-            render_card_editor_panel(display_result_df, sheet_name, tab_key)
-
             lazy_c0, lazy_c1, lazy_c2, lazy_c3, lazy_c4, lazy_c5 = st.columns(6)
             lazy_c0.checkbox("Показать шаблоны", key=f"lazy_templates_{tab_key}")
             lazy_c1.checkbox("Показать цены у всех", key=f"lazy_all_prices_{tab_key}")
@@ -5841,8 +4907,6 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
 
             if st.session_state.get(f"lazy_templates_{tab_key}", False):
                 result_enriched_for_templates = apply_photo_map(result_df, photo_df) if isinstance(result_df, pd.DataFrame) else result_df
-                if isinstance(result_enriched_for_templates, pd.DataFrame):
-                    result_enriched_for_templates = apply_card_overrides(result_enriched_for_templates, sheet_name)
                 st.markdown('<div class="result-wrap">', unsafe_allow_html=True)
                 render_block_header(
                     f"{tab_label} — шаблоны",
@@ -6034,8 +5098,7 @@ else:
     if "active_workspace_label" not in st.session_state:
         st.session_state["active_workspace_label"] = "Оригинал"
 
-    task_counts = task_summary_counts()
-    switch_l, switch_m, switch_r = st.columns([3.2, 1.25, 1.25])
+    switch_l, switch_r = st.columns([4, 1.25])
     switch_l.radio(
         "Раздел",
         options=[label for _, label, _ in tab_specs],
@@ -6043,24 +5106,9 @@ else:
         horizontal=True,
         label_visibility="collapsed",
     )
-    switch_m.checkbox(
-        f"🔔 Задачи ({task_counts.get('open', 0)})",
-        key="show_task_center_global",
-        help="Открывает единый центр задач и напоминаний по карточкам. Пока чекбокс выключен, список не строится.",
-    )
     switch_r.checkbox("Показать фото", key="show_photos_global")
 
     active_sheet_name, active_tab_label, active_tab_key = label_to_spec[st.session_state.get("active_workspace_label", "Оригинал")]
-    active_sheet_df = sheets.get(active_sheet_name) if isinstance(sheets, dict) else None
-    crm_metrics = compute_crm_strip_metrics_for_sheet(
-        active_sheet_df,
-        st.session_state.get("photo_df"),
-        st.session_state.get("avito_df"),
-        safe_float(st.session_state.get("distributor_min_qty", 1.0), 1.0),
-        active_tab_label,
-    )
-    render_crm_summary_strip(task_counts, crm_metrics, active_tab_label)
-    render_task_center_lazy_panel()
     render_hot_buy_watchlist_lazy_panel()
     render_sheet_workspace(active_sheet_name, active_tab_label, active_tab_key)
 
