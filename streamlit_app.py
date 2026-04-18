@@ -2039,6 +2039,249 @@ def ensure_persisted_source_files_loaded() -> None:
 
 
 
+
+
+def get_card_override_path() -> Path:
+    try:
+        return Path(__file__).resolve().with_name("card_overrides.sqlite")
+    except NameError:
+        return Path.cwd() / "card_overrides.sqlite"
+
+
+def ensure_card_override_db() -> None:
+    path = get_card_override_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS card_overrides (
+                sheet_name TEXT NOT NULL,
+                article_norm TEXT NOT NULL,
+                article TEXT,
+                photo_url TEXT,
+                name_override TEXT,
+                meta_model TEXT,
+                meta_manufacturer_code TEXT,
+                meta_fits_models TEXT,
+                note TEXT,
+                updated_at TEXT,
+                PRIMARY KEY (sheet_name, article_norm)
+            )
+            """
+        )
+        conn.commit()
+
+
+@st.cache_data(ttl=1800, max_entries=5)
+def load_card_overrides_df() -> pd.DataFrame:
+    path = get_card_override_path()
+    if not path.exists():
+        return pd.DataFrame()
+    with sqlite3.connect(path) as conn:
+        df = pd.read_sql_query("SELECT * FROM card_overrides", conn)
+    if df.empty:
+        return df
+    for col in ["sheet_name", "article_norm", "article", "photo_url", "name_override", "meta_model", "meta_manufacturer_code", "meta_fits_models", "note", "updated_at"]:
+        if col in df.columns:
+            df[col] = df[col].fillna("").map(normalize_text)
+    return df
+
+
+def clear_card_override_cache() -> None:
+    try:
+        load_card_overrides_df.clear()
+    except Exception:
+        pass
+
+
+def save_card_override(sheet_name: str, article: str, article_norm: str, payload: dict[str, Any]) -> None:
+    ensure_card_override_db()
+    now = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    clean = {k: normalize_text(v) for k, v in (payload or {}).items()}
+    with sqlite3.connect(get_card_override_path()) as conn:
+        conn.execute(
+            """
+            INSERT INTO card_overrides (
+                sheet_name, article_norm, article, photo_url, name_override,
+                meta_model, meta_manufacturer_code, meta_fits_models, note, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(sheet_name, article_norm) DO UPDATE SET
+                article=excluded.article,
+                photo_url=excluded.photo_url,
+                name_override=excluded.name_override,
+                meta_model=excluded.meta_model,
+                meta_manufacturer_code=excluded.meta_manufacturer_code,
+                meta_fits_models=excluded.meta_fits_models,
+                note=excluded.note,
+                updated_at=excluded.updated_at
+            """,
+            (
+                normalize_text(sheet_name), normalize_text(article_norm), normalize_text(article),
+                clean.get("photo_url", ""), clean.get("name_override", ""), clean.get("meta_model", ""),
+                clean.get("meta_manufacturer_code", ""), clean.get("meta_fits_models", ""), clean.get("note", ""), now
+            ),
+        )
+        conn.commit()
+    clear_card_override_cache()
+
+
+def delete_card_override(sheet_name: str, article_norm: str) -> None:
+    ensure_card_override_db()
+    with sqlite3.connect(get_card_override_path()) as conn:
+        conn.execute(
+            "DELETE FROM card_overrides WHERE sheet_name=? AND article_norm=?",
+            (normalize_text(sheet_name), normalize_text(article_norm)),
+        )
+        conn.commit()
+    clear_card_override_cache()
+
+
+def apply_card_overrides(df: pd.DataFrame | None, sheet_name: str) -> pd.DataFrame | None:
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    overrides = load_card_overrides_df()
+    if overrides.empty:
+        return df
+    sheet_name_norm = normalize_text(sheet_name)
+    work = overrides[overrides.get("sheet_name", pd.Series(dtype=object)).fillna("").map(normalize_text).eq(sheet_name_norm)].copy()
+    if work.empty:
+        return df
+    work = work.drop_duplicates(subset=["article_norm"], keep="last")
+    by_key = {normalize_text(r["article_norm"]): r for _, r in work.iterrows() if normalize_text(r.get("article_norm", ""))}
+    out = df.copy()
+    if "manual_note" not in out.columns:
+        out["manual_note"] = ""
+    for idx, row in out.iterrows():
+        key = normalize_text(row.get("article_norm", ""))
+        if not key:
+            continue
+        ov = by_key.get(key)
+        if ov is None:
+            continue
+        photo_url = normalize_text(ov.get("photo_url", ""))
+        if photo_url:
+            out.at[idx, "photo_url"] = photo_url
+            out.at[idx, "source_sheet"] = "manual_override"
+        name_override = normalize_text(ov.get("name_override", ""))
+        if name_override:
+            out.at[idx, "name"] = name_override
+        meta_model = normalize_text(ov.get("meta_model", ""))
+        if meta_model:
+            out.at[idx, "meta_model"] = meta_model
+        meta_code = normalize_text(ov.get("meta_manufacturer_code", ""))
+        if meta_code:
+            out.at[idx, "meta_manufacturer_code"] = meta_code
+        meta_fits = normalize_text(ov.get("meta_fits_models", ""))
+        if meta_fits:
+            out.at[idx, "meta_fits_models"] = meta_fits
+        note = normalize_text(ov.get("note", ""))
+        if note:
+            out.at[idx, "manual_note"] = note
+    return out
+
+
+def trigger_search_from_article(article: str, tab_key: str) -> None:
+    query = normalize_query_for_display(article)
+    if not query:
+        return
+    st.session_state[f"search_input_{tab_key}"] = query
+    st.session_state[f"submitted_query_{tab_key}"] = query
+    st.session_state[f"search_input_widget_pending_{tab_key}"] = query
+    st.session_state[f"last_result_{tab_key}"] = None
+    st.session_state[f"last_result_sig_{tab_key}"] = None
+    st.rerun()
+
+
+def render_analytics_jump_helper(df: pd.DataFrame | None, tab_key: str, box_key: str) -> None:
+    if not isinstance(df, pd.DataFrame) or df.empty or "Артикул" not in df.columns:
+        return
+    articles = [normalize_text(x) for x in df["Артикул"].tolist() if normalize_text(x)]
+    articles = unique_preserve_order(articles)
+    if not articles:
+        return
+    c1, c2 = st.columns([4, 1.2])
+    selected_article = c1.selectbox(
+        "Открыть позицию в обычном поиске",
+        articles,
+        key=f"analytics_open_select_{box_key}_{tab_key}",
+        help="Быстрый переход из аналитики в обычную карточку товара.",
+    )
+    if c2.button("Открыть", key=f"analytics_open_btn_{box_key}_{tab_key}", use_container_width=True):
+        trigger_search_from_article(selected_article, tab_key)
+
+
+def render_card_editor_panel(result_df: pd.DataFrame | None, sheet_name: str, tab_key: str) -> None:
+    if not isinstance(result_df, pd.DataFrame) or result_df.empty:
+        return
+    if not st.checkbox("✏️ Редактировать карточку", key=f"show_card_editor_{tab_key}", help="Открывает безопасный редактор карточки. Правки сохраняются поверх файла и не пропадают после новой загрузки comparison."):
+        return
+
+    rows = result_df.copy()
+    options = []
+    option_map = {}
+    for _, row in rows.iterrows():
+        art = normalize_text(row.get("article", ""))
+        key = normalize_text(row.get("article_norm", ""))
+        name = normalize_text(row.get("name", ""))
+        label = f"{art} — {name[:120]}"
+        options.append(label)
+        option_map[label] = row
+
+    default_label = options[0] if options else None
+    selected_label = st.selectbox("Позиция для редактирования", options, index=0 if default_label else None, key=f"card_editor_select_{tab_key}")
+    if not selected_label:
+        return
+    row = option_map[selected_label]
+    art = normalize_text(row.get("article", ""))
+    art_norm = normalize_text(row.get("article_norm", ""))
+    current_photo = normalize_text(row.get("photo_url", ""))
+    current_name = normalize_text(row.get("name", ""))
+    current_model = normalize_text(row.get("meta_model", ""))
+    current_code = normalize_text(row.get("meta_manufacturer_code", ""))
+    current_fits = normalize_text(row.get("meta_fits_models", ""))
+    current_note = normalize_text(row.get("manual_note", ""))
+
+    st.caption("Правки сохраняются как ручные overrides и накладываются поверх comparison-файла после каждой новой загрузки.")
+    with st.form(f"card_editor_form_{tab_key}_{art_norm}", clear_on_submit=False):
+        col1, col2 = st.columns([1.2, 1.8])
+        with col1:
+            photo_url = st.text_input("Фото (ссылка)", value=current_photo, key=f"card_edit_photo_{tab_key}_{art_norm}")
+            if current_photo:
+                st.link_button("Открыть текущее фото", current_photo, use_container_width=True)
+        with col2:
+            name_override = st.text_area("Название", value=current_name, height=90, key=f"card_edit_name_{tab_key}_{art_norm}")
+        cmeta1, cmeta2 = st.columns(2)
+        meta_model = cmeta1.text_input("Модель", value=current_model, key=f"card_edit_model_{tab_key}_{art_norm}")
+        meta_code = cmeta2.text_input("Код производителя", value=current_code, key=f"card_edit_code_{tab_key}_{art_norm}")
+        meta_fits = st.text_area("Подходит к моделям", value=current_fits, height=80, key=f"card_edit_fits_{tab_key}_{art_norm}")
+        note = st.text_area("Заметка", value=current_note, height=70, key=f"card_edit_note_{tab_key}_{art_norm}")
+
+        b1, b2 = st.columns(2)
+        save_clicked = b1.form_submit_button("💾 Сохранить карточку", use_container_width=True, type="primary")
+        reset_clicked = b2.form_submit_button("↺ Сбросить ручные правки", use_container_width=True)
+
+    if save_clicked:
+        save_card_override(
+            sheet_name,
+            art,
+            art_norm,
+            {
+                "photo_url": photo_url,
+                "name_override": name_override,
+                "meta_model": meta_model,
+                "meta_manufacturer_code": meta_code,
+                "meta_fits_models": meta_fits,
+                "note": note,
+            },
+        )
+        st.success(f"Карточка {art} сохранена.")
+        st.rerun()
+
+    if reset_clicked:
+        delete_card_override(sheet_name, art_norm)
+        st.success(f"Ручные правки для {art} сброшены.")
+        st.rerun()
+
 def ensure_photo_web_cache_table() -> None:
     path = get_photo_registry_path()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -3194,6 +3437,10 @@ def render_results_table(df: pd.DataFrame, price_mode: str, round100: bool, cust
             badge_html = "<div class='match-badge match-badge-soft'>По названию / бренду</div>"
 
         hot_html = ""
+        manual_note_html = ""
+        manual_note = normalize_text(row.get("manual_note", ""))
+        if manual_note:
+            manual_note_html = f"<div class='manual-note'>{html.escape(manual_note)}</div>"
         if bool(row.get("hot_flag", False)):
             abc = normalize_text(row.get("hot_abc_class", "")).upper()
             sales_pm = safe_float(row.get("hot_sales_per_month"), 0.0)
@@ -3275,6 +3522,7 @@ def render_results_table(df: pd.DataFrame, price_mode: str, round100: bool, cust
                     <div class='name-cell'>{html.escape(str(row['name']))}</div>
                     {badge_html}
                     {hot_html}
+                    {manual_note_html}
                   </div>
                 </div>
               </td>
@@ -3303,6 +3551,7 @@ def render_results_table(df: pd.DataFrame, price_mode: str, round100: bool, cust
       .match-badge-exact {{ background:#e8f7ee; color:#15803d; }}
       .match-badge-linked {{ background:#e8f1ff; color:#1d4ed8; }}
       .match-badge-soft {{ background:#fff4e5; color:#b45309; }}
+      .manual-note {{ margin-top:8px; font-size:12px; color:#475569; background:#f8fafc; border:1px dashed #cbd5e1; padding:6px 8px; border-radius:10px; max-width:560px; }}
       .sale-col {{ font-weight:800; white-space:nowrap; }}
       .selected-col {{ background: linear-gradient(180deg, #f4f8ff 0%, #eef4ff 100%); border-left:1px solid #c7d7ff; border-right:1px solid #c7d7ff; font-weight:900; color:#315efb; white-space:nowrap; }}
       .compare-col {{ min-width:230px; }}
@@ -4588,6 +4837,7 @@ def render_operational_analytics_block(sheet_df: pd.DataFrame, photo_df: pd.Data
         if isinstance(top_df, pd.DataFrame) and not top_df.empty:
             view = top_df[["Артикул", "Название", "Наша цена", "Лучшая цена дистрибьютора", "Лучший поставщик", "Разница, руб", "Разница, %", "Наш остаток", "Остаток дистрибьютора", "Приоритет"]].head(100)
             st.dataframe(view, use_container_width=True, hide_index=True)
+            render_analytics_jump_helper(view, tab_key, "top")
         else:
             st.caption("На текущем листе нет позиций, где рынок дешевле нас.")
 
@@ -4600,6 +4850,7 @@ def render_operational_analytics_block(sheet_df: pd.DataFrame, photo_df: pd.Data
         if isinstance(action_df, pd.DataFrame) and not action_df.empty:
             view = action_df[["Артикул", "Название", "Наш остаток", "Причины", "Объявлений Авито", "Фото", "Шаблон", "Лучший поставщик", "Разница, %"]].head(150)
             st.dataframe(view, use_container_width=True, hide_index=True)
+            render_analytics_jump_helper(view, tab_key, "action")
         else:
             st.caption("Явных проблемных позиций на текущем листе не найдено.")
 
@@ -4629,7 +4880,9 @@ def render_operational_analytics_block(sheet_df: pd.DataFrame, photo_df: pd.Data
             "Как пользоваться: полезно, чтобы не продавать серию обрывками."
         )
         if isinstance(series_df, pd.DataFrame) and not series_df.empty:
-            st.dataframe(series_df.head(100), use_container_width=True, hide_index=True)
+            series_view = series_df.head(100)
+            st.dataframe(series_view, use_container_width=True, hide_index=True)
+            render_analytics_jump_helper(series_view, tab_key, "series")
         else:
             st.caption("На текущем листе не найдено серий, требующих отдельной сводки.")
 
@@ -4691,7 +4944,8 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
         st.session_state[search_widget_key] = ""
         st.session_state[clear_flag_key] = False
 
-    base_sheet_df = sheets.get(sheet_name) if isinstance(sheets, dict) else None
+    base_sheet_raw = sheets.get(sheet_name) if isinstance(sheets, dict) else None
+    base_sheet_df = apply_card_overrides(base_sheet_raw.copy(), sheet_name) if isinstance(base_sheet_raw, pd.DataFrame) else None
     show_photos = bool(st.session_state.get("show_photos_global", True))
     photo_df = st.session_state.get("photo_df")
     source_pairs = get_source_pairs(base_sheet_df) if isinstance(base_sheet_df, pd.DataFrame) else []
@@ -4849,6 +5103,8 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
         st.session_state[result_key] = result_df
     if isinstance(result_df, pd.DataFrame) and show_photos:
         display_result_df = apply_photo_map(result_df, photo_df)
+    if isinstance(display_result_df, pd.DataFrame):
+        display_result_df = apply_card_overrides(display_result_df, sheet_name)
     if isinstance(display_result_df, pd.DataFrame) and isinstance(hot_items_df, pd.DataFrame) and not hot_items_df.empty:
         display_result_df = apply_hot_watchlist(display_result_df, hot_items_df, tab_label=tab_label)
 
@@ -4897,6 +5153,8 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
                     tech = tech[["article", "name", "Наша цена", "Наш склад", "Лучший поставщик", "Лучшая цена", "Фото"]].rename(columns={"article": "Артикул", "name": "Название"})
                 st.dataframe(tech, use_container_width=True, hide_index=True)
 
+            render_card_editor_panel(display_result_df, sheet_name, tab_key)
+
             lazy_c0, lazy_c1, lazy_c2, lazy_c3, lazy_c4, lazy_c5 = st.columns(6)
             lazy_c0.checkbox("Показать шаблоны", key=f"lazy_templates_{tab_key}")
             lazy_c1.checkbox("Показать цены у всех", key=f"lazy_all_prices_{tab_key}")
@@ -4907,6 +5165,8 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
 
             if st.session_state.get(f"lazy_templates_{tab_key}", False):
                 result_enriched_for_templates = apply_photo_map(result_df, photo_df) if isinstance(result_df, pd.DataFrame) else result_df
+                if isinstance(result_enriched_for_templates, pd.DataFrame):
+                    result_enriched_for_templates = apply_card_overrides(result_enriched_for_templates, sheet_name)
                 st.markdown('<div class="result-wrap">', unsafe_allow_html=True)
                 render_block_header(
                     f"{tab_label} — шаблоны",
