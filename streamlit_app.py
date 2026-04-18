@@ -391,7 +391,12 @@ def build_hot_buy_watchlist_table() -> pd.DataFrame:
 
 
 def render_hot_buy_watchlist_lazy_panel() -> None:
-    if not st.session_state.get("show_hot_buy_watchlist_table", False):
+    global_open = bool(st.session_state.get("show_hot_buy_watchlist_table", False))
+    crm_open = any(
+        bool(v) for k, v in st.session_state.items()
+        if str(k).startswith("crm_show_buy_")
+    )
+    if not (global_open or crm_open):
         return
     buy_df = build_hot_buy_watchlist_table()
     st.markdown('<div class="result-wrap">', unsafe_allow_html=True)
@@ -2469,7 +2474,12 @@ def render_tasks_table_ui(task_df: pd.DataFrame, key_prefix: str, default_sheet:
 
 
 def render_task_center_lazy_panel() -> None:
-    if not st.session_state.get("show_task_center_global", False):
+    global_open = bool(st.session_state.get("show_task_center_global", False))
+    crm_open = any(
+        bool(v) for k, v in st.session_state.items()
+        if str(k).startswith("crm_show_tasks_")
+    )
+    if not (global_open or crm_open):
         return
     counts = task_summary_counts()
     task_df = build_task_view_df()
@@ -5473,9 +5483,6 @@ def render_crm_header_bar(
             key=f"crm_show_tasks_{sheet_name}",
             help="Открывает единый центр задач: новые, активные, просроченные и выполненные.",
         ))
-        st.session_state["show_task_center_global"] = bool(
-            st.session_state.get("show_task_center_global", False) or open_tasks
-        )
         if open_tasks:
             st.session_state["crm_last_active_sheet_for_tasks"] = str(sheet_name)
         st.caption(f"Просрочено: {stats['tasks_overdue']}")
@@ -5486,9 +5493,6 @@ def render_crm_header_bar(
             key=f"crm_show_buy_{sheet_name}",
             help="Открывает ленивую таблицу по ходовым позициям, где поставщик сейчас даёт выгодный вход по цене.",
         ))
-        st.session_state["show_hot_buy_watchlist_table"] = bool(
-            st.session_state.get("show_hot_buy_watchlist_table", False) or open_buy
-        )
         if open_buy:
             st.session_state["crm_last_active_sheet_for_buy"] = str(sheet_name)
         st.caption("Показывает только выгодные позиции")
