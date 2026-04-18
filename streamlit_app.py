@@ -391,10 +391,7 @@ def build_hot_buy_watchlist_table() -> pd.DataFrame:
 
 
 def render_hot_buy_watchlist_lazy_panel() -> None:
-    active_sheet_name = normalize_text(st.session_state.get("active_workspace_sheet_name", ""))
-    header_key = f"crm_show_buy_{active_sheet_name}" if active_sheet_name else ""
-    is_open = bool(st.session_state.get("show_hot_buy_watchlist_table", False)) or bool(st.session_state.get(header_key, False))
-    if not is_open:
+    if not st.session_state.get("show_hot_buy_watchlist_table", False):
         return
     buy_df = build_hot_buy_watchlist_table()
     st.markdown('<div class="result-wrap">', unsafe_allow_html=True)
@@ -2472,10 +2469,7 @@ def render_tasks_table_ui(task_df: pd.DataFrame, key_prefix: str, default_sheet:
 
 
 def render_task_center_lazy_panel() -> None:
-    active_sheet_name = normalize_text(st.session_state.get("active_workspace_sheet_name", ""))
-    header_key = f"crm_show_tasks_{active_sheet_name}" if active_sheet_name else ""
-    is_open = bool(st.session_state.get("show_task_center_global", False)) or bool(st.session_state.get(header_key, False))
-    if not is_open:
+    if not st.session_state.get("show_task_center_global", False):
         return
     counts = task_summary_counts()
     task_df = build_task_view_df()
@@ -3398,51 +3392,90 @@ def build_report_df(
     rows: list[dict[str, Any]] = []
     if df is None or df.empty:
         return pd.DataFrame()
+
     hot_lookup = hot_lookup or {}
+
     for _, row in df.iterrows():
         own_price = safe_float(row.get("sale_price"), 0.0)
         own_qty = safe_float(row.get("free_qty"), 0.0)
         if own_price <= 0:
             continue
-        best = get_best_offer(row, min_qty=min_qty)
-        if not best:
-            continue
-        best_price = safe_float(best.get("price"), 0.0)
-        best_qty = safe_float(best.get("qty"), 0.0)
-        delta = safe_float(best.get("delta"), 0.0)
-        delta_pct = safe_float(best.get("delta_percent"), 0.0)
-        if best_price <= 0 or delta <= 0 or delta_pct < float(threshold_percent):
-            continue
 
         hot_rec = pick_hot_watch_rec(row, hot_lookup) if hot_lookup else None
+        best = get_best_offer(row, min_qty=min_qty)
+
+        best_source = ""
+        best_price = None
+        best_qty = None
+        delta = None
+        delta_pct = None
+        profitable_offer = False
+
+        if best:
+            best_source = normalize_text(best.get("source", ""))
+            best_price_val = safe_float(best.get("price"), 0.0)
+            best_qty_val = safe_float(best.get("qty"), 0.0)
+            delta_val = safe_float(best.get("delta"), 0.0)
+            delta_pct_val = safe_float(best.get("delta_percent"), 0.0)
+
+            if best_price_val > 0:
+                best_price = best_price_val
+            if best_qty_val >= 0:
+                best_qty = best_qty_val
+            delta = delta_val
+            delta_pct = round(delta_pct_val, 2)
+
+            profitable_offer = (
+                best_price_val > 0
+                and delta_val > 0
+                and delta_pct_val >= float(threshold_percent)
+            )
+
+        # Возвращаем старую полезную логику:
+        # строка попадает в отчёт, если она есть в watchlist
+        # ИЛИ если поставщик реально выгоднее нас на нужный порог.
+        if not hot_rec and not profitable_offer:
+            continue
+
+        action_text = ""
+        if hot_rec:
+            action_text, _ = hot_supplier_note(row, best, threshold_pct=35.0)
+        elif profitable_offer:
+            action_text = f"Сейчас можно брать у {best_source}" if best_source else "Сейчас можно брать"
+
         rows.append({
             "Лист": tab_label,
-            "Артикул": row.get("article", ""),
-            "Товар": row.get("name", ""),
+            "Артикул": normalize_text(row.get("article", "")),
+            "Товар": normalize_text(row.get("name", "")),
+            "Ходовая": "Да" if hot_rec else "",
             "Спрос, шт/мес": safe_float((hot_rec or {}).get("sales_per_month"), 0.0) if hot_rec else None,
             "Наша цена": own_price,
             "Наш остаток": own_qty,
-            "Лучший поставщик": best.get("source", ""),
+            "Лучший поставщик": best_source,
             "Цена поставщика": best_price,
             "Остаток поставщика": best_qty,
-            "Ниже нашей цены, %": round(delta_pct, 2),
+            "Ниже нашей цены, %": delta_pct,
             "Дней запаса": safe_float((hot_rec or {}).get("days_of_cover"), 0.0) if hot_rec else None,
             "Приоритет": safe_float((hot_rec or {}).get("priority_score"), 0.0) if hot_rec else None,
-            "Действие": translate_watch_action((hot_rec or {}).get("action_today", ""), threshold_pct=35.0) if hot_rec else "",
+            "Действие": action_text,
             "Разница, руб": delta,
-            "Ходовая": "Да" if hot_rec else "",
         })
+
     if not rows:
         return pd.DataFrame()
+
     out = pd.DataFrame(rows)
+    out["_sort_hot"] = out["Ходовая"].astype(str).eq("Да").astype(int)
     out["_sort_priority"] = pd.to_numeric(out.get("Приоритет"), errors="coerce").fillna(-1.0)
+    out["_sort_gap"] = pd.to_numeric(out.get("Ниже нашей цены, %"), errors="coerce").fillna(-1.0)
+
     out = out.sort_values(
-        ["_sort_priority", "Ниже нашей цены, %", "Разница, руб", "Артикул"],
+        ["_sort_hot", "_sort_priority", "_sort_gap", "Артикул"],
         ascending=[False, False, False, True],
         kind="stable",
-    ).drop(columns=["_sort_priority"]).reset_index(drop=True)
-    return out
+    ).drop(columns=["_sort_hot", "_sort_priority", "_sort_gap"]).reset_index(drop=True)
 
+    return out
 
 def report_to_excel_bytes(df: pd.DataFrame) -> bytes:
     bio = io.BytesIO()
@@ -5356,20 +5389,14 @@ def build_crm_header_stats(
         "without_photo": 0,
         "without_avito": 0,
     }
-
-    task_df = load_task_registry_df()
+    task_df = load_review_tasks_df()
     if isinstance(task_df, pd.DataFrame) and not task_df.empty:
-        sheet_mask = (
-            task_df.get("sheet_name", pd.Series(dtype=object))
-            .fillna("")
-            .map(normalize_text)
-            .eq(normalize_text(sheet_name))
-        )
+        sheet_mask = task_df.get("sheet_name", pd.Series(dtype=object)).fillna("").map(normalize_text).eq(normalize_text(sheet_name))
         task_sheet = task_df.loc[sheet_mask].copy()
         if not task_sheet.empty:
-            effective_status = task_sheet.apply(lambda r: task_effective_status(r), axis=1)
-            stats["tasks_open"] = int(effective_status.isin(["NEW", "ACTIVE", "OVERDUE"]).sum())
-            stats["tasks_overdue"] = int(effective_status.eq("OVERDUE").sum())
+            status_norm = task_sheet.get("status", pd.Series(dtype=object)).fillna("").map(normalize_text).str.upper()
+            stats["tasks_open"] = int(status_norm.isin(["NEW", "ACTIVE", "OVERDUE"]).sum())
+            stats["tasks_overdue"] = int(status_norm.eq("OVERDUE").sum())
 
     hot_buy_df = build_hot_buy_watchlist_table()
     if isinstance(hot_buy_df, pd.DataFrame) and not hot_buy_df.empty and "Лист" in hot_buy_df.columns:
@@ -5404,18 +5431,20 @@ def render_crm_header_bar(
     with c1:
         open_tasks = bool(st.checkbox(
             f"🔔 Задачи ({stats['tasks_open']})",
-            value=bool(st.session_state.get(f"crm_show_tasks_{sheet_name}", st.session_state.get("show_task_center_global", False))),
+            value=bool(st.session_state.get("show_task_center_global", False)),
             key=f"crm_show_tasks_{sheet_name}",
             help="Открывает единый центр задач: новые, активные, просроченные и выполненные.",
         ))
+        st.session_state["show_task_center_global"] = open_tasks
         st.caption(f"Просрочено: {stats['tasks_overdue']}")
     with c2:
         open_buy = bool(st.checkbox(
             f"💸 Можно брать ({stats['can_buy']})",
-            value=bool(st.session_state.get(f"crm_show_buy_{sheet_name}", st.session_state.get("show_hot_buy_watchlist_table", False))),
+            value=bool(st.session_state.get("show_hot_buy_watchlist_table", False)),
             key=f"crm_show_buy_{sheet_name}",
             help="Открывает ленивую таблицу по ходовым позициям, где поставщик сейчас даёт выгодный вход по цене.",
         ))
+        st.session_state["show_hot_buy_watchlist_table"] = open_buy
         st.caption("Показывает только выгодные позиции")
     with c3:
         st.metric("🖼️ Нет фото", stats["without_photo"])
@@ -5481,7 +5510,7 @@ def render_crm_card_center(
     model = normalize_text(row.get("meta_model", ""))
     mcode = normalize_text(row.get("meta_manufacturer_code", ""))
     fits = normalize_text(row.get("meta_fits_models", ""))
-    own_price = get_selected_price_raw(row, price_mode, round100, custom_discount)
+    own_price = safe_float(row.get("sale_price"), 0.0)
     own_stock = parse_qty_generic(row.get("free_qty"))
     best = get_best_offer(row, min_qty=float(st.session_state.get("distributor_min_qty", 1.0)))
     best_source = normalize_text((best or {}).get("source", ""))
@@ -6109,7 +6138,6 @@ else:
     switch_r.checkbox("Показать фото", key="show_photos_global")
 
     active_sheet_name, active_tab_label, active_tab_key = label_to_spec[st.session_state.get("active_workspace_label", "Оригинал")]
-    st.session_state["active_workspace_sheet_name"] = active_sheet_name
     active_sheet_df = sheets.get(active_sheet_name) if isinstance(sheets, dict) else None
     render_crm_header_bar(
         active_sheet_df,
