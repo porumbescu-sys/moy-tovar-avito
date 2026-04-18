@@ -8,7 +8,7 @@ import math
 import re
 import sqlite3
 import hashlib
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
 from collections import Counter, defaultdict
@@ -2136,6 +2136,349 @@ def delete_card_override(sheet_name: str, article_norm: str) -> None:
     clear_card_override_cache()
 
 
+
+def get_task_registry_path() -> Path:
+    try:
+        return Path(__file__).resolve().with_name("review_tasks.sqlite")
+    except NameError:
+        return Path.cwd() / "review_tasks.sqlite"
+
+
+def ensure_task_registry_db() -> None:
+    path = get_task_registry_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS review_tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                article_norm TEXT NOT NULL,
+                article TEXT,
+                sheet_name TEXT,
+                name_snapshot TEXT,
+                created_at TEXT,
+                due_date TEXT,
+                status TEXT,
+                reason TEXT,
+                note TEXT,
+                completed_at TEXT,
+                source TEXT
+            )
+            """
+        )
+        conn.commit()
+
+
+@st.cache_data(ttl=300, max_entries=4)
+def load_task_registry_df() -> pd.DataFrame:
+    path = get_task_registry_path()
+    if not path.exists():
+        return pd.DataFrame(
+            columns=[
+                "id", "article_norm", "article", "sheet_name", "name_snapshot",
+                "created_at", "due_date", "status", "reason", "note", "completed_at", "source"
+            ]
+        )
+    ensure_task_registry_db()
+    with sqlite3.connect(path) as conn:
+        df = pd.read_sql_query("SELECT * FROM review_tasks ORDER BY id DESC", conn)
+    if df.empty:
+        return df
+    text_cols = [
+        "article_norm", "article", "sheet_name", "name_snapshot",
+        "created_at", "due_date", "status", "reason", "note", "completed_at", "source"
+    ]
+    for col in text_cols:
+        if col in df.columns:
+            df[col] = df[col].fillna("").map(normalize_text)
+    return df
+
+
+def clear_task_registry_cache() -> None:
+    try:
+        load_task_registry_df.clear()
+    except Exception:
+        pass
+
+
+def create_review_task(
+    article: str,
+    article_norm: str,
+    sheet_name: str,
+    name_snapshot: str,
+    due_date: Any,
+    reason: str = "",
+    note: str = "",
+    source: str = "manual_review",
+) -> None:
+    ensure_task_registry_db()
+    now = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    due_txt = ""
+    if due_date:
+        try:
+            if hasattr(due_date, "isoformat"):
+                due_txt = due_date.isoformat()
+            else:
+                due_txt = str(due_date)
+        except Exception:
+            due_txt = str(due_date)
+    with sqlite3.connect(get_task_registry_path()) as conn:
+        conn.execute(
+            """
+            INSERT INTO review_tasks (
+                article_norm, article, sheet_name, name_snapshot,
+                created_at, due_date, status, reason, note, completed_at, source
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                normalize_text(article_norm),
+                normalize_text(article),
+                normalize_text(sheet_name),
+                normalize_text(name_snapshot),
+                now,
+                normalize_text(due_txt),
+                "NEW",
+                normalize_text(reason),
+                normalize_text(note),
+                "",
+                normalize_text(source),
+            ),
+        )
+        conn.commit()
+    clear_task_registry_cache()
+
+
+def update_review_task_status(task_id: Any, status: str) -> None:
+    ensure_task_registry_db()
+    task_id = safe_int(task_id, 0)
+    if task_id <= 0:
+        return
+    new_status = normalize_text(status).upper()
+    completed_at = ""
+    if new_status == "DONE":
+        completed_at = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    with sqlite3.connect(get_task_registry_path()) as conn:
+        conn.execute(
+            "UPDATE review_tasks SET status=?, completed_at=? WHERE id=?",
+            (new_status, completed_at, int(task_id)),
+        )
+        conn.commit()
+    clear_task_registry_cache()
+
+
+def task_effective_status(row: dict[str, Any] | pd.Series) -> str:
+    raw_status = normalize_text((row or {}).get("status", "")).upper() if isinstance(row, dict) else normalize_text(row.get("status", "")).upper()
+    due_txt = normalize_text((row or {}).get("due_date", "")) if isinstance(row, dict) else normalize_text(row.get("due_date", ""))
+    if raw_status in {"DONE", "CANCELLED"}:
+        return raw_status
+    if due_txt:
+        try:
+            due_dt = datetime.fromisoformat(due_txt).date()
+            if due_dt < datetime.utcnow().date():
+                return "OVERDUE"
+        except Exception:
+            pass
+    if raw_status == "ACTIVE":
+        return "ACTIVE"
+    return "NEW"
+
+
+def task_status_ru(status: str) -> str:
+    mapping = {
+        "NEW": "Новая",
+        "ACTIVE": "Активная",
+        "OVERDUE": "Просрочена",
+        "DONE": "Выполнена",
+        "CANCELLED": "Отменена",
+    }
+    return mapping.get(normalize_text(status).upper(), normalize_text(status))
+
+
+def build_task_view_df(sheet_filter: str | None = None) -> pd.DataFrame:
+    df = load_task_registry_df()
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return pd.DataFrame(
+            columns=[
+                "ID", "Артикул", "Название", "Лист", "Создана", "Срок",
+                "Статус", "Причина", "Комментарий", "Источник"
+            ]
+        )
+    work = df.copy()
+    work["effective_status"] = work.apply(lambda r: task_effective_status(r), axis=1)
+    if sheet_filter and normalize_text(sheet_filter):
+        work = work[work.get("sheet_name", pd.Series(dtype=object)).fillna("").map(normalize_text).eq(normalize_text(sheet_filter))]
+    work["ID"] = pd.to_numeric(work.get("id", 0), errors="coerce").fillna(0).astype(int)
+    work["Артикул"] = work.get("article", "")
+    work["Название"] = work.get("name_snapshot", "")
+    work["Лист"] = work.get("sheet_name", "")
+    work["Создана"] = work.get("created_at", "")
+    work["Срок"] = work.get("due_date", "")
+    work["Статус"] = work["effective_status"].map(task_status_ru)
+    work["Причина"] = work.get("reason", "")
+    work["Комментарий"] = work.get("note", "")
+    work["Источник"] = work.get("source", "")
+    return work[["ID", "Артикул", "Название", "Лист", "Создана", "Срок", "Статус", "Причина", "Комментарий", "Источник"]].copy()
+
+
+def task_summary_counts() -> dict[str, int]:
+    df = load_task_registry_df()
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return {"new": 0, "active": 0, "overdue": 0, "done": 0, "open": 0}
+    eff = [task_effective_status(r) for _, r in df.iterrows()]
+    return {
+        "new": sum(1 for x in eff if x == "NEW"),
+        "active": sum(1 for x in eff if x == "ACTIVE"),
+        "overdue": sum(1 for x in eff if x == "OVERDUE"),
+        "done": sum(1 for x in eff if x == "DONE"),
+        "open": sum(1 for x in eff if x in {"NEW", "ACTIVE", "OVERDUE"}),
+    }
+
+
+def tasks_summary_text() -> str:
+    c = task_summary_counts()
+    if c["open"] <= 0:
+        return "Задач нет"
+    return f"новых: {c['new']} • активных: {c['active']} • просрочено: {c['overdue']}"
+
+
+def trigger_search_from_task(article: str, sheet_label: str) -> None:
+    sheet_label = normalize_text(sheet_label) or "Оригинал"
+    mapping = {"Оригинал": "original", "Уценка": "discount", "Совместимые": "compatible"}
+    if sheet_label in mapping:
+        st.session_state["active_workspace_label"] = sheet_label
+        trigger_search_from_article(article, mapping[sheet_label])
+    else:
+        trigger_search_from_article(article, st.session_state.get("active_workspace_label", "original"))
+
+
+def apply_task_filters(task_df: pd.DataFrame, status_filter: str, period_filter: str, sheet_filter: str) -> pd.DataFrame:
+    if not isinstance(task_df, pd.DataFrame) or task_df.empty:
+        return pd.DataFrame(columns=task_df.columns if isinstance(task_df, pd.DataFrame) else [])
+    out = task_df.copy()
+
+    if sheet_filter and sheet_filter != "Все листы":
+        out = out[out["Лист"].astype(str) == sheet_filter]
+
+    if status_filter == "Новые":
+        out = out[out["Статус"].eq("Новая")]
+    elif status_filter == "Активные":
+        out = out[out["Статус"].eq("Активная")]
+    elif status_filter == "Просроченные":
+        out = out[out["Статус"].eq("Просрочена")]
+    elif status_filter == "Выполненные":
+        out = out[out["Статус"].eq("Выполнена")]
+    elif status_filter == "Не выполненные":
+        out = out[~out["Статус"].isin(["Выполнена", "Отменена"])]
+
+    today = datetime.utcnow().date()
+    if period_filter and period_filter != "Все":
+        due = pd.to_datetime(out["Срок"], errors="coerce").dt.date
+        if period_filter == "Сегодня":
+            out = out[due == today]
+        elif period_filter == "7 дней":
+            out = out[(due.notna()) & (due >= today) & (due <= (today + timedelta(days=7)))]
+        elif period_filter == "14 дней":
+            out = out[(due.notna()) & (due >= today) & (due <= (today + timedelta(days=14)))]
+        elif period_filter == "30 дней":
+            out = out[(due.notna()) & (due >= today) & (due <= (today + timedelta(days=30)))]
+        elif period_filter == "Просроченные":
+            out = out[out["Статус"].eq("Просрочена")]
+    return out
+
+
+def render_tasks_table_ui(task_df: pd.DataFrame, key_prefix: str, default_sheet: str | None = None) -> None:
+    if not isinstance(task_df, pd.DataFrame) or task_df.empty:
+        st.info("Задач пока нет.")
+        return
+
+    filters = st.columns([1.25, 1.25, 1.2])
+    status_filter = filters[0].selectbox(
+        "Статус",
+        ["Все", "Новые", "Активные", "Просроченные", "Выполненные", "Не выполненные"],
+        key=f"task_status_filter_{key_prefix}",
+        help="Фильтрует задачи по статусу: новые, активные, просроченные, выполненные или все сразу.",
+    )
+    period_filter = filters[1].selectbox(
+        "Период",
+        ["Все", "Сегодня", "7 дней", "14 дней", "30 дней", "Просроченные"],
+        key=f"task_period_filter_{key_prefix}",
+        help="Фильтр по сроку задачи: на сегодня, на ближайшие дни или только просроченные.",
+    )
+    sheet_options = ["Все листы"] + sorted([x for x in task_df["Лист"].fillna("").astype(str).unique().tolist() if str(x).strip()])
+    default_index = sheet_options.index(default_sheet) if default_sheet in sheet_options else 0
+    sheet_filter = filters[2].selectbox(
+        "Лист",
+        sheet_options,
+        index=default_index,
+        key=f"task_sheet_filter_{key_prefix}",
+        help="Ограничивает список задач выбранным листом: Оригинал, Уценка или Совместимые.",
+    )
+
+    st.caption(
+        "Статус — показывает, на каком этапе задача. "
+        "Период — помогает увидеть срочные и просроченные задачи. "
+        "Лист — ограничивает список выбранным разделом comparison."
+    )
+
+    filtered = apply_task_filters(task_df, status_filter, period_filter, sheet_filter)
+    if filtered.empty:
+        st.info("По выбранным фильтрам задач не найдено.")
+        return
+
+    st.dataframe(filtered, use_container_width=True, hide_index=True, height=min(520, 120 + len(filtered) * 36))
+
+    labels = []
+    row_map = {}
+    for _, row in filtered.iterrows():
+        label = f"{row['Артикул']} • {row['Статус']} • срок: {row['Срок'] or '—'}"
+        labels.append(label)
+        row_map[label] = row
+    pick_col, b1, b2, b3 = st.columns([4, 1.1, 1.1, 1.1])
+    selected = pick_col.selectbox(
+        "Открыть или изменить задачу",
+        labels,
+        key=f"task_selected_{key_prefix}",
+        help="Выбери задачу, чтобы открыть карточку товара или сменить статус.",
+    )
+    if not selected:
+        return
+    row = row_map[selected]
+    if b1.button("Открыть", key=f"task_open_{key_prefix}", use_container_width=True):
+        trigger_search_from_task(str(row.get("Артикул", "")), str(row.get("Лист", "")))
+    if b2.button("Выполнено", key=f"task_done_{key_prefix}", use_container_width=True):
+        update_review_task_status(row.get("ID", 0), "DONE")
+        st.success(f"Задача по {row.get('Артикул', '')} отмечена как выполненная.")
+        st.rerun()
+    if b3.button("Активировать", key=f"task_active_{key_prefix}", use_container_width=True):
+        update_review_task_status(row.get("ID", 0), "ACTIVE")
+        st.success(f"Задача по {row.get('Артикул', '')} переведена в активные.")
+        st.rerun()
+
+
+def render_task_center_lazy_panel() -> None:
+    if not st.session_state.get("show_task_center_global", False):
+        return
+    counts = task_summary_counts()
+    task_df = build_task_view_df()
+    st.markdown('<div class="result-wrap">', unsafe_allow_html=True)
+    render_block_header(
+        "Задачи / напоминания",
+        "Список задач по карточкам: что проверить, к какому сроку и по какой причине.",
+        icon="🔔",
+        help_text="Это отдельный слой задач поверх карточек. Задачи не меняют comparison-файл и не пропадают при загрузке нового файла.",
+    )
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Открытых задач", counts.get("open", 0))
+    m2.metric("Новые", counts.get("new", 0))
+    m3.metric("Активные", counts.get("active", 0))
+    m4.metric("Просроченные", counts.get("overdue", 0))
+    st.caption(
+        "Что показывает: задачи на пересмотр карточек и цен. "
+        "Как пользоваться: смотри срочные задачи, открывай карточку и после проверки отмечай задачу выполненной."
+    )
+    render_tasks_table_ui(task_df, "global_tasks")
+    st.markdown('</div>', unsafe_allow_html=True)
+
 def apply_card_overrides(df: pd.DataFrame | None, sheet_name: str) -> pd.DataFrame | None:
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         return df
@@ -2270,6 +2613,33 @@ def render_card_editor_panel(result_df: pd.DataFrame | None, sheet_name: str, ta
         meta_fits = st.text_area("Подходит к моделям", value=current_fits, height=80, key=f"card_edit_fits_{tab_key}_{art_norm}")
         note = st.text_area("Заметка", value=current_note, height=70, key=f"card_edit_note_{tab_key}_{art_norm}")
 
+        st.markdown("### 🔔 Напоминание / задача")
+        st.caption("Можно создать задачу на пересмотр позиции через несколько дней. Задача сохранится отдельно и не пропадёт после загрузки нового файла.")
+        t1, t2, t3 = st.columns([1.1, 1.4, 1.7])
+        create_task_flag = t1.checkbox(
+            "Создать задачу",
+            key=f"card_edit_make_task_{tab_key}_{art_norm}",
+            help="Создаёт напоминание по этой карточке с датой проверки и комментарием.",
+        )
+        task_due_date = t2.date_input(
+            "Когда проверить",
+            value=(datetime.utcnow().date() + timedelta(days=14)),
+            key=f"card_edit_task_due_{tab_key}_{art_norm}",
+        )
+        task_reason = t3.selectbox(
+            "Причина",
+            ["Пересмотреть цену", "Проверить после правки", "Нет продаж", "Проверить фото/карточку", "Проверить спрос", "Другое"],
+            key=f"card_edit_task_reason_{tab_key}_{art_norm}",
+            help="Коротко описывает, зачем создана задача.",
+        )
+        task_note = st.text_area(
+            "Комментарий к задаче",
+            value="",
+            height=65,
+            key=f"card_edit_task_note_{tab_key}_{art_norm}",
+            placeholder="Например: снизили цену, проверить продажи через 14 дней.",
+        )
+
         b1, b2 = st.columns(2)
         save_clicked = b1.form_submit_button("💾 Сохранить карточку", use_container_width=True, type="primary")
         reset_clicked = b2.form_submit_button("↺ Сбросить ручные правки", use_container_width=True)
@@ -2288,7 +2658,20 @@ def render_card_editor_panel(result_df: pd.DataFrame | None, sheet_name: str, ta
                 "note": note,
             },
         )
+        if create_task_flag:
+            create_review_task(
+                article=art,
+                article_norm=art_norm,
+                sheet_name=sheet_name,
+                name_snapshot=name_override or current_name,
+                due_date=task_due_date,
+                reason=task_reason,
+                note=task_note or note,
+                source="card_editor",
+            )
         st.success(f"Карточка {art} сохранена.")
+        if create_task_flag:
+            st.info(f"Задача по {art} создана до {task_due_date}.")
         st.rerun()
 
     if reset_clicked:
@@ -4922,6 +5305,14 @@ def render_operational_analytics_block(sheet_df: pd.DataFrame, photo_df: pd.Data
         else:
             st.caption("Пока нет данных по лучшим поставщикам.")
 
+    with st.expander("8. Задачи / напоминания ❔", expanded=False):
+        st.caption(
+            "Что показывает: задачи по карточкам на пересмотр, проверку или доработку. "
+            "Как пользоваться: открывай карточку из задачи, проверяй позицию и отмечай задачу выполненной."
+        )
+        task_df = build_task_view_df(sheet_name)
+        render_tasks_table_ui(task_df, f"analytics_tasks_{tab_key}", default_sheet=sheet_name)
+
     st.download_button(
         "⬇️ Скачать аналитику в Excel",
         analytics_bundle_to_excel_bytes(bundle),
@@ -5372,7 +5763,8 @@ else:
     if "active_workspace_label" not in st.session_state:
         st.session_state["active_workspace_label"] = "Оригинал"
 
-    switch_l, switch_r = st.columns([4, 1.25])
+    task_counts = task_summary_counts()
+    switch_l, switch_m, switch_r = st.columns([3.2, 1.25, 1.25])
     switch_l.radio(
         "Раздел",
         options=[label for _, label, _ in tab_specs],
@@ -5380,9 +5772,15 @@ else:
         horizontal=True,
         label_visibility="collapsed",
     )
+    switch_m.checkbox(
+        f"🔔 Задачи ({task_counts.get('open', 0)})",
+        key="show_task_center_global",
+        help="Открывает ленивый список задач и напоминаний по карточкам. Пока чекбокс выключен, список не строится.",
+    )
     switch_r.checkbox("Показать фото", key="show_photos_global")
 
     active_sheet_name, active_tab_label, active_tab_key = label_to_spec[st.session_state.get("active_workspace_label", "Оригинал")]
+    render_task_center_lazy_panel()
     render_hot_buy_watchlist_lazy_panel()
     render_sheet_workspace(active_sheet_name, active_tab_label, active_tab_key)
 
