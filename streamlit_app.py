@@ -5409,25 +5409,43 @@ def build_crm_header_stats(
         "without_photo": 0,
         "without_avito": 0,
     }
-    task_df = load_review_tasks_df()
-    if isinstance(task_df, pd.DataFrame) and not task_df.empty:
-        sheet_mask = task_df.get("sheet_name", pd.Series(dtype=object)).fillna("").map(normalize_text).eq(normalize_text(sheet_name))
-        task_sheet = task_df.loc[sheet_mask].copy()
-        if not task_sheet.empty:
-            status_norm = task_sheet.get("status", pd.Series(dtype=object)).fillna("").map(normalize_text).str.upper()
-            stats["tasks_open"] = int(status_norm.isin(["NEW", "ACTIVE", "OVERDUE"]).sum())
-            stats["tasks_overdue"] = int(status_norm.eq("OVERDUE").sum())
 
-    hot_buy_df = build_hot_buy_watchlist_table()
-    if isinstance(hot_buy_df, pd.DataFrame) and not hot_buy_df.empty and "Лист" in hot_buy_df.columns:
-        stats["can_buy"] = int((hot_buy_df["Лист"].fillna("").astype(str) == tab_label).sum())
+    try:
+        task_df = load_task_registry_df()
+        if isinstance(task_df, pd.DataFrame) and not task_df.empty:
+            sheet_mask = (
+                task_df.get("sheet_name", pd.Series(dtype=object))
+                .fillna("")
+                .map(normalize_text)
+                .eq(normalize_text(sheet_name))
+            )
+            task_sheet = task_df.loc[sheet_mask].copy()
+            if not task_sheet.empty:
+                effective_status = task_sheet.apply(lambda r: task_effective_status(r), axis=1)
+                stats["tasks_open"] = int(effective_status.isin(["NEW", "ACTIVE", "OVERDUE"]).sum())
+                stats["tasks_overdue"] = int(effective_status.eq("OVERDUE").sum())
+    except Exception as exc:
+        log_operation(f"CRM header: не удалось посчитать задачи ({normalize_text(exc)})", "warning")
 
-    if isinstance(sheet_df, pd.DataFrame) and not sheet_df.empty:
-        registry_df = load_avito_registry_df()
-        bundle = build_operational_analytics_bundle(sheet_df, photo_df, avito_df, registry_df, float(min_qty), str(tab_label))
-        quality = bundle.get("quality", {}) if isinstance(bundle, dict) else {}
-        stats["without_photo"] = int(quality.get("without_photo", 0) or 0)
-        stats["without_avito"] = int(quality.get("in_price_not_in_avito", 0) or 0)
+    try:
+        hot_buy_df = build_hot_buy_watchlist_table()
+        if isinstance(hot_buy_df, pd.DataFrame) and not hot_buy_df.empty and "Лист" in hot_buy_df.columns:
+            stats["can_buy"] = int((hot_buy_df["Лист"].fillna("").astype(str) == str(tab_label)).sum())
+    except Exception as exc:
+        log_operation(f"CRM header: не удалось посчитать 'можно брать' ({normalize_text(exc)})", "warning")
+
+    try:
+        if isinstance(sheet_df, pd.DataFrame) and not sheet_df.empty:
+            registry_df = load_avito_registry_df()
+            bundle = build_operational_analytics_bundle(
+                sheet_df, photo_df, avito_df, registry_df, float(min_qty), str(tab_label)
+            )
+            quality = bundle.get("quality", {}) if isinstance(bundle, dict) else {}
+            stats["without_photo"] = int(quality.get("without_photo", 0) or 0)
+            stats["without_avito"] = int(quality.get("in_price_not_in_avito", 0) or 0)
+    except Exception as exc:
+        log_operation(f"CRM header: не удалось посчитать аналитику ({normalize_text(exc)})", "warning")
+
     return stats
 
 
@@ -5451,20 +5469,28 @@ def render_crm_header_bar(
     with c1:
         open_tasks = bool(st.checkbox(
             f"🔔 Задачи ({stats['tasks_open']})",
-            value=bool(st.session_state.get("show_task_center_global", False)),
+            value=bool(st.session_state.get(f"crm_show_tasks_{sheet_name}", False)),
             key=f"crm_show_tasks_{sheet_name}",
             help="Открывает единый центр задач: новые, активные, просроченные и выполненные.",
         ))
-        st.session_state["show_task_center_global"] = open_tasks
+        st.session_state["show_task_center_global"] = bool(
+            st.session_state.get("show_task_center_global", False) or open_tasks
+        )
+        if open_tasks:
+            st.session_state["crm_last_active_sheet_for_tasks"] = str(sheet_name)
         st.caption(f"Просрочено: {stats['tasks_overdue']}")
     with c2:
         open_buy = bool(st.checkbox(
             f"💸 Можно брать ({stats['can_buy']})",
-            value=bool(st.session_state.get("show_hot_buy_watchlist_table", False)),
+            value=bool(st.session_state.get(f"crm_show_buy_{sheet_name}", False)),
             key=f"crm_show_buy_{sheet_name}",
             help="Открывает ленивую таблицу по ходовым позициям, где поставщик сейчас даёт выгодный вход по цене.",
         ))
-        st.session_state["show_hot_buy_watchlist_table"] = open_buy
+        st.session_state["show_hot_buy_watchlist_table"] = bool(
+            st.session_state.get("show_hot_buy_watchlist_table", False) or open_buy
+        )
+        if open_buy:
+            st.session_state["crm_last_active_sheet_for_buy"] = str(sheet_name)
         st.caption("Показывает только выгодные позиции")
     with c3:
         st.metric("🖼️ Нет фото", stats["without_photo"])
