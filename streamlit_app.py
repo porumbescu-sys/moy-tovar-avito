@@ -338,23 +338,6 @@ def hot_watchlist_summary_text() -> str:
     ab_count = int(hot_df.get("abc_class", pd.Series(dtype=object)).fillna("").map(normalize_text).isin(["A", "B"]).sum())
     return f"Ходовых: {len(hot_df)} • сильный спрос: {ab_count} • можно брать: {buy_count}"
 
-
-def hot_supplier_note(row: pd.Series | dict | None, best: dict | None, threshold_pct: float = 35.0) -> tuple[str, str]:
-    help_text = "Товар ходовой → товар хорошо продавался за выбранный период"
-    if not best:
-        help_text += f"\nСейчас брать невыгодно → нет поставщика с ценой минимум на {threshold_pct:.0f}% ниже нашей цены"
-        return "Сейчас брать невыгодно", help_text
-
-    source = normalize_text((best or {}).get("source", ""))
-    delta_pct = safe_float((best or {}).get("delta_percent"), 0.0)
-    if delta_pct >= float(threshold_pct):
-        action_text = f"Сейчас можно брать у {source}" if source else "Сейчас можно брать"
-        help_text += f"\nСейчас можно брать → лучший поставщик сейчас минимум на {threshold_pct:.0f}% дешевле нашей цены"
-        return action_text, help_text
-
-    help_text += f"\nСейчас брать невыгодно → нет поставщика с ценой минимум на {threshold_pct:.0f}% ниже нашей цены"
-    return "Сейчас брать невыгодно", help_text
-
 def load_persisted_watchlist_source_into_state() -> bool:
     target = get_persisted_watchlist_file_path()
     if not target.exists():
@@ -3019,6 +3002,13 @@ def render_results_table(df: pd.DataFrame, price_mode: str, round100: bool, cust
                 "B": "Спрос хороший",
                 "C": "Спрос умеренный",
             }
+            action_map = {
+                "BUY": "Сейчас можно брать",
+                "WATCH": "Сейчас брать невыгодно",
+                "RESTOCK": "Нужно пополнить",
+                "NO_MATCH_IN_COMPARISON": "Нет совпадения в comparison",
+            }
+
             primary = "🔥 Товар ходовой"
             note_parts = []
             if abc:
@@ -3027,7 +3017,12 @@ def render_results_table(df: pd.DataFrame, price_mode: str, round100: bool, cust
                 note_parts.append(f"≈ {sales_pm:.1f} шт/мес")
             note = " • ".join(note_parts)
 
-            action_text, _hot_help = hot_supplier_note(row, best, threshold_pct=35.0)
+            action_text = action_map.get(action_today, "")
+            if buy_signal == "BUY":
+                action_text = "Сейчас можно брать"
+            elif not action_text:
+                action_text = "Сейчас брать невыгодно"
+
             action_html = f"<div class='hot-sub-badge'>{html.escape(action_text)}</div>" if action_text else ""
             hot_html = f"<div class='hot-badge'>{html.escape(primary)}</div>{('<div class="hot-meta">' + html.escape(note) + '</div>') if note else ''}{action_html}"
 
@@ -3253,10 +3248,10 @@ def render_results_insight_dashboard(result_df: pd.DataFrame, compare_map: dict[
         hot_label = "Товар ходовой"
         if hot_buy_count > 0:
             hot_note = "Сейчас можно брать"
-            hot_help += "\nСейчас можно брать → лучший поставщик сейчас минимум на 35% дешевле нашей цены"
+            hot_help += "\nСейчас можно брать → лучший поставщик сейчас заметно дешевле нашей цены"
         else:
             hot_note = "Сейчас брать невыгодно"
-            hot_help += "\nСейчас брать невыгодно → нет поставщика с ценой минимум на 35% ниже нашей цены"
+            hot_help += "\nСейчас брать невыгодно → лучший поставщик сейчас не дешевле нашей цены"
     cards = [
         ("🔎", "Найдено позиций", str(found_count), "Сколько строк вошло в текущий поиск", ""),
         ("💚", "Есть цена лучше", str(better_rows), "Сколько позиций реально дешевле у поставщиков", ""),
@@ -3264,13 +3259,10 @@ def render_results_insight_dashboard(result_df: pd.DataFrame, compare_map: dict[
         ("🔥", hot_label, str(hot_count), hot_note, hot_help),
         ("🧩", "Источников найдено", str(len(source_pairs)), ", ".join([x["source"] for x in source_pairs]) if source_pairs else "Нет колонок источников", ""),
     ]
-    html_parts = []
-    for icon, label, value, note, help_text in cards:
-        help_html = f"<span class='insight-help' title='{html.escape(help_text)}'>?</span>" if help_text else ""
-        html_parts.append(
-            f"<div class='insight-card'><div class='insight-top'><span class='insight-icon'>{icon}</span><span class='insight-label'>{label}</span>{help_html}</div><div class='insight-value'>{value}</div><div class='insight-note'>{note}</div></div>"
-        )
-    html_cards = "".join(html_parts)
+    html_cards = "".join(
+        f"<div class='insight-card'><div class='insight-top'><span class='insight-icon'>{icon}</span><span class='insight-label'>{label}</span>{(f\"<span class='insight-help' title='{html.escape(help_text)}'>?</span>\" if help_text else '')}</div><div class='insight-value'>{value}</div><div class='insight-note'>{note}</div></div>"
+        for icon, label, value, note, help_text in cards
+    )
     st.markdown(f"<div class='insight-grid'>{html_cards}</div>", unsafe_allow_html=True)
 
 
@@ -4960,22 +4952,5 @@ def hot_watchlist_summary_text() -> str:
     buy_count = int((hot_df.get("buy_signal_30pct", pd.Series(dtype=object)).fillna("").map(normalize_text).str.upper() == "BUY").sum())
     ab_count = int(hot_df.get("abc_class", pd.Series(dtype=object)).fillna("").map(normalize_text).isin(["A", "B"]).sum())
     return f"Ходовых: {len(hot_df)} • сильный спрос: {ab_count} • можно брать: {buy_count}"
-
-
-def hot_supplier_note(row: pd.Series | dict | None, best: dict | None, threshold_pct: float = 35.0) -> tuple[str, str]:
-    help_text = "Товар ходовой → товар хорошо продавался за выбранный период"
-    if not best:
-        help_text += f"\nСейчас брать невыгодно → нет поставщика с ценой минимум на {threshold_pct:.0f}% ниже нашей цены"
-        return "Сейчас брать невыгодно", help_text
-
-    source = normalize_text((best or {}).get("source", ""))
-    delta_pct = safe_float((best or {}).get("delta_percent"), 0.0)
-    if delta_pct >= float(threshold_pct):
-        action_text = f"Сейчас можно брать у {source}" if source else "Сейчас можно брать"
-        help_text += f"\nСейчас можно брать → лучший поставщик сейчас минимум на {threshold_pct:.0f}% дешевле нашей цены"
-        return action_text, help_text
-
-    help_text += f"\nСейчас брать невыгодно → нет поставщика с ценой минимум на {threshold_pct:.0f}% ниже нашей цены"
-    return "Сейчас брать невыгодно", help_text
 
 
