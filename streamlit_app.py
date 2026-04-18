@@ -2248,6 +2248,19 @@ def create_review_task(
     clear_task_registry_cache()
 
 
+def safe_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None:
+            return int(default)
+        if isinstance(value, bool):
+            return int(value)
+        text_value = str(value).strip()
+        if not text_value:
+            return int(default)
+        return int(float(text_value.replace(",", ".")))
+    except Exception:
+        return int(default)
+
 def update_review_task_status(task_id: Any, status: str) -> None:
     ensure_task_registry_db()
     task_id = safe_int(task_id, 0)
@@ -2415,7 +2428,7 @@ def render_tasks_table_ui(task_df: pd.DataFrame, key_prefix: str, default_sheet:
     )
 
     st.caption(
-        "Статус — показывает, на каком этапе задача. "
+        "Статус — показывает, на каком этапе задача: новая, активная, просроченная или выполненная. "
         "Период — помогает увидеть срочные и просроченные задачи. "
         "Лист — ограничивает список выбранным разделом comparison."
     )
@@ -2438,7 +2451,7 @@ def render_tasks_table_ui(task_df: pd.DataFrame, key_prefix: str, default_sheet:
         "Открыть или изменить задачу",
         labels,
         key=f"task_selected_{key_prefix}",
-        help="Выбери задачу, чтобы открыть карточку товара или сменить статус.",
+        help="Выбери задачу, чтобы открыть карточку товара, отметить её выполненной или вернуть в работу.",
     )
     if not selected:
         return
@@ -2449,9 +2462,9 @@ def render_tasks_table_ui(task_df: pd.DataFrame, key_prefix: str, default_sheet:
         update_review_task_status(row.get("ID", 0), "DONE")
         st.success(f"Задача по {row.get('Артикул', '')} отмечена как выполненная.")
         st.rerun()
-    if b3.button("Активировать", key=f"task_active_{key_prefix}", use_container_width=True):
+    if b3.button("Вернуть в работу", key=f"task_active_{key_prefix}", use_container_width=True):
         update_review_task_status(row.get("ID", 0), "ACTIVE")
-        st.success(f"Задача по {row.get('Артикул', '')} переведена в активные.")
+        st.success(f"Задача по {row.get('Артикул', '')} возвращена в работу.")
         st.rerun()
 
 
