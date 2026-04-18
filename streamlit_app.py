@@ -363,6 +363,7 @@ def build_hot_buy_watchlist_table() -> pd.DataFrame:
     work = work[
         pd.to_numeric(work.get("our_price_now", 0.0), errors="coerce").fillna(0.0).gt(0)
         & pd.to_numeric(work.get("best_supplier_price_now", 0.0), errors="coerce").fillna(0.0).gt(0)
+        & pd.to_numeric(work.get("best_supplier_stock_now", 0.0), errors="coerce").fillna(0.0).gt(0)
     ].copy()
     if work.empty:
         return pd.DataFrame()
