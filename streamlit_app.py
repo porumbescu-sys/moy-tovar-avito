@@ -4579,7 +4579,7 @@ def render_operational_analytics_block(sheet_df: pd.DataFrame, photo_df: pd.Data
     if isinstance(tasks_df, pd.DataFrame) and not tasks_df.empty:
         st.dataframe(tasks_df, use_container_width=True, hide_index=True)
 
-    with st.expander("1. Приоритет на пересмотр цены", expanded=False):
+    with st.expander("1. Приоритет на пересмотр цены ❔", expanded=False):
         st.caption(
             "Что показывает: где мы дороже рынка и что стоит пересмотреть в первую очередь. "
             "Как считается приоритет: Разница, % × Наш остаток × Количество связанных объявлений Avito (минимум 1). "
@@ -4591,7 +4591,7 @@ def render_operational_analytics_block(sheet_df: pd.DataFrame, photo_df: pd.Data
         else:
             st.caption("На текущем листе нет позиций, где рынок дешевле нас.")
 
-    with st.expander("2. Что лежит и требует вмешательства", expanded=False):
+    with st.expander("2. Что лежит и требует вмешательства ❔", expanded=False):
         st.caption(
             "Что показывает: позиции, где уже есть проблема или задача. "
             "Причины могут быть такие: дорого, нет фото, нет объявления, слабое объявление, давно не обновлялось. "
@@ -4603,7 +4603,7 @@ def render_operational_analytics_block(sheet_df: pd.DataFrame, photo_df: pd.Data
         else:
             st.caption("Явных проблемных позиций на текущем листе не найдено.")
 
-    with st.expander("3. Аналитика по аккаунтам Avito", expanded=False):
+    with st.expander("3. Аналитика по аккаунтам Avito ❔", expanded=False):
         st.caption(
             "Что показывает: как позиции распределены по аккаунтам Avito. "
             "Можно понять, на каком аккаунте больше карточек, где больше позиций без фото и где больше дорогих позиций. "
@@ -4614,7 +4614,7 @@ def render_operational_analytics_block(sheet_df: pd.DataFrame, photo_df: pd.Data
         else:
             st.caption("В Avito пока нет данных по аккаунтам для этого листа.")
 
-    with st.expander("4. Покрытие качества карточек", expanded=False):
+    with st.expander("4. Покрытие качества карточек ❔", expanded=False):
         st.caption(
             "Что показывает: насколько хорошо заполнены карточки товаров на текущем листе. "
             "Здесь видно, сколько позиций с фото, без фото, с моделью, с полем 'подходит к моделям', есть ли Avito и есть ли остаток. "
@@ -4622,7 +4622,7 @@ def render_operational_analytics_block(sheet_df: pd.DataFrame, photo_df: pd.Data
         )
         st.dataframe(quality_df, use_container_width=True, hide_index=True)
 
-    with st.expander("5. Серийная аналитика", expanded=False):
+    with st.expander("5. Серийная аналитика ❔", expanded=False):
         st.caption(
             "Что показывает: серии товаров, где есть несколько связанных артикулов, цветов или вариантов. "
             "Помогает увидеть неполные серии, серии без фото, без Avito или с ценовыми перекосами. "
@@ -4633,7 +4633,7 @@ def render_operational_analytics_block(sheet_df: pd.DataFrame, photo_df: pd.Data
         else:
             st.caption("На текущем листе не найдено серий, требующих отдельной сводки.")
 
-    with st.expander("6. История ручных правок", expanded=False):
+    with st.expander("6. История ручных правок ❔", expanded=False):
         st.caption(
             "Что показывает: журнал ручных изменений цен. "
             "Видно когда меняли, какой артикул, на каком листе, было / стало и источник изменения. "
@@ -4644,7 +4644,7 @@ def render_operational_analytics_block(sheet_df: pd.DataFrame, photo_df: pd.Data
         else:
             st.caption("История ручных правок пока пустая.")
 
-    with st.expander("7. Надёжность источников", expanded=False):
+    with st.expander("7. Надёжность источников ❔", expanded=False):
         st.caption(
             "Что показывает: как часто каждый поставщик оказывался лучшим по цене на текущем листе. "
             "Это не гарантия, а практический индикатор, кого стоит чаще мониторить. "
