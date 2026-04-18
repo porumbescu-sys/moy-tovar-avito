@@ -2248,7 +2248,6 @@ def create_review_task(
     clear_task_registry_cache()
 
 
-
 def safe_int(value: Any, default: int = 0) -> int:
     try:
         if value is None:
@@ -2580,6 +2579,263 @@ def render_analytics_jump_helper(df: pd.DataFrame | None, tab_key: str, box_key:
     if c2.button("Открыть", key=f"analytics_open_btn_{box_key}_{tab_key}", use_container_width=True):
         trigger_search_from_article(selected_article, tab_key)
 
+
+
+
+def compute_crm_strip_metrics_for_sheet(
+    sheet_df: pd.DataFrame | None,
+    photo_df: pd.DataFrame | None,
+    avito_df: pd.DataFrame | None,
+    min_qty: float,
+    sheet_name: str,
+) -> dict[str, int]:
+    metrics = {"no_photo": 0, "no_avito": 0, "can_buy": 0}
+    if not isinstance(sheet_df, pd.DataFrame) or sheet_df.empty:
+        return metrics
+    try:
+        registry_df = load_avito_registry_df()
+        bundle = build_operational_analytics_bundle(sheet_df, photo_df, avito_df, registry_df, min_qty, sheet_name)
+        quality = (bundle or {}).get("quality", {}) if isinstance(bundle, dict) else {}
+        metrics["no_photo"] = int(quality.get("without_photo", 0) or 0)
+        metrics["no_avito"] = int(quality.get("in_price_not_in_avito", 0) or 0)
+    except Exception:
+        pass
+    try:
+        buy_df = build_hot_buy_watchlist_table()
+        if isinstance(buy_df, pd.DataFrame) and not buy_df.empty and "Лист" in buy_df.columns:
+            metrics["can_buy"] = int((buy_df["Лист"].fillna("").astype(str) == str(sheet_name)).sum())
+        elif isinstance(buy_df, pd.DataFrame):
+            metrics["can_buy"] = int(len(buy_df))
+    except Exception:
+        pass
+    return metrics
+
+
+def render_crm_summary_strip(
+    task_counts: dict[str, int],
+    crm_metrics: dict[str, int],
+    active_sheet_label: str,
+) -> None:
+    st.markdown('<div class="result-wrap">', unsafe_allow_html=True)
+    render_block_header(
+        "CRM-центр",
+        f"Быстрый рабочий слой по разделу «{active_sheet_label}»: задачи, сигналы закупки и проблемные зоны. Нажми на нужный блок и переходи сразу к работе.",
+        icon="🧭",
+        help_text="CRM-центр не меняет comparison-файл. Он собирает в одном месте задачи, сигналы закупки и проблемные зоны, чтобы не бегать по странице.",
+    )
+    c1, c2, c3, c4, c5 = st.columns(5)
+    if c1.button(f"🔔 Задачи: {int(task_counts.get('open', 0))}", use_container_width=True, key=f"crm_open_tasks_{active_sheet_label}"):
+        st.session_state["show_task_center_global"] = True
+    c1.caption("Открывает единый центр задач и напоминаний.")
+    c2.metric("Просрочено", int(task_counts.get("overdue", 0) or 0))
+    c2.caption("Сколько задач уже нужно было проверить.")
+    if c3.button(f"💰 Можно брать: {int(crm_metrics.get('can_buy', 0))}", use_container_width=True, key=f"crm_open_buy_{active_sheet_label}"):
+        st.session_state["show_hot_buy_watchlist_table"] = True
+    c3.caption("Позиции, где поставщик сейчас минимум на 35% дешевле нашей цены.")
+    c4.metric("Нет фото", int(crm_metrics.get("no_photo", 0) or 0))
+    c4.caption("Позиции на текущем листе без фото.")
+    c5.metric("Без Avito", int(crm_metrics.get("no_avito", 0) or 0))
+    c5.caption("Позиции текущего листа без объявления в Avito.")
+    st.markdown('</div>', unsafe_allow_html=True)
+
+
+def render_crm_card_center(
+    result_df: pd.DataFrame | None,
+    compare_map: dict[str, Any] | None,
+    avito_df: pd.DataFrame | None,
+    min_qty: float,
+    sheet_name: str,
+    tab_key: str,
+    show_photos: bool = True,
+) -> None:
+    if not isinstance(result_df, pd.DataFrame) or result_df.empty:
+        return
+
+    rows = result_df.copy()
+    options = []
+    row_by_label = {}
+    for _, row in rows.iterrows():
+        art = normalize_text(row.get("article", ""))
+        name = normalize_text(row.get("name", ""))
+        label = f"{art} — {name[:100]}"
+        options.append(label)
+        row_by_label[label] = row
+
+    selected_label = st.selectbox(
+        "Позиция в CRM-центре",
+        options,
+        index=0 if options else None,
+        key=f"crm_card_select_{tab_key}",
+        help="Выбери позицию, чтобы видеть всё важное в одном месте: обзор, цены, Avito и задачи.",
+    )
+    if not selected_label:
+        return
+
+    row = row_by_label[selected_label]
+    article = normalize_text(row.get("article", ""))
+    article_norm = normalize_text(row.get("article_norm", ""))
+    name = normalize_text(row.get("name", ""))
+    photo_url = normalize_text(row.get("photo_url", ""))
+    note_current = normalize_text(row.get("manual_note", ""))
+    meta_model = normalize_text(row.get("meta_model", ""))
+    meta_code = normalize_text(row.get("meta_manufacturer_code", ""))
+    meta_fits = normalize_text(row.get("meta_fits_models", ""))
+    sale_price = safe_float(row.get("sale_price"), 0.0)
+    free_qty = parse_qty_generic(row.get("free_qty"))
+    total_qty = parse_qty_generic(row.get("total_qty"))
+    transit_qty = parse_qty_generic(row.get("transit_qty"))
+    best = get_best_offer(row, min_qty=min_qty)
+    matched_avito = pd.DataFrame()
+    try:
+        registry_df = load_avito_registry_df()
+        merged_avito = combine_avito_sources(avito_df, registry_df)
+        _, avito_index = build_avito_code_index(merged_avito)
+        codes = row.get("row_codes", []) or build_row_compare_codes(article, name)
+        matched = match_avito_candidates_for_codes(avito_index, codes)
+        matched_avito = pd.DataFrame(matched) if matched else pd.DataFrame()
+    except Exception:
+        matched_avito = pd.DataFrame()
+
+    st.markdown('<div class="result-wrap">', unsafe_allow_html=True)
+    render_block_header(
+        "CRM-карточка товара",
+        "Всё важное по выбранной позиции в одном месте: обзор, цены, Avito и заметки/задачи. Старые блоки остаются ниже как вторичный режим.",
+        icon="🗂️",
+        help_text="Это компактный CRM-экран по одной позиции. Здесь удобно быстро понять состояние карточки, сравнить цены и поставить задачу на пересмотр.",
+    )
+
+    t1, t2, t3, t4 = st.tabs(["Обзор", "Цены", "Avito", "Заметки / задачи"])
+
+    with t1:
+        c1, c2 = st.columns([1, 2.2])
+        with c1:
+            if show_photos and photo_url:
+                try:
+                    st.image(photo_url, use_container_width=True)
+                except Exception:
+                    st.caption("Фото не удалось открыть.")
+            else:
+                st.caption("Фото не показано.")
+        with c2:
+            st.markdown(f"### {html.escape(article)}")
+            st.write(name)
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Свободно", fmt_qty(free_qty))
+            m2.metric("Всего", fmt_qty(total_qty))
+            m3.metric("Транзит", fmt_qty(transit_qty))
+            if meta_model:
+                st.write(f"**Модель:** {meta_model}")
+            if meta_code:
+                st.write(f"**Код производителя:** {meta_code}")
+            if meta_fits:
+                st.write(f"**Подходит к моделям:** {meta_fits}")
+            if note_current:
+                st.info(f"**Заметка:** {note_current}")
+
+    with t2:
+        m1, m2 = st.columns(2)
+        m1.metric("Наша цена", fmt_price_with_rub(sale_price))
+        m2.metric("Наш остаток", fmt_qty(free_qty))
+        if best:
+            st.success(
+                f"Лучший поставщик: {normalize_text(best.get('source', ''))} • "
+                f"{fmt_price_with_rub(safe_float(best.get('price'), 0.0))} • "
+                f"остаток {fmt_qty(safe_float(best.get('qty'), 0.0))}"
+            )
+        else:
+            st.caption("Сейчас нет поставщика, который проходит фильтр по остатку.")
+        if compare_map:
+            row_key = str(article_norm or article)
+            offers = compare_map.get(row_key, []) or []
+            if offers:
+                offers_df = pd.DataFrame(offers)
+                if not offers_df.empty:
+                    shown = offers_df.copy()
+                    if "price" in shown.columns:
+                        shown["Цена"] = shown["price"].map(fmt_price)
+                    if "qty" in shown.columns:
+                        shown["Остаток"] = shown["qty"].map(fmt_qty)
+                    if "gap_pct" in shown.columns:
+                        shown["Разница к нам, %"] = shown["gap_pct"].map(lambda x: round(float(x), 2) if pd.notna(x) else "")
+                    cols = [c for c in ["source", "Цена", "Остаток", "Разница к нам, %"] if c in shown.columns]
+                    if cols:
+                        st.dataframe(shown[cols].rename(columns={"source": "Поставщик"}), use_container_width=True, hide_index=True)
+
+    with t3:
+        st.caption("Что показывает: связанные объявления Avito по этой позиции. Как пользоваться: отсюда видно, есть ли объявление, на каком аккаунте оно находится и что нужно доработать.")
+        if isinstance(matched_avito, pd.DataFrame) and not matched_avito.empty:
+            show_cols = [c for c in ["account", "title", "price", "ad_id", "last_changed_at"] if c in matched_avito.columns]
+            shown = matched_avito[show_cols].copy()
+            shown = shown.rename(columns={
+                "account": "Аккаунт",
+                "title": "Название объявления",
+                "price": "Цена",
+                "ad_id": "ID",
+                "last_changed_at": "Последнее изменение",
+            })
+            if "Цена" in shown.columns:
+                shown["Цена"] = shown["Цена"].map(fmt_price)
+            st.dataframe(shown, use_container_width=True, hide_index=True)
+        else:
+            st.info("По этой позиции связанные объявления Avito не найдены.")
+
+    with t4:
+        st.caption("Что показывает: заметка по карточке и задачи на пересмотр. Как пользоваться: заметка — это просто комментарий, задача — отдельное напоминание с датой и статусом.")
+        current_tasks = build_task_view_df(sheet_filter=sheet_name)
+        if isinstance(current_tasks, pd.DataFrame) and not current_tasks.empty:
+            current_tasks = current_tasks[current_tasks["Артикул"].fillna("").astype(str).eq(article)]
+        tleft, tright = st.columns([1.2, 1])
+        with tleft:
+            with st.form(f"crm_note_form_{tab_key}_{article_norm}", clear_on_submit=False):
+                note_new = st.text_area("Заметка", value=note_current, height=90, key=f"crm_note_val_{tab_key}_{article_norm}")
+                save_note = st.form_submit_button("💾 Сохранить заметку", use_container_width=True)
+            if save_note:
+                save_card_override(
+                    sheet_name,
+                    article,
+                    article_norm,
+                    {
+                        "photo_url": photo_url,
+                        "name_override": name,
+                        "meta_model": meta_model,
+                        "meta_manufacturer_code": meta_code,
+                        "meta_fits_models": meta_fits,
+                        "note": note_new,
+                    },
+                )
+                st.success("Заметка сохранена.")
+                st.rerun()
+        with tright:
+            with st.form(f"crm_task_form_{tab_key}_{article_norm}", clear_on_submit=True):
+                due_date = st.date_input("Срок проверки", value=(datetime.utcnow().date() + timedelta(days=14)), key=f"crm_due_{tab_key}_{article_norm}")
+                reason = st.selectbox("Причина", ["Пересмотреть цену", "Проверить после правки", "Нет продаж", "Проверить фото/карточку", "Проверить спрос", "Другое"], key=f"crm_reason_{tab_key}_{article_norm}")
+                task_note = st.text_area("Комментарий", value="", height=70, key=f"crm_task_note_{tab_key}_{article_norm}")
+                create_task = st.form_submit_button("🔔 Создать задачу", use_container_width=True, type="primary")
+            if create_task:
+                create_review_task(
+                    article=article,
+                    article_norm=article_norm,
+                    sheet_name=sheet_name,
+                    name_snapshot=name,
+                    due_date=due_date,
+                    reason=reason,
+                    note=task_note,
+                    source="crm_card",
+                )
+                st.success("Задача создана.")
+                st.session_state["show_task_center_global"] = True
+                st.rerun()
+
+        if isinstance(current_tasks, pd.DataFrame) and not current_tasks.empty:
+            st.markdown("#### Задачи по этой позиции")
+            st.dataframe(
+                current_tasks[["Создана", "Срок", "Статус", "Причина", "Комментарий", "Источник"]],
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.caption("По этой позиции задач пока нет.")
+    st.markdown('</div>', unsafe_allow_html=True)
 
 def render_card_editor_panel(result_df: pd.DataFrame | None, sheet_name: str, tab_key: str) -> None:
     if not isinstance(result_df, pd.DataFrame) or result_df.empty:
@@ -5549,6 +5805,7 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
             compare_map = build_distributor_compare(result_df, min_qty=min_dist_qty)
             render_results_insight_dashboard(display_result_df, compare_map, source_pairs)
             render_results_table(display_result_df.head(200), price_mode, round100, custom_discount, distributor_map=compare_map, show_photos=show_photos)
+            render_crm_card_center(display_result_df.head(200), compare_map, st.session_state.get("avito_df"), min_dist_qty, sheet_name, tab_key, show_photos=show_photos)
             st.download_button(
                 "⬇️ Скачать результаты в Excel",
                 to_excel_bytes(display_result_df, price_mode, round100, custom_discount, min_dist_qty),
@@ -5789,11 +6046,20 @@ else:
     switch_m.checkbox(
         f"🔔 Задачи ({task_counts.get('open', 0)})",
         key="show_task_center_global",
-        help="Открывает ленивый список задач и напоминаний по карточкам. Пока чекбокс выключен, список не строится.",
+        help="Открывает единый центр задач и напоминаний по карточкам. Пока чекбокс выключен, список не строится.",
     )
     switch_r.checkbox("Показать фото", key="show_photos_global")
 
     active_sheet_name, active_tab_label, active_tab_key = label_to_spec[st.session_state.get("active_workspace_label", "Оригинал")]
+    active_sheet_df = sheets.get(active_sheet_name) if isinstance(sheets, dict) else None
+    crm_metrics = compute_crm_strip_metrics_for_sheet(
+        active_sheet_df,
+        st.session_state.get("photo_df"),
+        st.session_state.get("avito_df"),
+        safe_float(st.session_state.get("distributor_min_qty", 1.0), 1.0),
+        active_tab_label,
+    )
+    render_crm_summary_strip(task_counts, crm_metrics, active_tab_label)
     render_task_center_lazy_panel()
     render_hot_buy_watchlist_lazy_panel()
     render_sheet_workspace(active_sheet_name, active_tab_label, active_tab_key)
