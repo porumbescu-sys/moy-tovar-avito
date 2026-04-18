@@ -8,7 +8,7 @@ import math
 import re
 import sqlite3
 import hashlib
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
 from collections import Counter, defaultdict
@@ -184,6 +184,318 @@ def load_persisted_comparison_source_into_state() -> bool:
     except Exception:
         return False
 
+
+def normalize_watchlist_sheet_name(value: Any) -> str:
+    txt = contains_text(value)
+    if "ОРИГИН" in txt or "СРАВН" in txt:
+        return "Оригинал"
+    if "УЦЕН" in txt:
+        return "Уценка"
+    if "СОВМЕСТ" in txt:
+        return "Совместимые"
+    return normalize_text(value)
+
+
+@st.cache_data(show_spinner=False, ttl=3600, max_entries=4)
+def load_hot_watchlist_file(file_name: str, file_bytes: bytes) -> pd.DataFrame:
+    suffix = Path(file_name).suffix.lower()
+    if suffix == ".csv":
+        bio = io.BytesIO(file_bytes)
+        try:
+            raw = pd.read_csv(bio)
+        except UnicodeDecodeError:
+            bio.seek(0)
+            raw = pd.read_csv(bio, encoding="cp1251")
+    else:
+        raw = pd.read_excel(io.BytesIO(file_bytes))
+    raw = raw.dropna(how="all").copy()
+    if raw.empty:
+        return pd.DataFrame(columns=[
+            "watch_article", "watch_key", "watch_name", "current_sheet", "comparison_article",
+            "sales_qty_15m", "sales_per_month", "abc_class", "velocity_band",
+            "best_supplier", "best_supplier_gap_pct", "buy_signal_30pct", "days_of_cover",
+            "priority_score", "action_today", "watch_article_norm", "watch_key_norm",
+            "comparison_article_norm", "match_keys_text",
+        ])
+    raw.columns = [normalize_text(c) for c in raw.columns]
+    rows = []
+    for _, r in raw.iterrows():
+        watch_article = normalize_text(r.get("watch_article", ""))
+        watch_key = normalize_text(r.get("watch_key", ""))
+        watch_name = normalize_text(r.get("watch_name", ""))
+        comparison_article = normalize_text(r.get("comparison_article", ""))
+        keys = unique_preserve_order([
+            normalize_article(watch_article),
+            normalize_article(watch_key),
+            normalize_article(comparison_article),
+        ])
+        if not any(keys):
+            continue
+        rows.append({
+            "watch_article": watch_article,
+            "watch_key": watch_key,
+            "watch_name": watch_name,
+            "current_sheet": normalize_watchlist_sheet_name(r.get("current_sheet", "")),
+            "comparison_article": comparison_article,
+            "sales_qty_15m": safe_float(r.get("sales_qty_15m"), 0.0),
+            "sales_per_month": safe_float(r.get("sales_per_month"), 0.0),
+            "abc_class": normalize_text(r.get("abc_class", "")),
+            "velocity_band": normalize_text(r.get("velocity_band", "")),
+            "ledger_end_qty": safe_float(r.get("ledger_end_qty"), 0.0),
+            "our_price_now": safe_float(r.get("our_price_now"), 0.0),
+            "our_stock_now": safe_float(r.get("our_stock_now"), 0.0),
+            "best_supplier": normalize_text(r.get("best_supplier", "")),
+            "best_supplier_price_now": safe_float(r.get("best_supplier_price_now"), 0.0),
+            "best_supplier_stock_now": safe_float(r.get("best_supplier_stock_now"), 0.0),
+            "best_supplier_gap_pct": safe_float(r.get("best_supplier_gap_pct"), 0.0),
+            "buy_signal_30pct": normalize_text(r.get("buy_signal_30pct", "")),
+            "days_of_cover": safe_float(r.get("days_of_cover"), 0.0),
+            "priority_score": safe_float(r.get("priority_score"), 0.0),
+            "action_today": normalize_text(r.get("action_today", "")),
+            "watch_article_norm": normalize_article(watch_article),
+            "watch_key_norm": normalize_article(watch_key),
+            "comparison_article_norm": normalize_article(comparison_article),
+            "match_keys_text": "|".join([k for k in keys if k]),
+        })
+    out = pd.DataFrame(rows)
+    return out.reset_index(drop=True)
+
+
+def build_hot_watchlist_lookup(hot_df: pd.DataFrame | None, tab_label: str = "") -> dict[str, list[dict[str, Any]]]:
+    if not isinstance(hot_df, pd.DataFrame) or hot_df.empty:
+        return {}
+    work = hot_df.copy()
+    tab_label = normalize_text(tab_label)
+    if tab_label:
+        filtered = work[(work["current_sheet"] == "") | (work["current_sheet"] == tab_label)].copy()
+        if not filtered.empty:
+            work = filtered
+    lookup: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for _, row in work.iterrows():
+        rec = row.to_dict()
+        keys = [normalize_article(x) for x in normalize_text(rec.get("match_keys_text", "")).split("|") if normalize_article(x)]
+        if not keys:
+            continue
+        for key in keys:
+            lookup[key].append(rec)
+    return lookup
+
+
+def pick_hot_watch_rec(row: pd.Series, lookup: dict[str, list[dict[str, Any]]]) -> dict[str, Any] | None:
+    if not lookup:
+        return None
+    candidate_keys = []
+    article_norm = normalize_article(row.get("article_norm", row.get("article", "")))
+    if article_norm:
+        candidate_keys.append(article_norm)
+    row_codes = row.get("row_codes")
+    if isinstance(row_codes, list):
+        candidate_keys.extend([normalize_article(x) for x in row_codes if normalize_article(x)])
+    best = None
+    best_score = -10**18
+    seen = set()
+    for key in candidate_keys:
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        for rec in lookup.get(key, []):
+            score = safe_float(rec.get("priority_score"), 0.0)
+            if normalize_text(rec.get("buy_signal_30pct", "")).upper() == "BUY":
+                score += 100000.0
+            if key == normalize_article(rec.get("comparison_article_norm", "")):
+                score += 1000.0
+            elif key == normalize_article(rec.get("watch_article_norm", "")):
+                score += 500.0
+            if score > best_score:
+                best = rec
+                best_score = score
+    return best
+
+
+def apply_hot_watchlist(df: pd.DataFrame | None, hot_df: pd.DataFrame | None, tab_label: str = "") -> pd.DataFrame | None:
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    if not isinstance(hot_df, pd.DataFrame) or hot_df.empty:
+        return df
+    lookup = build_hot_watchlist_lookup(hot_df, tab_label=tab_label)
+    if not lookup:
+        return df
+    work = df.copy()
+    matches = [pick_hot_watch_rec(row, lookup) for _, row in work.iterrows()]
+    work["hot_flag"] = [bool(m) for m in matches]
+    work["hot_sales_per_month"] = [safe_float((m or {}).get("sales_per_month"), 0.0) for m in matches]
+    work["hot_priority_score"] = [safe_float((m or {}).get("priority_score"), 0.0) for m in matches]
+    work["hot_abc_class"] = [normalize_text((m or {}).get("abc_class", "")) for m in matches]
+    work["hot_velocity_band"] = [normalize_text((m or {}).get("velocity_band", "")) for m in matches]
+    work["hot_action_today"] = [normalize_text((m or {}).get("action_today", "")) for m in matches]
+    work["hot_buy_signal"] = [normalize_text((m or {}).get("buy_signal_30pct", "")) for m in matches]
+    work["hot_best_supplier"] = [normalize_text((m or {}).get("best_supplier", "")) for m in matches]
+    work["hot_best_supplier_gap_pct"] = [safe_float((m or {}).get("best_supplier_gap_pct"), 0.0) for m in matches]
+    work["hot_watch_article"] = [normalize_text((m or {}).get("watch_article", "")) for m in matches]
+    return work
+
+
+
+
+def dataframe_to_excel_bytes(df: pd.DataFrame) -> bytes:
+    out = io.BytesIO()
+    with pd.ExcelWriter(out, engine="openpyxl") as writer:
+        (df if isinstance(df, pd.DataFrame) else pd.DataFrame()).to_excel(writer, index=False, sheet_name="Watchlist")
+    return out.getvalue()
+
+def hot_watchlist_summary_text() -> str:
+    hot_df = st.session_state.get("hot_items_df")
+    if not isinstance(hot_df, pd.DataFrame) or hot_df.empty:
+        return "watchlist не загружен"
+    buy_count = int((hot_df.get("buy_signal_30pct", pd.Series(dtype=object)).fillna("").map(normalize_text).str.upper() == "BUY").sum())
+    ab_count = int(hot_df.get("abc_class", pd.Series(dtype=object)).fillna("").map(normalize_text).isin(["A", "B"]).sum())
+    return f"Ходовых: {len(hot_df)} • сильный спрос: {ab_count} • можно брать: {buy_count}"
+
+def build_hot_buy_watchlist_table() -> pd.DataFrame:
+    hot_df = st.session_state.get("hot_items_df")
+    if not isinstance(hot_df, pd.DataFrame) or hot_df.empty:
+        return pd.DataFrame()
+    work = hot_df.copy()
+    buy_mask = work.get("buy_signal_30pct", pd.Series(dtype=object)).fillna("").map(normalize_text).str.upper().eq("BUY")
+    work = work.loc[buy_mask].copy()
+    if work.empty:
+        return pd.DataFrame()
+    work = work[
+        pd.to_numeric(work.get("our_price_now", 0.0), errors="coerce").fillna(0.0).gt(0)
+        & pd.to_numeric(work.get("best_supplier_price_now", 0.0), errors="coerce").fillna(0.0).gt(0)
+    ].copy()
+    if work.empty:
+        return pd.DataFrame()
+    work["gap_pct_display"] = work.get("best_supplier_gap_pct", pd.Series(dtype=float)).fillna(0.0).map(lambda x: round(float(x) * 100.0, 1))
+    out = pd.DataFrame({
+        "Лист": work.get("current_sheet", ""),
+        "Артикул": work.get("comparison_article", work.get("watch_article", "")),
+        "Товар": work.get("watch_name", ""),
+        "Ходовая": "Да",
+        "Спрос, шт/мес": work.get("sales_per_month", 0.0),
+        "Наша цена": work.get("our_price_now", 0.0),
+        "Наш остаток": work.get("our_stock_now", 0.0),
+        "Лучший поставщик": work.get("best_supplier", ""),
+        "Цена поставщика": work.get("best_supplier_price_now", 0.0),
+        "Остаток поставщика": work.get("best_supplier_stock_now", 0.0),
+        "Ниже нашей цены, %": work.get("gap_pct_display", 0.0),
+        "Дней запаса": work.get("days_of_cover", 0.0),
+        "Приоритет": work.get("priority_score", 0.0),
+        "Действие": [translate_watch_action(x, threshold_pct=35.0) for x in work.get("action_today", "")],
+    })
+    for col in ["Спрос, шт/мес", "Наша цена", "Наш остаток", "Цена поставщика", "Остаток поставщика", "Ниже нашей цены, %", "Дней запаса", "Приоритет"]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+    out = out.sort_values(["Приоритет", "Спрос, шт/мес"], ascending=[False, False], kind="stable").reset_index(drop=True)
+    return out
+
+
+def render_hot_buy_watchlist_lazy_panel() -> None:
+    active_sheet_name = normalize_text(st.session_state.get("active_workspace_sheet_name", ""))
+    header_key = f"crm_show_buy_{active_sheet_name}" if active_sheet_name else ""
+    is_open = bool(st.session_state.get("show_hot_buy_watchlist_table", False)) or bool(st.session_state.get(header_key, False))
+    if not is_open:
+        return
+    buy_df = build_hot_buy_watchlist_table()
+    st.markdown('<div class="result-wrap">', unsafe_allow_html=True)
+    render_block_header(
+        "Ходовые позиции — сейчас можно брать",
+        "Ленивая таблица только по ходовым позициям, где лучший поставщик минимум на 35% дешевле нашей цены.",
+        icon="🔥",
+        help_text="Показывает только ходовые позиции, где лучший поставщик сейчас минимум на 35% дешевле нашей цены. Таблица не грузится, пока чекбокс в блоке Watchlist выключен.",
+    )
+    if buy_df.empty:
+        st.info("Сейчас в watchlist нет позиций, где лучший поставщик минимум на 35% дешевле нашей цены.")
+    else:
+        c1, c2 = st.columns([1.2, 1])
+        c1.metric("Позиций можно брать", len(buy_df))
+        c2.download_button(
+            "⬇️ Скачать таблицу «можно брать» в Excel",
+            dataframe_to_excel_bytes(buy_df),
+            file_name="hot_buy_watchlist.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="download_hot_buy_watchlist",
+            use_container_width=True,
+        )
+
+        f1, f2, f3, f4 = st.columns([1.15, 1.1, 1.2, 1.35])
+        sheet_options = ["Все листы"] + sorted(
+            [x for x in buy_df["Лист"].fillna("").astype(str).unique().tolist() if x.strip()]
+        )
+        selected_sheet = f1.selectbox(
+            "Лист",
+            sheet_options,
+            key="hot_buy_sheet_filter",
+            help="Ограничивает таблицу выбранным листом: Оригинал, Уценка или Совместимые.",
+        )
+        only_hot = f2.checkbox(
+            "Только ходовые",
+            value=True,
+            key="hot_buy_only_hot",
+            help="Показывать только товары с хорошим спросом за выбранный период.",
+        )
+        only_buy = f3.checkbox(
+            "Только можно брать",
+            value=True,
+            key="hot_buy_only_buy",
+            help="Показывать только позиции, где лучший поставщик сейчас минимум на 35% дешевле нашей цены.",
+        )
+        only_attention = f4.checkbox(
+            "Только требует внимания",
+            value=False,
+            key="hot_buy_only_attention",
+            help="Показывать позиции, где кроме выгодной закупки есть ещё действие: пополнить запас, наблюдать или проверить сравнение.",
+        )
+
+        st.caption(
+            "Лист — ограничивает таблицу выбранным разделом. "
+            "Только ходовые — товары с хорошим спросом. "
+            "Только можно брать — позиции, где поставщик сейчас минимум на 35% дешевле нашей цены. "
+            "Только требует внимания — позиции, где кроме выгодной закупки есть ещё действие: пополнить запас, наблюдать или проверить сравнение."
+        )
+
+        filtered_buy_df = buy_df.copy()
+
+        if selected_sheet != "Все листы":
+            filtered_buy_df = filtered_buy_df[filtered_buy_df["Лист"].astype(str) == selected_sheet]
+
+        if only_hot:
+            filtered_buy_df = filtered_buy_df[filtered_buy_df["Ходовая"].astype(str).str.strip().eq("Да")]
+
+        if only_buy:
+            filtered_buy_df = filtered_buy_df[
+                filtered_buy_df["Действие"].fillna("").astype(str).str.contains("Можно брать", regex=False)
+            ]
+
+        if only_attention:
+            filtered_buy_df = filtered_buy_df[
+                filtered_buy_df["Действие"].fillna("").astype(str).str.contains(
+                    "Пополнить запас|Наблюдать|Нет в сравнении", regex=True
+                )
+            ]
+
+        if filtered_buy_df.empty:
+            st.info("По выбранным фильтрам строк не найдено.")
+        else:
+            st.dataframe(filtered_buy_df, use_container_width=True, height=min(640, 80 + len(filtered_buy_df) * 35))
+    st.markdown('</div>', unsafe_allow_html=True)
+
+
+def hot_supplier_note(row: pd.Series | dict | None, best: dict | None, threshold_pct: float = 35.0) -> tuple[str, str]:
+    help_text = "Товар ходовой → товар хорошо продавался за выбранный период"
+    if not best:
+        help_text += f"\nСейчас брать невыгодно → нет поставщика с ценой минимум на {threshold_pct:.0f}% ниже нашей цены"
+        return "Сейчас брать невыгодно", help_text
+
+    source = normalize_text((best or {}).get("source", ""))
+    delta_pct = safe_float((best or {}).get("delta_percent"), 0.0)
+    if delta_pct >= float(threshold_pct):
+        action_text = f"Сейчас можно брать у {source}" if source else "Сейчас можно брать"
+        help_text += f"\nСейчас можно брать → лучший поставщик сейчас минимум на {threshold_pct:.0f}% дешевле нашей цены"
+        return action_text, help_text
+
+    help_text += f"\nСейчас брать невыгодно → нет поставщика с ценой минимум на {threshold_pct:.0f}% ниже нашей цены"
+    return "Сейчас брать невыгодно", help_text
 
 def load_persisted_watchlist_source_into_state() -> bool:
     target = get_persisted_watchlist_file_path()
@@ -1730,6 +2042,662 @@ def ensure_persisted_source_files_loaded() -> None:
 
 
 
+
+
+def get_card_override_path() -> Path:
+    try:
+        return Path(__file__).resolve().with_name("card_overrides.sqlite")
+    except NameError:
+        return Path.cwd() / "card_overrides.sqlite"
+
+
+def ensure_card_override_db() -> None:
+    path = get_card_override_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS card_overrides (
+                sheet_name TEXT NOT NULL,
+                article_norm TEXT NOT NULL,
+                article TEXT,
+                photo_url TEXT,
+                name_override TEXT,
+                meta_model TEXT,
+                meta_manufacturer_code TEXT,
+                meta_fits_models TEXT,
+                note TEXT,
+                updated_at TEXT,
+                PRIMARY KEY (sheet_name, article_norm)
+            )
+            """
+        )
+        conn.commit()
+
+
+@st.cache_data(ttl=1800, max_entries=5)
+def load_card_overrides_df() -> pd.DataFrame:
+    path = get_card_override_path()
+    if not path.exists():
+        return pd.DataFrame()
+    with sqlite3.connect(path) as conn:
+        df = pd.read_sql_query("SELECT * FROM card_overrides", conn)
+    if df.empty:
+        return df
+    for col in ["sheet_name", "article_norm", "article", "photo_url", "name_override", "meta_model", "meta_manufacturer_code", "meta_fits_models", "note", "updated_at"]:
+        if col in df.columns:
+            df[col] = df[col].fillna("").map(normalize_text)
+    return df
+
+
+def clear_card_override_cache() -> None:
+    try:
+        load_card_overrides_df.clear()
+    except Exception:
+        pass
+
+
+def save_card_override(sheet_name: str, article: str, article_norm: str, payload: dict[str, Any]) -> None:
+    ensure_card_override_db()
+    now = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    clean = {k: normalize_text(v) for k, v in (payload or {}).items()}
+    with sqlite3.connect(get_card_override_path()) as conn:
+        conn.execute(
+            """
+            INSERT INTO card_overrides (
+                sheet_name, article_norm, article, photo_url, name_override,
+                meta_model, meta_manufacturer_code, meta_fits_models, note, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(sheet_name, article_norm) DO UPDATE SET
+                article=excluded.article,
+                photo_url=excluded.photo_url,
+                name_override=excluded.name_override,
+                meta_model=excluded.meta_model,
+                meta_manufacturer_code=excluded.meta_manufacturer_code,
+                meta_fits_models=excluded.meta_fits_models,
+                note=excluded.note,
+                updated_at=excluded.updated_at
+            """,
+            (
+                normalize_text(sheet_name), normalize_text(article_norm), normalize_text(article),
+                clean.get("photo_url", ""), clean.get("name_override", ""), clean.get("meta_model", ""),
+                clean.get("meta_manufacturer_code", ""), clean.get("meta_fits_models", ""), clean.get("note", ""), now
+            ),
+        )
+        conn.commit()
+    clear_card_override_cache()
+
+
+def delete_card_override(sheet_name: str, article_norm: str) -> None:
+    ensure_card_override_db()
+    with sqlite3.connect(get_card_override_path()) as conn:
+        conn.execute(
+            "DELETE FROM card_overrides WHERE sheet_name=? AND article_norm=?",
+            (normalize_text(sheet_name), normalize_text(article_norm)),
+        )
+        conn.commit()
+    clear_card_override_cache()
+
+
+
+def get_task_registry_path() -> Path:
+    try:
+        return Path(__file__).resolve().with_name("review_tasks.sqlite")
+    except NameError:
+        return Path.cwd() / "review_tasks.sqlite"
+
+
+def ensure_task_registry_db() -> None:
+    path = get_task_registry_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS review_tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                article_norm TEXT NOT NULL,
+                article TEXT,
+                sheet_name TEXT,
+                name_snapshot TEXT,
+                created_at TEXT,
+                due_date TEXT,
+                status TEXT,
+                reason TEXT,
+                note TEXT,
+                completed_at TEXT,
+                source TEXT
+            )
+            """
+        )
+        conn.commit()
+
+
+@st.cache_data(ttl=300, max_entries=4)
+def load_task_registry_df() -> pd.DataFrame:
+    path = get_task_registry_path()
+    if not path.exists():
+        return pd.DataFrame(
+            columns=[
+                "id", "article_norm", "article", "sheet_name", "name_snapshot",
+                "created_at", "due_date", "status", "reason", "note", "completed_at", "source"
+            ]
+        )
+    ensure_task_registry_db()
+    with sqlite3.connect(path) as conn:
+        df = pd.read_sql_query("SELECT * FROM review_tasks ORDER BY id DESC", conn)
+    if df.empty:
+        return df
+    text_cols = [
+        "article_norm", "article", "sheet_name", "name_snapshot",
+        "created_at", "due_date", "status", "reason", "note", "completed_at", "source"
+    ]
+    for col in text_cols:
+        if col in df.columns:
+            df[col] = df[col].fillna("").map(normalize_text)
+    return df
+
+
+def clear_task_registry_cache() -> None:
+    try:
+        load_task_registry_df.clear()
+    except Exception:
+        pass
+
+
+def create_review_task(
+    article: str,
+    article_norm: str,
+    sheet_name: str,
+    name_snapshot: str,
+    due_date: Any,
+    reason: str = "",
+    note: str = "",
+    source: str = "manual_review",
+) -> None:
+    ensure_task_registry_db()
+    now = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    due_txt = ""
+    if due_date:
+        try:
+            if hasattr(due_date, "isoformat"):
+                due_txt = due_date.isoformat()
+            else:
+                due_txt = str(due_date)
+        except Exception:
+            due_txt = str(due_date)
+    with sqlite3.connect(get_task_registry_path()) as conn:
+        conn.execute(
+            """
+            INSERT INTO review_tasks (
+                article_norm, article, sheet_name, name_snapshot,
+                created_at, due_date, status, reason, note, completed_at, source
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                normalize_text(article_norm),
+                normalize_text(article),
+                normalize_text(sheet_name),
+                normalize_text(name_snapshot),
+                now,
+                normalize_text(due_txt),
+                "NEW",
+                normalize_text(reason),
+                normalize_text(note),
+                "",
+                normalize_text(source),
+            ),
+        )
+        conn.commit()
+    clear_task_registry_cache()
+
+
+def safe_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None:
+            return int(default)
+        if isinstance(value, bool):
+            return int(value)
+        text_value = str(value).strip()
+        if not text_value:
+            return int(default)
+        return int(float(text_value.replace(",", ".")))
+    except Exception:
+        return int(default)
+
+def update_review_task_status(task_id: Any, status: str) -> None:
+    ensure_task_registry_db()
+    task_id = safe_int(task_id, 0)
+    if task_id <= 0:
+        return
+    new_status = normalize_text(status).upper()
+    completed_at = ""
+    if new_status == "DONE":
+        completed_at = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    with sqlite3.connect(get_task_registry_path()) as conn:
+        conn.execute(
+            "UPDATE review_tasks SET status=?, completed_at=? WHERE id=?",
+            (new_status, completed_at, int(task_id)),
+        )
+        conn.commit()
+    clear_task_registry_cache()
+
+
+def task_effective_status(row: dict[str, Any] | pd.Series) -> str:
+    raw_status = normalize_text((row or {}).get("status", "")).upper() if isinstance(row, dict) else normalize_text(row.get("status", "")).upper()
+    due_txt = normalize_text((row or {}).get("due_date", "")) if isinstance(row, dict) else normalize_text(row.get("due_date", ""))
+    if raw_status in {"DONE", "CANCELLED"}:
+        return raw_status
+    if due_txt:
+        try:
+            due_dt = datetime.fromisoformat(due_txt).date()
+            if due_dt < datetime.utcnow().date():
+                return "OVERDUE"
+        except Exception:
+            pass
+    if raw_status == "ACTIVE":
+        return "ACTIVE"
+    return "NEW"
+
+
+def task_status_ru(status: str) -> str:
+    mapping = {
+        "NEW": "Новая",
+        "ACTIVE": "Активная",
+        "OVERDUE": "Просрочена",
+        "DONE": "Выполнена",
+        "CANCELLED": "Отменена",
+    }
+    return mapping.get(normalize_text(status).upper(), normalize_text(status))
+
+
+def build_task_view_df(sheet_filter: str | None = None) -> pd.DataFrame:
+    df = load_task_registry_df()
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return pd.DataFrame(
+            columns=[
+                "ID", "Артикул", "Название", "Лист", "Создана", "Срок",
+                "Статус", "Причина", "Комментарий", "Источник"
+            ]
+        )
+    work = df.copy()
+    work["effective_status"] = work.apply(lambda r: task_effective_status(r), axis=1)
+    if sheet_filter and normalize_text(sheet_filter):
+        work = work[work.get("sheet_name", pd.Series(dtype=object)).fillna("").map(normalize_text).eq(normalize_text(sheet_filter))]
+    work["ID"] = pd.to_numeric(work.get("id", 0), errors="coerce").fillna(0).astype(int)
+    work["Артикул"] = work.get("article", "")
+    work["Название"] = work.get("name_snapshot", "")
+    work["Лист"] = work.get("sheet_name", "")
+    work["Создана"] = work.get("created_at", "")
+    work["Срок"] = work.get("due_date", "")
+    work["Статус"] = work["effective_status"].map(task_status_ru)
+    work["Причина"] = work.get("reason", "")
+    work["Комментарий"] = work.get("note", "")
+    work["Источник"] = work.get("source", "")
+    return work[["ID", "Артикул", "Название", "Лист", "Создана", "Срок", "Статус", "Причина", "Комментарий", "Источник"]].copy()
+
+
+def task_summary_counts() -> dict[str, int]:
+    df = load_task_registry_df()
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return {"new": 0, "active": 0, "overdue": 0, "done": 0, "open": 0}
+    eff = [task_effective_status(r) for _, r in df.iterrows()]
+    return {
+        "new": sum(1 for x in eff if x == "NEW"),
+        "active": sum(1 for x in eff if x == "ACTIVE"),
+        "overdue": sum(1 for x in eff if x == "OVERDUE"),
+        "done": sum(1 for x in eff if x == "DONE"),
+        "open": sum(1 for x in eff if x in {"NEW", "ACTIVE", "OVERDUE"}),
+    }
+
+
+def tasks_summary_text() -> str:
+    c = task_summary_counts()
+    if c["open"] <= 0:
+        return "Задач нет"
+    return f"новых: {c['new']} • активных: {c['active']} • просрочено: {c['overdue']}"
+
+
+def trigger_search_from_task(article: str, sheet_label: str) -> None:
+    sheet_label = normalize_text(sheet_label) or "Оригинал"
+    mapping = {"Оригинал": "original", "Уценка": "discount", "Совместимые": "compatible"}
+    if sheet_label in mapping:
+        st.session_state["active_workspace_label"] = sheet_label
+        trigger_search_from_article(article, mapping[sheet_label])
+    else:
+        trigger_search_from_article(article, st.session_state.get("active_workspace_label", "original"))
+
+
+def apply_task_filters(task_df: pd.DataFrame, status_filter: str, period_filter: str, sheet_filter: str) -> pd.DataFrame:
+    if not isinstance(task_df, pd.DataFrame) or task_df.empty:
+        return pd.DataFrame(columns=task_df.columns if isinstance(task_df, pd.DataFrame) else [])
+    out = task_df.copy()
+
+    if sheet_filter and sheet_filter != "Все листы":
+        out = out[out["Лист"].astype(str) == sheet_filter]
+
+    if status_filter == "Новые":
+        out = out[out["Статус"].eq("Новая")]
+    elif status_filter == "Активные":
+        out = out[out["Статус"].eq("Активная")]
+    elif status_filter == "Просроченные":
+        out = out[out["Статус"].eq("Просрочена")]
+    elif status_filter == "Выполненные":
+        out = out[out["Статус"].eq("Выполнена")]
+    elif status_filter == "Не выполненные":
+        out = out[~out["Статус"].isin(["Выполнена", "Отменена"])]
+
+    today = datetime.utcnow().date()
+    if period_filter and period_filter != "Все":
+        due = pd.to_datetime(out["Срок"], errors="coerce").dt.date
+        if period_filter == "Сегодня":
+            out = out[due == today]
+        elif period_filter == "7 дней":
+            out = out[(due.notna()) & (due >= today) & (due <= (today + timedelta(days=7)))]
+        elif period_filter == "14 дней":
+            out = out[(due.notna()) & (due >= today) & (due <= (today + timedelta(days=14)))]
+        elif period_filter == "30 дней":
+            out = out[(due.notna()) & (due >= today) & (due <= (today + timedelta(days=30)))]
+        elif period_filter == "Просроченные":
+            out = out[out["Статус"].eq("Просрочена")]
+    return out
+
+
+def render_tasks_table_ui(task_df: pd.DataFrame, key_prefix: str, default_sheet: str | None = None) -> None:
+    if not isinstance(task_df, pd.DataFrame) or task_df.empty:
+        st.info("Задач пока нет.")
+        return
+
+    filters = st.columns([1.25, 1.25, 1.2])
+    status_filter = filters[0].selectbox(
+        "Статус",
+        ["Все", "Новые", "Активные", "Просроченные", "Выполненные", "Не выполненные"],
+        key=f"task_status_filter_{key_prefix}",
+        help="Фильтрует задачи по статусу: новые, активные, просроченные, выполненные или все сразу.",
+    )
+    period_filter = filters[1].selectbox(
+        "Период",
+        ["Все", "Сегодня", "7 дней", "14 дней", "30 дней", "Просроченные"],
+        key=f"task_period_filter_{key_prefix}",
+        help="Фильтр по сроку задачи: на сегодня, на ближайшие дни или только просроченные.",
+    )
+    sheet_options = ["Все листы"] + sorted([x for x in task_df["Лист"].fillna("").astype(str).unique().tolist() if str(x).strip()])
+    default_index = sheet_options.index(default_sheet) if default_sheet in sheet_options else 0
+    sheet_filter = filters[2].selectbox(
+        "Лист",
+        sheet_options,
+        index=default_index,
+        key=f"task_sheet_filter_{key_prefix}",
+        help="Ограничивает список задач выбранным листом: Оригинал, Уценка или Совместимые.",
+    )
+
+    st.caption(
+        "Статус — показывает, на каком этапе задача: новая, активная, просроченная или выполненная. "
+        "Период — помогает увидеть срочные и просроченные задачи. "
+        "Лист — ограничивает список выбранным разделом comparison."
+    )
+
+    filtered = apply_task_filters(task_df, status_filter, period_filter, sheet_filter)
+    if filtered.empty:
+        st.info("По выбранным фильтрам задач не найдено.")
+        return
+
+    st.dataframe(filtered, use_container_width=True, hide_index=True, height=min(520, 120 + len(filtered) * 36))
+
+    labels = []
+    row_map = {}
+    for _, row in filtered.iterrows():
+        label = f"{row['Артикул']} • {row['Статус']} • срок: {row['Срок'] or '—'}"
+        labels.append(label)
+        row_map[label] = row
+    pick_col, b1, b2, b3 = st.columns([4, 1.1, 1.1, 1.1])
+    selected = pick_col.selectbox(
+        "Открыть или изменить задачу",
+        labels,
+        key=f"task_selected_{key_prefix}",
+        help="Выбери задачу, чтобы открыть карточку товара, отметить её выполненной или вернуть в работу.",
+    )
+    if not selected:
+        return
+    row = row_map[selected]
+    if b1.button("Открыть", key=f"task_open_{key_prefix}", use_container_width=True):
+        trigger_search_from_task(str(row.get("Артикул", "")), str(row.get("Лист", "")))
+    if b2.button("Выполнено", key=f"task_done_{key_prefix}", use_container_width=True):
+        update_review_task_status(row.get("ID", 0), "DONE")
+        st.success(f"Задача по {row.get('Артикул', '')} отмечена как выполненная.")
+        st.rerun()
+    if b3.button("Вернуть в работу", key=f"task_active_{key_prefix}", use_container_width=True):
+        update_review_task_status(row.get("ID", 0), "ACTIVE")
+        st.success(f"Задача по {row.get('Артикул', '')} возвращена в работу.")
+        st.rerun()
+
+
+def render_task_center_lazy_panel() -> None:
+    active_sheet_name = normalize_text(st.session_state.get("active_workspace_sheet_name", ""))
+    header_key = f"crm_show_tasks_{active_sheet_name}" if active_sheet_name else ""
+    is_open = bool(st.session_state.get("show_task_center_global", False)) or bool(st.session_state.get(header_key, False))
+    if not is_open:
+        return
+    counts = task_summary_counts()
+    task_df = build_task_view_df()
+    st.markdown('<div class="result-wrap">', unsafe_allow_html=True)
+    render_block_header(
+        "Задачи / напоминания",
+        "Список задач по карточкам: что проверить, к какому сроку и по какой причине.",
+        icon="🔔",
+        help_text="Это отдельный слой задач поверх карточек. Задачи не меняют comparison-файл и не пропадают при загрузке нового файла.",
+    )
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Открытых задач", counts.get("open", 0))
+    m2.metric("Новые", counts.get("new", 0))
+    m3.metric("Активные", counts.get("active", 0))
+    m4.metric("Просроченные", counts.get("overdue", 0))
+    st.caption(
+        "Что показывает: задачи на пересмотр карточек и цен. "
+        "Как пользоваться: смотри срочные задачи, открывай карточку и после проверки отмечай задачу выполненной."
+    )
+    render_tasks_table_ui(task_df, "global_tasks")
+    st.markdown('</div>', unsafe_allow_html=True)
+
+def apply_card_overrides(df: pd.DataFrame | None, sheet_name: str) -> pd.DataFrame | None:
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    overrides = load_card_overrides_df()
+    if overrides.empty:
+        return df
+    sheet_name_norm = normalize_text(sheet_name)
+    work = overrides[overrides.get("sheet_name", pd.Series(dtype=object)).fillna("").map(normalize_text).eq(sheet_name_norm)].copy()
+    if work.empty:
+        return df
+    work = work.drop_duplicates(subset=["article_norm"], keep="last")
+    by_key = {normalize_text(r["article_norm"]): r for _, r in work.iterrows() if normalize_text(r.get("article_norm", ""))}
+    out = df.copy()
+
+    text_cols = [
+        "photo_url",
+        "source_sheet",
+        "name",
+        "meta_model",
+        "meta_manufacturer_code",
+        "meta_fits_models",
+        "manual_note",
+    ]
+    for col in text_cols:
+        if col not in out.columns:
+            out[col] = ""
+        else:
+            out[col] = out[col].astype(object)
+
+    for idx, row in out.iterrows():
+        key = normalize_text(row.get("article_norm", ""))
+        if not key:
+            continue
+        ov = by_key.get(key)
+        if ov is None:
+            continue
+        photo_url = normalize_text(ov.get("photo_url", ""))
+        if photo_url:
+            out.at[idx, "photo_url"] = photo_url
+            out.at[idx, "source_sheet"] = "manual_override"
+        name_override = normalize_text(ov.get("name_override", ""))
+        if name_override:
+            out.at[idx, "name"] = name_override
+        meta_model = normalize_text(ov.get("meta_model", ""))
+        if meta_model:
+            out.at[idx, "meta_model"] = meta_model
+        meta_code = normalize_text(ov.get("meta_manufacturer_code", ""))
+        if meta_code:
+            out.at[idx, "meta_manufacturer_code"] = meta_code
+        meta_fits = normalize_text(ov.get("meta_fits_models", ""))
+        if meta_fits:
+            out.at[idx, "meta_fits_models"] = meta_fits
+        note = normalize_text(ov.get("note", ""))
+        if note:
+            out.at[idx, "manual_note"] = note
+    return out
+
+
+def trigger_search_from_article(article: str, tab_key: str) -> None:
+    query = normalize_query_for_display(article)
+    if not query:
+        return
+    st.session_state[f"search_input_{tab_key}"] = query
+    st.session_state[f"submitted_query_{tab_key}"] = query
+    st.session_state[f"search_input_widget_pending_{tab_key}"] = query
+    st.session_state[f"last_result_{tab_key}"] = None
+    st.session_state[f"last_result_sig_{tab_key}"] = None
+    st.rerun()
+
+
+def render_analytics_jump_helper(df: pd.DataFrame | None, tab_key: str, box_key: str) -> None:
+    if not isinstance(df, pd.DataFrame) or df.empty or "Артикул" not in df.columns:
+        return
+    articles = [normalize_text(x) for x in df["Артикул"].tolist() if normalize_text(x)]
+    articles = unique_preserve_order(articles)
+    if not articles:
+        return
+    c1, c2 = st.columns([4, 1.2])
+    selected_article = c1.selectbox(
+        "Открыть позицию в обычном поиске",
+        articles,
+        key=f"analytics_open_select_{box_key}_{tab_key}",
+        help="Быстрый переход из аналитики в обычную карточку товара.",
+    )
+    if c2.button("Открыть", key=f"analytics_open_btn_{box_key}_{tab_key}", use_container_width=True):
+        trigger_search_from_article(selected_article, tab_key)
+
+
+def render_card_editor_panel(result_df: pd.DataFrame | None, sheet_name: str, tab_key: str) -> None:
+    if not isinstance(result_df, pd.DataFrame) or result_df.empty:
+        return
+    if not st.checkbox("✏️ Редактировать карточку", key=f"show_card_editor_{tab_key}", help="Открывает безопасный редактор карточки. Правки сохраняются поверх файла и не пропадают после новой загрузки comparison."):
+        return
+
+    rows = result_df.copy()
+    options = []
+    option_map = {}
+    for _, row in rows.iterrows():
+        art = normalize_text(row.get("article", ""))
+        key = normalize_text(row.get("article_norm", ""))
+        name = normalize_text(row.get("name", ""))
+        label = f"{art} — {name[:120]}"
+        options.append(label)
+        option_map[label] = row
+
+    default_label = options[0] if options else None
+    selected_label = st.selectbox("Позиция для редактирования", options, index=0 if default_label else None, key=f"card_editor_select_{tab_key}")
+    if not selected_label:
+        return
+    row = option_map[selected_label]
+    art = normalize_text(row.get("article", ""))
+    art_norm = normalize_text(row.get("article_norm", ""))
+    current_photo = normalize_text(row.get("photo_url", ""))
+    current_name = normalize_text(row.get("name", ""))
+    current_model = normalize_text(row.get("meta_model", ""))
+    current_code = normalize_text(row.get("meta_manufacturer_code", ""))
+    current_fits = normalize_text(row.get("meta_fits_models", ""))
+    current_note = normalize_text(row.get("manual_note", ""))
+
+    st.caption("Правки сохраняются как ручные overrides и накладываются поверх comparison-файла после каждой новой загрузки.")
+    with st.form(f"card_editor_form_{tab_key}_{art_norm}", clear_on_submit=False):
+        col1, col2 = st.columns([1.2, 1.8])
+        with col1:
+            photo_url = st.text_input("Фото (ссылка)", value=current_photo, key=f"card_edit_photo_{tab_key}_{art_norm}")
+            if current_photo:
+                st.link_button("Открыть текущее фото", current_photo, use_container_width=True)
+        with col2:
+            name_override = st.text_area("Название", value=current_name, height=90, key=f"card_edit_name_{tab_key}_{art_norm}")
+        cmeta1, cmeta2 = st.columns(2)
+        meta_model = cmeta1.text_input("Модель", value=current_model, key=f"card_edit_model_{tab_key}_{art_norm}")
+        meta_code = cmeta2.text_input("Код производителя", value=current_code, key=f"card_edit_code_{tab_key}_{art_norm}")
+        meta_fits = st.text_area("Подходит к моделям", value=current_fits, height=80, key=f"card_edit_fits_{tab_key}_{art_norm}")
+        note = st.text_area("Заметка", value=current_note, height=70, key=f"card_edit_note_{tab_key}_{art_norm}")
+
+        st.markdown("### 🔔 Напоминание / задача")
+        st.caption("Можно создать задачу на пересмотр позиции через несколько дней. Задача сохранится отдельно и не пропадёт после загрузки нового файла.")
+        t1, t2, t3 = st.columns([1.1, 1.4, 1.7])
+        create_task_flag = t1.checkbox(
+            "Создать задачу",
+            key=f"card_edit_make_task_{tab_key}_{art_norm}",
+            help="Создаёт напоминание по этой карточке с датой проверки и комментарием.",
+        )
+        task_due_date = t2.date_input(
+            "Когда проверить",
+            value=(datetime.utcnow().date() + timedelta(days=14)),
+            key=f"card_edit_task_due_{tab_key}_{art_norm}",
+        )
+        task_reason = t3.selectbox(
+            "Причина",
+            ["Пересмотреть цену", "Проверить после правки", "Нет продаж", "Проверить фото/карточку", "Проверить спрос", "Другое"],
+            key=f"card_edit_task_reason_{tab_key}_{art_norm}",
+            help="Коротко описывает, зачем создана задача.",
+        )
+        task_note = st.text_area(
+            "Комментарий к задаче",
+            value="",
+            height=65,
+            key=f"card_edit_task_note_{tab_key}_{art_norm}",
+            placeholder="Например: снизили цену, проверить продажи через 14 дней.",
+        )
+
+        b1, b2 = st.columns(2)
+        save_clicked = b1.form_submit_button("💾 Сохранить карточку", use_container_width=True, type="primary")
+        reset_clicked = b2.form_submit_button("↺ Сбросить ручные правки", use_container_width=True)
+
+    if save_clicked:
+        save_card_override(
+            sheet_name,
+            art,
+            art_norm,
+            {
+                "photo_url": photo_url,
+                "name_override": name_override,
+                "meta_model": meta_model,
+                "meta_manufacturer_code": meta_code,
+                "meta_fits_models": meta_fits,
+                "note": note,
+            },
+        )
+        if create_task_flag:
+            create_review_task(
+                article=art,
+                article_norm=art_norm,
+                sheet_name=sheet_name,
+                name_snapshot=name_override or current_name,
+                due_date=task_due_date,
+                reason=task_reason,
+                note=task_note or note,
+                source="card_editor",
+            )
+        st.success(f"Карточка {art} сохранена.")
+        if create_task_flag:
+            st.info(f"Задача по {art} создана до {task_due_date}.")
+        st.rerun()
+
+    if reset_clicked:
+        delete_card_override(sheet_name, art_norm)
+        st.success(f"Ручные правки для {art} сброшены.")
+        st.rerun()
+
 def ensure_photo_web_cache_table() -> None:
     path = get_photo_registry_path()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -2396,10 +3364,41 @@ def all_prices_to_excel_bytes(df: pd.DataFrame) -> bytes:
     return bio.read()
 
 
-def build_report_df(df: pd.DataFrame, threshold_percent: float, min_qty: float) -> pd.DataFrame:
+
+def translate_watch_action(action: Any, threshold_pct: float = 35.0) -> str:
+    raw = normalize_text(action)
+    if not raw:
+        return ""
+    tokens = [t.strip().upper() for t in raw.replace("|", ";").split(";") if t.strip()]
+    translated = []
+    for token in tokens:
+        if token == "BUY":
+            translated.append(f"Можно брать (-{int(threshold_pct)}%+)")
+        elif token == "RESTOCK":
+            translated.append("Пополнить запас")
+        elif token == "WATCH":
+            translated.append("Наблюдать")
+        elif token in {"NO_MATCH", "NO_MATCH_IN_COMPARISON"}:
+            translated.append("Нет в сравнении")
+        else:
+            translated.append(token)
+    uniq = []
+    for item in translated:
+        if item not in uniq:
+            uniq.append(item)
+    return "; ".join(uniq)
+
+def build_report_df(
+    df: pd.DataFrame,
+    threshold_percent: float,
+    min_qty: float,
+    tab_label: str = "",
+    hot_lookup: dict[str, list[dict[str, Any]]] | None = None,
+) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
     if df is None or df.empty:
         return pd.DataFrame()
+    hot_lookup = hot_lookup or {}
     for _, row in df.iterrows():
         own_price = safe_float(row.get("sale_price"), 0.0)
         own_qty = safe_float(row.get("free_qty"), 0.0)
@@ -2408,24 +3407,40 @@ def build_report_df(df: pd.DataFrame, threshold_percent: float, min_qty: float) 
         best = get_best_offer(row, min_qty=min_qty)
         if not best:
             continue
+        best_price = safe_float(best.get("price"), 0.0)
+        best_qty = safe_float(best.get("qty"), 0.0)
         delta = safe_float(best.get("delta"), 0.0)
         delta_pct = safe_float(best.get("delta_percent"), 0.0)
-        if delta <= 0 or delta_pct < float(threshold_percent):
+        if best_price <= 0 or delta <= 0 or delta_pct < float(threshold_percent):
             continue
+
+        hot_rec = pick_hot_watch_rec(row, hot_lookup) if hot_lookup else None
         rows.append({
+            "Лист": tab_label,
             "Артикул": row.get("article", ""),
-            "Название": row.get("name", ""),
-            "Наш остаток": own_qty,
+            "Товар": row.get("name", ""),
+            "Спрос, шт/мес": safe_float((hot_rec or {}).get("sales_per_month"), 0.0) if hot_rec else None,
             "Наша цена": own_price,
-            "Лучший дистрибьютер": best["source"],
-            "Цена дистрибьютора": best["price"],
-            "Остаток дистрибьютора": best["qty"],
+            "Наш остаток": own_qty,
+            "Лучший поставщик": best.get("source", ""),
+            "Цена поставщика": best_price,
+            "Остаток поставщика": best_qty,
+            "Ниже нашей цены, %": round(delta_pct, 2),
+            "Дней запаса": safe_float((hot_rec or {}).get("days_of_cover"), 0.0) if hot_rec else None,
+            "Приоритет": safe_float((hot_rec or {}).get("priority_score"), 0.0) if hot_rec else None,
+            "Действие": translate_watch_action((hot_rec or {}).get("action_today", ""), threshold_pct=35.0) if hot_rec else "",
             "Разница, руб": delta,
-            "Разница, %": round(delta_pct, 2),
+            "Ходовая": "Да" if hot_rec else "",
         })
     if not rows:
         return pd.DataFrame()
-    out = pd.DataFrame(rows).sort_values(["Разница, %", "Разница, руб", "Артикул"], ascending=[False, False, True]).reset_index(drop=True)
+    out = pd.DataFrame(rows)
+    out["_sort_priority"] = pd.to_numeric(out.get("Приоритет"), errors="coerce").fillna(-1.0)
+    out = out.sort_values(
+        ["_sort_priority", "Ниже нашей цены, %", "Разница, руб", "Артикул"],
+        ascending=[False, False, False, True],
+        kind="stable",
+    ).drop(columns=["_sort_priority"]).reset_index(drop=True)
     return out
 
 
@@ -2838,21 +3853,31 @@ def render_results_table(df: pd.DataFrame, price_mode: str, round100: bool, cust
             badge_html = "<div class='match-badge match-badge-soft'>По названию / бренду</div>"
 
         hot_html = ""
+        manual_note_html = ""
+        manual_note = normalize_text(row.get("manual_note", ""))
+        if manual_note:
+            manual_note_html = f"<div class='manual-note'>{html.escape(manual_note)}</div>"
         if bool(row.get("hot_flag", False)):
-            hot_parts = []
-            abc = normalize_text(row.get("hot_abc_class", ""))
+            abc = normalize_text(row.get("hot_abc_class", "")).upper()
             sales_pm = safe_float(row.get("hot_sales_per_month"), 0.0)
-            if abc:
-                hot_parts.append(f"класс {abc}")
-            if sales_pm > 0:
-                hot_parts.append(f"{sales_pm:.1f}/мес")
-            action_today = normalize_text(row.get("hot_action_today", ""))
+            action_today = normalize_text(row.get("hot_action_today", "")).upper()
             buy_signal = normalize_text(row.get("hot_buy_signal", "")).upper()
-            primary = "🔥 Ходовая"
-            if buy_signal == "BUY":
-                primary = "🔥 Ходовая • BUY"
-            note = " • ".join(hot_parts)
-            action_html = f"<div class='hot-sub-badge'>{html.escape(action_today)}</div>" if action_today else ""
+
+            demand_map = {
+                "A": "Спрос высокий",
+                "B": "Спрос хороший",
+                "C": "Спрос умеренный",
+            }
+            primary = "🔥 Товар ходовой"
+            note_parts = []
+            if abc:
+                note_parts.append(demand_map.get(abc, f"Класс {abc}"))
+            if sales_pm > 0:
+                note_parts.append(f"≈ {sales_pm:.1f} шт/мес")
+            note = " • ".join(note_parts)
+
+            action_text, _hot_help = hot_supplier_note(row, best, threshold_pct=35.0)
+            action_html = f"<div class='hot-sub-badge'>{html.escape(action_text)}</div>" if action_text else ""
             hot_html = f"<div class='hot-badge'>{html.escape(primary)}</div>{('<div class="hot-meta">' + html.escape(note) + '</div>') if note else ''}{action_html}"
 
         if best:
@@ -2913,6 +3938,7 @@ def render_results_table(df: pd.DataFrame, price_mode: str, round100: bool, cust
                     <div class='name-cell'>{html.escape(str(row['name']))}</div>
                     {badge_html}
                     {hot_html}
+                    {manual_note_html}
                   </div>
                 </div>
               </td>
@@ -2941,6 +3967,7 @@ def render_results_table(df: pd.DataFrame, price_mode: str, round100: bool, cust
       .match-badge-exact {{ background:#e8f7ee; color:#15803d; }}
       .match-badge-linked {{ background:#e8f1ff; color:#1d4ed8; }}
       .match-badge-soft {{ background:#fff4e5; color:#b45309; }}
+      .manual-note {{ margin-top:8px; font-size:12px; color:#475569; background:#f8fafc; border:1px dashed #cbd5e1; padding:6px 8px; border-radius:10px; max-width:560px; }}
       .sale-col {{ font-weight:800; white-space:nowrap; }}
       .selected-col {{ background: linear-gradient(180deg, #f4f8ff 0%, #eef4ff 100%); border-left:1px solid #c7d7ff; border-right:1px solid #c7d7ff; font-weight:900; color:#315efb; white-space:nowrap; }}
       .compare-col {{ min-width:230px; }}
@@ -3070,17 +4097,31 @@ def render_results_insight_dashboard(result_df: pd.DataFrame, compare_map: dict[
         hot_count = int(result_df["hot_flag"].fillna(False).map(bool).sum())
         if "hot_buy_signal" in result_df.columns:
             hot_buy_count = int(result_df["hot_buy_signal"].fillna("").map(normalize_text).str.upper().eq("BUY").sum())
+    hot_label = "Ходовые в поиске"
+    hot_note = "Watchlist не совпал с результатами"
+    hot_help = "Товар ходовой → товар хорошо продавался за выбранный период"
+    if hot_count:
+        hot_label = "Товар ходовой"
+        if hot_buy_count > 0:
+            hot_note = "Сейчас можно брать"
+            hot_help += "\nСейчас можно брать → лучший поставщик сейчас минимум на 35% дешевле нашей цены"
+        else:
+            hot_note = "Сейчас брать невыгодно"
+            hot_help += "\nСейчас брать невыгодно → нет поставщика с ценой минимум на 35% ниже нашей цены"
     cards = [
-        ("🔎", "Найдено позиций", str(found_count), "Сколько строк вошло в текущий поиск"),
-        ("💚", "Есть цена лучше", str(better_rows), "Сколько позиций реально дешевле у поставщиков"),
-        ("📈", "Средняя выгода", (f"{avg_gain:.1f}%" if gains else "—"), "Считается приложением, не берётся из готовых колонок Excel"),
-        ("🔥", "Ходовые в поиске", str(hot_count), (f"BUY-сигналов: {hot_buy_count}" if hot_count else "Watchlist не совпал с результатами")),
-        ("🧩", "Источников найдено", str(len(source_pairs)), ", ".join([x["source"] for x in source_pairs]) if source_pairs else "Нет колонок источников"),
+        ("🔎", "Найдено позиций", str(found_count), "Сколько строк вошло в текущий поиск", ""),
+        ("💚", "Есть цена лучше", str(better_rows), "Сколько позиций реально дешевле у поставщиков", ""),
+        ("📈", "Средняя выгода", (f"{avg_gain:.1f}%" if gains else "—"), "Считается приложением, не берётся из готовых колонок Excel", ""),
+        ("🔥", hot_label, str(hot_count), hot_note, hot_help),
+        ("🧩", "Источников найдено", str(len(source_pairs)), ", ".join([x["source"] for x in source_pairs]) if source_pairs else "Нет колонок источников", ""),
     ]
-    html_cards = "".join(
-        f"<div class='insight-card'><div class='insight-top'><span class='insight-icon'>{icon}</span><span class='insight-label'>{label}</span></div><div class='insight-value'>{value}</div><div class='insight-note'>{note}</div></div>"
-        for icon, label, value, note in cards
-    )
+    html_parts = []
+    for icon, label, value, note, help_text in cards:
+        help_html = f"<span class='insight-help' title='{html.escape(help_text)}'>?</span>" if help_text else ""
+        html_parts.append(
+            f"<div class='insight-card'><div class='insight-top'><span class='insight-icon'>{icon}</span><span class='insight-label'>{label}</span>{help_html}</div><div class='insight-value'>{value}</div><div class='insight-note'>{note}</div></div>"
+        )
+    html_cards = "".join(html_parts)
     st.markdown(f"<div class='insight-grid'>{html_cards}</div>", unsafe_allow_html=True)
 
 
@@ -3606,6 +4647,11 @@ with st.sidebar:
     st.markdown(f'<div class="sidebar-status">Watchlist: {html.escape(st.session_state.get("hot_items_name", "ещё не загружен"))}</div>', unsafe_allow_html=True)
     st.markdown(f'<div class="sidebar-mini">Файл на сервере: {html.escape(str(get_persisted_watchlist_file_path()))}</div>', unsafe_allow_html=True)
     st.markdown(f'<div class="sidebar-mini">{html.escape(hot_watchlist_summary_text())}</div>', unsafe_allow_html=True)
+    hot_df_state = st.session_state.get("hot_items_df")
+    hot_buy_total = 0
+    if isinstance(hot_df_state, pd.DataFrame) and not hot_df_state.empty:
+        hot_buy_total = int(hot_df_state.get("buy_signal_30pct", pd.Series(dtype=object)).fillna("").map(normalize_text).str.upper().eq("BUY").sum())
+    st.checkbox(f"Показать таблицу «можно брать» ({hot_buy_total})", key="show_hot_buy_watchlist_table", help="Лениво открывает таблицу только по ходовым позициям со статусом BUY. Пока чекбокс выключен, таблица не строится.")
     st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown('<div class="sidebar-card">', unsafe_allow_html=True)
@@ -4198,46 +5244,93 @@ def render_operational_analytics_block(sheet_df: pd.DataFrame, photo_df: pd.Data
     if isinstance(tasks_df, pd.DataFrame) and not tasks_df.empty:
         st.dataframe(tasks_df, use_container_width=True, hide_index=True)
 
-    with st.expander("1. Приоритет на пересмотр цены", expanded=False):
+    with st.expander("1. Приоритет на пересмотр цены ❔", expanded=False):
+        st.caption(
+            "Что показывает: где мы дороже рынка и что стоит пересмотреть в первую очередь. "
+            "Как считается приоритет: Разница, % × Наш остаток × Количество связанных объявлений Avito (минимум 1). "
+            "Как пользоваться: чем выше приоритет, тем полезнее сначала проверить именно эту позицию."
+        )
         if isinstance(top_df, pd.DataFrame) and not top_df.empty:
             view = top_df[["Артикул", "Название", "Наша цена", "Лучшая цена дистрибьютора", "Лучший поставщик", "Разница, руб", "Разница, %", "Наш остаток", "Остаток дистрибьютора", "Приоритет"]].head(100)
             st.dataframe(view, use_container_width=True, hide_index=True)
+            render_analytics_jump_helper(view, tab_key, "top")
         else:
             st.caption("На текущем листе нет позиций, где рынок дешевле нас.")
 
-    with st.expander("2. Что лежит и требует вмешательства", expanded=False):
+    with st.expander("2. Что лежит и требует вмешательства ❔", expanded=False):
+        st.caption(
+            "Что показывает: позиции, где уже есть проблема или задача. "
+            "Причины могут быть такие: дорого, нет фото, нет объявления, слабое объявление, давно не обновлялось. "
+            "Как пользоваться: это твой список того, что нужно доработать в первую очередь."
+        )
         if isinstance(action_df, pd.DataFrame) and not action_df.empty:
             view = action_df[["Артикул", "Название", "Наш остаток", "Причины", "Объявлений Авито", "Фото", "Шаблон", "Лучший поставщик", "Разница, %"]].head(150)
             st.dataframe(view, use_container_width=True, hide_index=True)
+            render_analytics_jump_helper(view, tab_key, "action")
         else:
             st.caption("Явных проблемных позиций на текущем листе не найдено.")
 
-    with st.expander("3. Аналитика по аккаунтам Avito", expanded=False):
+    with st.expander("3. Аналитика по аккаунтам Avito ❔", expanded=False):
+        st.caption(
+            "Что показывает: как позиции распределены по аккаунтам Avito. "
+            "Можно понять, на каком аккаунте больше карточек, где больше позиций без фото и где больше дорогих позиций. "
+            "Как пользоваться: помогает управлять аккаунтами не на глаз, а по факту."
+        )
         if isinstance(account_df, pd.DataFrame) and not account_df.empty:
             st.dataframe(account_df, use_container_width=True, hide_index=True)
         else:
             st.caption("В Avito пока нет данных по аккаунтам для этого листа.")
 
-    with st.expander("4. Покрытие качества карточек", expanded=False):
+    with st.expander("4. Покрытие качества карточек ❔", expanded=False):
+        st.caption(
+            "Что показывает: насколько хорошо заполнены карточки товаров на текущем листе. "
+            "Здесь видно, сколько позиций с фото, без фото, с моделью, с полем 'подходит к моделям', есть ли Avito и есть ли остаток. "
+            "Как пользоваться: это быстрый контроль качества карточек."
+        )
         st.dataframe(quality_df, use_container_width=True, hide_index=True)
 
-    with st.expander("5. Серийная аналитика", expanded=False):
+    with st.expander("5. Серийная аналитика ❔", expanded=False):
+        st.caption(
+            "Что показывает: серии товаров, где есть несколько связанных артикулов, цветов или вариантов. "
+            "Помогает увидеть неполные серии, серии без фото, без Avito или с ценовыми перекосами. "
+            "Как пользоваться: полезно, чтобы не продавать серию обрывками."
+        )
         if isinstance(series_df, pd.DataFrame) and not series_df.empty:
-            st.dataframe(series_df.head(100), use_container_width=True, hide_index=True)
+            series_view = series_df.head(100)
+            st.dataframe(series_view, use_container_width=True, hide_index=True)
+            render_analytics_jump_helper(series_view, tab_key, "series")
         else:
             st.caption("На текущем листе не найдено серий, требующих отдельной сводки.")
 
-    with st.expander("6. История ручных правок", expanded=False):
+    with st.expander("6. История ручных правок ❔", expanded=False):
+        st.caption(
+            "Что показывает: журнал ручных изменений цен. "
+            "Видно когда меняли, какой артикул, на каком листе, было / стало и источник изменения. "
+            "Как пользоваться: помогает понять, что менялось руками, а что пришло из нового comparison-файла."
+        )
         if isinstance(patch_history_df, pd.DataFrame) and not patch_history_df.empty:
             st.dataframe(patch_history_df[["changed_at", "article", "sheet_name", "old_price", "new_price", "change_source", "note"]], use_container_width=True, hide_index=True)
         else:
             st.caption("История ручных правок пока пустая.")
 
-    with st.expander("7. Надёжность источников", expanded=False):
+    with st.expander("7. Надёжность источников ❔", expanded=False):
+        st.caption(
+            "Что показывает: как часто каждый поставщик оказывался лучшим по цене на текущем листе. "
+            "Это не гарантия, а практический индикатор, кого стоит чаще мониторить. "
+            "Как пользоваться: помогает понять, какие источники чаще всего дают хорошие цены."
+        )
         if isinstance(source_df, pd.DataFrame) and not source_df.empty:
             st.dataframe(source_df, use_container_width=True, hide_index=True)
         else:
             st.caption("Пока нет данных по лучшим поставщикам.")
+
+    with st.expander("8. Задачи / напоминания ❔", expanded=False):
+        st.caption(
+            "Что показывает: задачи по карточкам на пересмотр, проверку или доработку. "
+            "Как пользоваться: открывай карточку из задачи, проверяй позицию и отмечай задачу выполненной."
+        )
+        task_df = build_task_view_df(sheet_name)
+        render_tasks_table_ui(task_df, f"analytics_tasks_{tab_key}", default_sheet=sheet_name)
 
     st.download_button(
         "⬇️ Скачать аналитику в Excel",
@@ -4246,6 +5339,303 @@ def render_operational_analytics_block(sheet_df: pd.DataFrame, photo_df: pd.Data
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         key=f"download_analytics_{tab_key}",
     )
+
+
+def build_crm_header_stats(
+    sheet_df: pd.DataFrame | None,
+    photo_df: pd.DataFrame | None,
+    avito_df: pd.DataFrame | None,
+    sheet_name: str,
+    tab_label: str,
+    min_qty: float,
+) -> dict[str, int]:
+    stats = {
+        "tasks_open": 0,
+        "tasks_overdue": 0,
+        "can_buy": 0,
+        "without_photo": 0,
+        "without_avito": 0,
+    }
+
+    task_df = load_task_registry_df()
+    if isinstance(task_df, pd.DataFrame) and not task_df.empty:
+        sheet_mask = (
+            task_df.get("sheet_name", pd.Series(dtype=object))
+            .fillna("")
+            .map(normalize_text)
+            .eq(normalize_text(sheet_name))
+        )
+        task_sheet = task_df.loc[sheet_mask].copy()
+        if not task_sheet.empty:
+            effective_status = task_sheet.apply(lambda r: task_effective_status(r), axis=1)
+            stats["tasks_open"] = int(effective_status.isin(["NEW", "ACTIVE", "OVERDUE"]).sum())
+            stats["tasks_overdue"] = int(effective_status.eq("OVERDUE").sum())
+
+    hot_buy_df = build_hot_buy_watchlist_table()
+    if isinstance(hot_buy_df, pd.DataFrame) and not hot_buy_df.empty and "Лист" in hot_buy_df.columns:
+        stats["can_buy"] = int((hot_buy_df["Лист"].fillna("").astype(str) == tab_label).sum())
+
+    if isinstance(sheet_df, pd.DataFrame) and not sheet_df.empty:
+        registry_df = load_avito_registry_df()
+        bundle = build_operational_analytics_bundle(sheet_df, photo_df, avito_df, registry_df, float(min_qty), str(tab_label))
+        quality = bundle.get("quality", {}) if isinstance(bundle, dict) else {}
+        stats["without_photo"] = int(quality.get("without_photo", 0) or 0)
+        stats["without_avito"] = int(quality.get("in_price_not_in_avito", 0) or 0)
+    return stats
+
+
+def render_crm_header_bar(
+    sheet_df: pd.DataFrame | None,
+    photo_df: pd.DataFrame | None,
+    avito_df: pd.DataFrame | None,
+    sheet_name: str,
+    tab_label: str,
+    min_qty: float,
+) -> None:
+    stats = build_crm_header_stats(sheet_df, photo_df, avito_df, sheet_name, tab_label, min_qty)
+    st.markdown('<div class="result-wrap">', unsafe_allow_html=True)
+    render_block_header(
+        "CRM — быстрый центр управления",
+        "Короткая шапка с главными рабочими зонами: задачи, выгодные закупки, проблемы по карточкам.",
+        icon="🧭",
+        help_text="Эта шапка ничего не меняет в comparison. Она только помогает быстро открыть нужный рабочий блок без долгой прокрутки.",
+    )
+    c1, c2, c3, c4, c5 = st.columns(5)
+    with c1:
+        open_tasks = bool(st.checkbox(
+            f"🔔 Задачи ({stats['tasks_open']})",
+            value=bool(st.session_state.get(f"crm_show_tasks_{sheet_name}", st.session_state.get("show_task_center_global", False))),
+            key=f"crm_show_tasks_{sheet_name}",
+            help="Открывает единый центр задач: новые, активные, просроченные и выполненные.",
+        ))
+        st.caption(f"Просрочено: {stats['tasks_overdue']}")
+    with c2:
+        open_buy = bool(st.checkbox(
+            f"💸 Можно брать ({stats['can_buy']})",
+            value=bool(st.session_state.get(f"crm_show_buy_{sheet_name}", st.session_state.get("show_hot_buy_watchlist_table", False))),
+            key=f"crm_show_buy_{sheet_name}",
+            help="Открывает ленивую таблицу по ходовым позициям, где поставщик сейчас даёт выгодный вход по цене.",
+        ))
+        st.caption("Показывает только выгодные позиции")
+    with c3:
+        st.metric("🖼️ Нет фото", stats["without_photo"])
+        st.caption("Сколько позиций на листе без фото")
+    with c4:
+        st.metric("🛒 Без Avito", stats["without_avito"])
+        st.caption("Сколько позиций на листе без объявления")
+    with c5:
+        st.metric("Лист", tab_label)
+        st.caption("CRM-метрики именно по текущему листу")
+    st.markdown('</div>', unsafe_allow_html=True)
+
+
+def render_crm_card_center(
+    result_df: pd.DataFrame | None,
+    display_result_df: pd.DataFrame | None,
+    compare_map: dict[str, dict[str, Any]] | None,
+    avito_df: pd.DataFrame | None,
+    sheet_name: str,
+    tab_label: str,
+    tab_key: str,
+    price_mode: str,
+    round100: bool,
+    custom_discount: float,
+) -> None:
+    if not isinstance(display_result_df, pd.DataFrame) or display_result_df.empty:
+        return
+
+    rows = display_result_df.copy()
+    options = []
+    option_map: dict[str, pd.Series] = {}
+    for _, row in rows.iterrows():
+        art = normalize_text(row.get("article", ""))
+        name = normalize_text(row.get("name", ""))
+        label = f"{art} — {name[:120]}"
+        options.append(label)
+        option_map[label] = row
+
+    st.markdown('<div class="result-wrap">', unsafe_allow_html=True)
+    render_block_header(
+        "CRM-карточка товара",
+        "Один компактный экран по позиции: обзор, цены, Avito, заметки и задачи. Старые блоки остаются ниже как вторичный режим.",
+        icon="🧩",
+        help_text="Нужна, чтобы не бегать по странице: всё важное по найденной позиции собрано в одном месте.",
+    )
+    selected_label = st.selectbox(
+        "Позиция для CRM-карточки",
+        options,
+        index=0 if options else None,
+        key=f"crm_card_select_{tab_key}",
+        help="Выбери найденную позицию, чтобы открыть её краткую CRM-карточку.",
+    )
+    if not selected_label:
+        st.markdown('</div>', unsafe_allow_html=True)
+        return
+
+    row = option_map[selected_label]
+    art = normalize_text(row.get("article", ""))
+    art_norm = normalize_text(row.get("article_norm", ""))
+    name = normalize_text(row.get("name", ""))
+    photo_url = normalize_text(row.get("photo_url", ""))
+    note = normalize_text(row.get("manual_note", ""))
+    model = normalize_text(row.get("meta_model", ""))
+    mcode = normalize_text(row.get("meta_manufacturer_code", ""))
+    fits = normalize_text(row.get("meta_fits_models", ""))
+    own_price = get_selected_price_raw(row, price_mode, round100, custom_discount)
+    own_stock = parse_qty_generic(row.get("free_qty"))
+    best = get_best_offer(row, min_qty=float(st.session_state.get("distributor_min_qty", 1.0)))
+    best_source = normalize_text((best or {}).get("source", ""))
+    best_price = safe_float((best or {}).get("price"), 0.0)
+    best_qty = safe_float((best or {}).get("qty"), 0.0)
+    matched_ads = pd.DataFrame()
+    if isinstance(avito_df, pd.DataFrame) and not avito_df.empty:
+        one_row = pd.DataFrame([row.to_dict()])
+        matched_ads = find_avito_ads(avito_df, one_row)
+
+    t_overview, t_prices, t_avito, t_notes = st.tabs(["Обзор", "Цены", "Avito", "Заметки / задачи"])
+
+    with t_overview:
+        c1, c2 = st.columns([1, 2])
+        with c1:
+            if photo_url:
+                st.image(photo_url, use_container_width=True)
+            else:
+                st.info("Фото не найдено")
+        with c2:
+            st.markdown(f"### {html.escape(art)}")
+            st.caption(name)
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Наша цена", fmt_price(own_price))
+            m2.metric("Наш склад", fmt_qty(own_stock))
+            m3.metric("Лучший поставщик", best_source or "—")
+            if note:
+                st.info(f"Заметка: {note}")
+            if model or mcode or fits:
+                if model:
+                    st.write(f"**Модель:** {model}")
+                if mcode:
+                    st.write(f"**Код производителя:** {mcode}")
+                if fits:
+                    st.write(f"**Подходит к моделям:** {fits}")
+
+    with t_prices:
+        st.caption("Здесь видно нашу цену и лучший рынок по текущей позиции. Это быстрый обзор, а полный блок 'Показать цены у всех' остаётся ниже.")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Наша цена", fmt_price(own_price))
+        c2.metric("Лучший поставщик", best_source or "—")
+        c3.metric("Цена поставщика", fmt_price(best_price) if best_price > 0 else "—")
+        c4.metric("Остаток поставщика", fmt_qty(best_qty) if best_qty > 0 else "—")
+        if isinstance(compare_map, dict):
+            data = compare_map.get(art_norm) or compare_map.get(art) or {}
+            if data:
+                rows_prices = []
+                for item in data.get("offers", [])[:20]:
+                    rows_prices.append({
+                        "Поставщик": normalize_text(item.get("source", "")),
+                        "Цена": fmt_price(safe_float(item.get("price"), 0.0)),
+                        "Остаток": fmt_qty(safe_float(item.get("qty"), 0.0)),
+                    })
+                if rows_prices:
+                    st.dataframe(pd.DataFrame(rows_prices), use_container_width=True, hide_index=True)
+
+    with t_avito:
+        st.caption("Связанные объявления Avito по этой позиции. Отсюда можно быстро понять, на каком аккаунте она висит и есть ли вообще объявление.")
+        if isinstance(matched_ads, pd.DataFrame) and not matched_ads.empty:
+            try:
+                render_avito_block(avito_df, pd.DataFrame([row.to_dict()]))
+            except Exception:
+                view_cols = [c for c in ["ad_id", "title", "account", "price", "last_changed_at"] if c in matched_ads.columns]
+                st.dataframe(matched_ads[view_cols], use_container_width=True, hide_index=True)
+        else:
+            st.info("Связанные объявления Avito не найдены.")
+
+    with t_notes:
+        st.caption("Здесь можно быстро поправить карточку и сразу создать задачу на пересмотр без переходов вниз по странице.")
+        current_photo = photo_url
+        current_name = name
+        current_model = model
+        current_code = mcode
+        current_fits = fits
+        current_note = note
+
+        with st.form(f"crm_card_form_{tab_key}_{art_norm}", clear_on_submit=False):
+            cc1, cc2 = st.columns([1.2, 1.8])
+            with cc1:
+                photo_url_new = st.text_input("Фото (ссылка)", value=current_photo, key=f"crm_card_photo_{tab_key}_{art_norm}")
+            with cc2:
+                name_new = st.text_area("Название", value=current_name, height=90, key=f"crm_card_name_{tab_key}_{art_norm}")
+            mm1, mm2 = st.columns(2)
+            model_new = mm1.text_input("Модель", value=current_model, key=f"crm_card_model_{tab_key}_{art_norm}")
+            code_new = mm2.text_input("Код производителя", value=current_code, key=f"crm_card_code_{tab_key}_{art_norm}")
+            fits_new = st.text_area("Подходит к моделям", value=current_fits, height=80, key=f"crm_card_fits_{tab_key}_{art_norm}")
+            note_new = st.text_area("Заметка", value=current_note, height=70, key=f"crm_card_note_{tab_key}_{art_norm}")
+
+            st.markdown("#### 🔔 Создать задачу по карточке")
+            st.caption("Заметка — это просто комментарий. Задача — отдельное напоминание со сроком, статусом и причиной.")
+            tt1, tt2, tt3 = st.columns([1.1, 1.4, 1.7])
+            make_task = tt1.checkbox(
+                "Создать задачу",
+                key=f"crm_card_make_task_{tab_key}_{art_norm}",
+                help="Создаёт напоминание по этой позиции. Оно попадёт в общий центр задач и не пропадёт после загрузки нового файла.",
+            )
+            due_date = tt2.date_input(
+                "Когда проверить",
+                value=(datetime.utcnow().date() + timedelta(days=14)),
+                key=f"crm_card_due_{tab_key}_{art_norm}",
+            )
+            task_reason = tt3.selectbox(
+                "Причина",
+                ["Пересмотреть цену", "Проверить после правки", "Нет продаж", "Проверить фото/карточку", "Проверить спрос", "Другое"],
+                key=f"crm_card_reason_{tab_key}_{art_norm}",
+            )
+            task_note = st.text_area(
+                "Комментарий к задаче",
+                value="",
+                height=65,
+                key=f"crm_card_task_note_{tab_key}_{art_norm}",
+                placeholder="Например: снизили цену, проверить продажи через 14 дней.",
+            )
+
+            sb1, sb2 = st.columns(2)
+            save_clicked = sb1.form_submit_button("💾 Сохранить карточку", use_container_width=True, type="primary")
+            reset_clicked = sb2.form_submit_button("↺ Сбросить ручные правки", use_container_width=True)
+
+        if save_clicked:
+            save_card_override(
+                sheet_name,
+                art,
+                art_norm,
+                {
+                    "photo_url": photo_url_new,
+                    "name_override": name_new,
+                    "meta_model": model_new,
+                    "meta_manufacturer_code": code_new,
+                    "meta_fits_models": fits_new,
+                    "note": note_new,
+                },
+            )
+            if make_task:
+                create_review_task(
+                    article=art,
+                    article_norm=art_norm,
+                    sheet_name=sheet_name,
+                    name_snapshot=name_new or current_name,
+                    due_date=due_date,
+                    reason=task_reason,
+                    note=task_note or note_new,
+                    source="crm_card",
+                )
+            st.success(f"Карточка {art} сохранена.")
+            if make_task:
+                st.info(f"Задача по {art} создана до {due_date}.")
+            st.rerun()
+
+        if reset_clicked:
+            delete_card_override(sheet_name, art_norm)
+            st.success(f"Ручные правки для {art} сброшены.")
+            st.rerun()
+
+    st.markdown('</div>', unsafe_allow_html=True)
 
 def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> None:
     search_key = f"search_input_{tab_key}"
@@ -4275,7 +5665,8 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
         st.session_state[search_widget_key] = ""
         st.session_state[clear_flag_key] = False
 
-    base_sheet_df = sheets.get(sheet_name) if isinstance(sheets, dict) else None
+    base_sheet_raw = sheets.get(sheet_name) if isinstance(sheets, dict) else None
+    base_sheet_df = apply_card_overrides(base_sheet_raw.copy(), sheet_name) if isinstance(base_sheet_raw, pd.DataFrame) else None
     show_photos = bool(st.session_state.get("show_photos_global", True))
     photo_df = st.session_state.get("photo_df")
     source_pairs = get_source_pairs(base_sheet_df) if isinstance(base_sheet_df, pd.DataFrame) else []
@@ -4433,6 +5824,8 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
         st.session_state[result_key] = result_df
     if isinstance(result_df, pd.DataFrame) and show_photos:
         display_result_df = apply_photo_map(result_df, photo_df)
+    if isinstance(display_result_df, pd.DataFrame):
+        display_result_df = apply_card_overrides(display_result_df, sheet_name)
     if isinstance(display_result_df, pd.DataFrame) and isinstance(hot_items_df, pd.DataFrame) and not hot_items_df.empty:
         display_result_df = apply_hot_watchlist(display_result_df, hot_items_df, tab_label=tab_label)
 
@@ -4481,6 +5874,21 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
                     tech = tech[["article", "name", "Наша цена", "Наш склад", "Лучший поставщик", "Лучшая цена", "Фото"]].rename(columns={"article": "Артикул", "name": "Название"})
                 st.dataframe(tech, use_container_width=True, hide_index=True)
 
+            render_crm_card_center(
+                result_df,
+                display_result_df,
+                compare_map,
+                st.session_state.get("avito_df"),
+                sheet_name,
+                tab_label,
+                tab_key,
+                price_mode,
+                round100,
+                custom_discount,
+            )
+
+            render_card_editor_panel(display_result_df, sheet_name, tab_key)
+
             lazy_c0, lazy_c1, lazy_c2, lazy_c3, lazy_c4, lazy_c5 = st.columns(6)
             lazy_c0.checkbox("Показать шаблоны", key=f"lazy_templates_{tab_key}")
             lazy_c1.checkbox("Показать цены у всех", key=f"lazy_all_prices_{tab_key}")
@@ -4491,6 +5899,8 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
 
             if st.session_state.get(f"lazy_templates_{tab_key}", False):
                 result_enriched_for_templates = apply_photo_map(result_df, photo_df) if isinstance(result_df, pd.DataFrame) else result_df
+                if isinstance(result_enriched_for_templates, pd.DataFrame):
+                    result_enriched_for_templates = apply_card_overrides(result_enriched_for_templates, sheet_name)
                 st.markdown('<div class="result-wrap">', unsafe_allow_html=True)
                 render_block_header(
                     f"{tab_label} — шаблоны",
@@ -4554,17 +5964,42 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
                 render_avito_block(st.session_state.avito_df, result_df)
                 st.markdown('</div>', unsafe_allow_html=True)
 
+            if st.session_state.get(f"lazy_analytics_{tab_key}", False):
+                st.markdown('<div class="result-wrap">', unsafe_allow_html=True)
+                render_block_header(
+                    f"{tab_label} — аналитика / задачи",
+                    "Операционная аналитика по текущему листу: приоритет на пересмотр цены, проблемные позиции, качество карточек, серии, история правок и действия на сегодня.",
+                    icon="📌",
+                    help_text="Блок считается лениво и открывается только по чекбоксу. Аналитика строится по текущему листу и не должна влиять на обычный поиск, пока выключена.",
+                )
+                render_operational_analytics_block(
+                    base_sheet_df,
+                    photo_df,
+                    st.session_state.get("avito_df"),
+                    st.session_state.distributor_min_qty,
+                    tab_label,
+                    tab_key,
+                )
+                st.markdown('</div>', unsafe_allow_html=True)
+
         st.markdown('</div>', unsafe_allow_html=True)
 
     if st.session_state.get(f"lazy_report_{tab_key}", False):
         st.markdown('<div class="result-wrap">', unsafe_allow_html=True)
         render_block_header(
             f"{tab_label} — отчёт по листу",
-            "Полный отчёт по выбранному листу: где поставщик реально дешевле нас на заданный процент.",
+            "Полный отчёт по выбранному листу: где поставщик реально дешевле нас на заданный процент. Если загружен watchlist, отчёт дополняется спросом, днями запаса, приоритетом и действием.",
             icon="📊",
             help_text="Отчёт строится по всему текущему листу, а не только по поисковой выдаче. Порог и минимальный остаток меняются в sidebar.",
         )
-        report_df = build_report_df(base_sheet_df, st.session_state.distributor_threshold, st.session_state.distributor_min_qty)
+        report_hot_lookup = build_hot_watchlist_lookup(st.session_state.get("hot_items_df"), tab_label)
+        report_df = build_report_df(
+            base_sheet_df,
+            st.session_state.distributor_threshold,
+            st.session_state.distributor_min_qty,
+            tab_label=tab_label,
+            hot_lookup=report_hot_lookup,
+        )
         if report_df.empty:
             st.info("По текущему листу нет позиций, которые проходят ваш порог выгоды.")
         else:
@@ -4572,15 +6007,67 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
             c1.metric("Строк в отчёте", len(report_df))
             c2.metric("Порог", f"{fmt_qty(st.session_state.distributor_threshold)}%")
             c3.metric("Источников", len(source_pairs))
-            st.dataframe(report_df, use_container_width=True, hide_index=True, height=420)
-            st.download_button(
-                "⬇️ Скачать отчёт по листу",
-                report_to_excel_bytes(report_df),
-                file_name=f"moy_tovar_report_{tab_key}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-                key=f"download_report_{tab_key}",
+
+            f1, f2, f3 = st.columns(3)
+            only_hot = f1.checkbox(
+                "Только ходовые",
+                key=f"report_only_hot_{tab_key}",
+                help="Показывать только товары, которые хорошо продаются за выбранный период.",
             )
+            only_buy = f2.checkbox(
+                "Только можно брать",
+                key=f"report_only_buy_{tab_key}",
+                help="Показывать только позиции, где лучший поставщик сейчас минимум на 35% дешевле нашей цены.",
+            )
+            only_attention = f3.checkbox(
+                "Только требует внимания",
+                key=f"report_only_attention_{tab_key}",
+                help="Показывать только позиции, где нужно действие: пополнить запас, наблюдать или позиция не найдена в сравнении.",
+            )
+
+            st.caption(
+                "Только ходовые — товары с хорошим спросом. "
+                "Только можно брать — позиции, где поставщик сейчас минимум на 35% дешевле нашей цены. "
+                "Только требует внимания — позиции, где нужно действие: пополнить запас, наблюдать или проверить сравнение."
+            )
+
+            filtered_report_df = report_df.copy()
+
+            if only_hot:
+                filtered_report_df = filtered_report_df[
+                    filtered_report_df["Ходовая"].astype(str).str.strip().eq("Да")
+                ]
+
+            if only_buy:
+                filtered_report_df = filtered_report_df[
+                    filtered_report_df["Действие"]
+                    .fillna("")
+                    .astype(str)
+                    .str.upper()
+                    .str.contains("МОЖНО БРАТЬ", regex=False)
+                ]
+
+            if only_attention:
+                filtered_report_df = filtered_report_df[
+                    filtered_report_df["Действие"]
+                    .fillna("")
+                    .astype(str)
+                    .str.upper()
+                    .str.contains("ПОПОЛНИТЬ ЗАПАС|НАБЛЮДАТЬ|НЕТ В СРАВНЕНИИ", regex=True)
+                ]
+
+            if filtered_report_df.empty:
+                st.info("По выбранным фильтрам строк не найдено.")
+            else:
+                st.dataframe(filtered_report_df, use_container_width=True, hide_index=True, height=420)
+                st.download_button(
+                    "⬇️ Скачать отчёт по листу",
+                    report_to_excel_bytes(filtered_report_df),
+                    file_name=f"moy_tovar_report_{tab_key}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                    key=f"download_report_{tab_key}",
+                )
         st.markdown('</div>', unsafe_allow_html=True)
 
 
@@ -4605,7 +6092,8 @@ else:
     if "active_workspace_label" not in st.session_state:
         st.session_state["active_workspace_label"] = "Оригинал"
 
-    switch_l, switch_r = st.columns([4, 1.25])
+    task_counts = task_summary_counts()
+    switch_l, switch_m, switch_r = st.columns([3.2, 1.25, 1.25])
     switch_l.radio(
         "Раздел",
         options=[label for _, label, _ in tab_specs],
@@ -4613,9 +6101,26 @@ else:
         horizontal=True,
         label_visibility="collapsed",
     )
+    switch_m.checkbox(
+        f"🔔 Задачи ({task_counts.get('open', 0)})",
+        key="show_task_center_global",
+        help="Открывает ленивый список задач и напоминаний по карточкам. Пока чекбокс выключен, список не строится.",
+    )
     switch_r.checkbox("Показать фото", key="show_photos_global")
 
     active_sheet_name, active_tab_label, active_tab_key = label_to_spec[st.session_state.get("active_workspace_label", "Оригинал")]
+    st.session_state["active_workspace_sheet_name"] = active_sheet_name
+    active_sheet_df = sheets.get(active_sheet_name) if isinstance(sheets, dict) else None
+    render_crm_header_bar(
+        active_sheet_df,
+        st.session_state.get("photo_df"),
+        st.session_state.get("avito_df"),
+        active_sheet_name,
+        active_tab_label,
+        st.session_state.get("distributor_min_qty", 1.0),
+    )
+    render_task_center_lazy_panel()
+    render_hot_buy_watchlist_lazy_panel()
     render_sheet_workspace(active_sheet_name, active_tab_label, active_tab_key)
 
 def normalize_watchlist_sheet_name(value: Any) -> str:
@@ -4763,12 +6268,37 @@ def apply_hot_watchlist(df: pd.DataFrame | None, hot_df: pd.DataFrame | None, ta
     return work
 
 
+
+
+def dataframe_to_excel_bytes(df: pd.DataFrame) -> bytes:
+    out = io.BytesIO()
+    with pd.ExcelWriter(out, engine="openpyxl") as writer:
+        (df if isinstance(df, pd.DataFrame) else pd.DataFrame()).to_excel(writer, index=False, sheet_name="Watchlist")
+    return out.getvalue()
+
 def hot_watchlist_summary_text() -> str:
     hot_df = st.session_state.get("hot_items_df")
     if not isinstance(hot_df, pd.DataFrame) or hot_df.empty:
         return "watchlist не загружен"
     buy_count = int((hot_df.get("buy_signal_30pct", pd.Series(dtype=object)).fillna("").map(normalize_text).str.upper() == "BUY").sum())
     ab_count = int(hot_df.get("abc_class", pd.Series(dtype=object)).fillna("").map(normalize_text).isin(["A", "B"]).sum())
-    return f"Ходовые: {len(hot_df)} • A/B: {ab_count} • BUY: {buy_count}"
+    return f"Ходовых: {len(hot_df)} • сильный спрос: {ab_count} • можно брать: {buy_count}"
+
+
+def hot_supplier_note(row: pd.Series | dict | None, best: dict | None, threshold_pct: float = 35.0) -> tuple[str, str]:
+    help_text = "Товар ходовой → товар хорошо продавался за выбранный период"
+    if not best:
+        help_text += f"\nСейчас брать невыгодно → нет поставщика с ценой минимум на {threshold_pct:.0f}% ниже нашей цены"
+        return "Сейчас брать невыгодно", help_text
+
+    source = normalize_text((best or {}).get("source", ""))
+    delta_pct = safe_float((best or {}).get("delta_percent"), 0.0)
+    if delta_pct >= float(threshold_pct):
+        action_text = f"Сейчас можно брать у {source}" if source else "Сейчас можно брать"
+        help_text += f"\nСейчас можно брать → лучший поставщик сейчас минимум на {threshold_pct:.0f}% дешевле нашей цены"
+        return action_text, help_text
+
+    help_text += f"\nСейчас брать невыгодно → нет поставщика с ценой минимум на {threshold_pct:.0f}% ниже нашей цены"
+    return "Сейчас брать невыгодно", help_text
 
 
