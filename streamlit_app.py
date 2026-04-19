@@ -2748,6 +2748,30 @@ def get_card_override_path() -> Path:
 def ensure_card_override_db() -> None:
     path = get_card_override_path()
     path.parent.mkdir(parents=True, exist_ok=True)
+    required_columns = {
+        "sheet_name": "TEXT NOT NULL",
+        "article_norm": "TEXT NOT NULL",
+        "article": "TEXT",
+        "photo_url": "TEXT",
+        "name_override": "TEXT",
+        "meta_brand": "TEXT",
+        "meta_model": "TEXT",
+        "meta_manufacturer_code": "TEXT",
+        "meta_print_type": "TEXT",
+        "meta_color": "TEXT",
+        "meta_capacity": "TEXT",
+        "meta_iso_pages": "TEXT",
+        "meta_item_type": "TEXT",
+        "meta_print_technology": "TEXT",
+        "meta_description": "TEXT",
+        "meta_fits_models": "TEXT",
+        "meta_weight": "TEXT",
+        "meta_length": "TEXT",
+        "meta_width": "TEXT",
+        "meta_height": "TEXT",
+        "note": "TEXT",
+        "updated_at": "TEXT",
+    }
     with sqlite3.connect(path) as conn:
         conn.execute(
             """
@@ -2757,15 +2781,31 @@ def ensure_card_override_db() -> None:
                 article TEXT,
                 photo_url TEXT,
                 name_override TEXT,
+                meta_brand TEXT,
                 meta_model TEXT,
                 meta_manufacturer_code TEXT,
+                meta_print_type TEXT,
+                meta_color TEXT,
+                meta_capacity TEXT,
+                meta_iso_pages TEXT,
+                meta_item_type TEXT,
+                meta_print_technology TEXT,
+                meta_description TEXT,
                 meta_fits_models TEXT,
+                meta_weight TEXT,
+                meta_length TEXT,
+                meta_width TEXT,
+                meta_height TEXT,
                 note TEXT,
                 updated_at TEXT,
                 PRIMARY KEY (sheet_name, article_norm)
             )
             """
         )
+        existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(card_overrides)")}
+        for col_name, col_type in required_columns.items():
+            if col_name not in existing_cols:
+                conn.execute(f"ALTER TABLE card_overrides ADD COLUMN {col_name} {col_type}")
         conn.commit()
 
 
@@ -2778,7 +2818,14 @@ def load_card_overrides_df() -> pd.DataFrame:
         df = pd.read_sql_query("SELECT * FROM card_overrides", conn)
     if df.empty:
         return df
-    for col in ["sheet_name", "article_norm", "article", "photo_url", "name_override", "meta_model", "meta_manufacturer_code", "meta_fits_models", "note", "updated_at"]:
+    for col in [
+        "sheet_name", "article_norm", "article", "photo_url", "name_override",
+        "meta_brand", "meta_model", "meta_manufacturer_code", "meta_print_type",
+        "meta_color", "meta_capacity", "meta_iso_pages", "meta_item_type",
+        "meta_print_technology", "meta_description", "meta_fits_models",
+        "meta_weight", "meta_length", "meta_width", "meta_height",
+        "note", "updated_at",
+    ]:
         if col in df.columns:
             df[col] = df[col].fillna("").map(normalize_text)
     return df
@@ -2800,22 +2847,42 @@ def save_card_override(sheet_name: str, article: str, article_norm: str, payload
             """
             INSERT INTO card_overrides (
                 sheet_name, article_norm, article, photo_url, name_override,
-                meta_model, meta_manufacturer_code, meta_fits_models, note, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                meta_brand, meta_model, meta_manufacturer_code, meta_print_type,
+                meta_color, meta_capacity, meta_iso_pages, meta_item_type,
+                meta_print_technology, meta_description, meta_fits_models,
+                meta_weight, meta_length, meta_width, meta_height,
+                note, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(sheet_name, article_norm) DO UPDATE SET
                 article=excluded.article,
                 photo_url=excluded.photo_url,
                 name_override=excluded.name_override,
+                meta_brand=excluded.meta_brand,
                 meta_model=excluded.meta_model,
                 meta_manufacturer_code=excluded.meta_manufacturer_code,
+                meta_print_type=excluded.meta_print_type,
+                meta_color=excluded.meta_color,
+                meta_capacity=excluded.meta_capacity,
+                meta_iso_pages=excluded.meta_iso_pages,
+                meta_item_type=excluded.meta_item_type,
+                meta_print_technology=excluded.meta_print_technology,
+                meta_description=excluded.meta_description,
                 meta_fits_models=excluded.meta_fits_models,
+                meta_weight=excluded.meta_weight,
+                meta_length=excluded.meta_length,
+                meta_width=excluded.meta_width,
+                meta_height=excluded.meta_height,
                 note=excluded.note,
                 updated_at=excluded.updated_at
             """,
             (
                 normalize_text(sheet_name), normalize_text(article_norm), normalize_text(article),
-                clean.get("photo_url", ""), clean.get("name_override", ""), clean.get("meta_model", ""),
-                clean.get("meta_manufacturer_code", ""), clean.get("meta_fits_models", ""), clean.get("note", ""), now
+                clean.get("photo_url", ""), clean.get("name_override", ""), clean.get("meta_brand", ""),
+                clean.get("meta_model", ""), clean.get("meta_manufacturer_code", ""), clean.get("meta_print_type", ""),
+                clean.get("meta_color", ""), clean.get("meta_capacity", ""), clean.get("meta_iso_pages", ""),
+                clean.get("meta_item_type", ""), clean.get("meta_print_technology", ""), clean.get("meta_description", ""),
+                clean.get("meta_fits_models", ""), clean.get("meta_weight", ""), clean.get("meta_length", ""),
+                clean.get("meta_width", ""), clean.get("meta_height", ""), clean.get("note", ""), now
             ),
         )
         conn.commit()
@@ -3213,9 +3280,21 @@ def apply_card_overrides(df: pd.DataFrame | None, sheet_name: str) -> pd.DataFra
         "photo_url",
         "source_sheet",
         "name",
+        "meta_brand",
         "meta_model",
         "meta_manufacturer_code",
+        "meta_print_type",
+        "meta_color",
+        "meta_capacity",
+        "meta_iso_pages",
+        "meta_item_type",
+        "meta_print_technology",
+        "meta_description",
         "meta_fits_models",
+        "meta_weight",
+        "meta_length",
+        "meta_width",
+        "meta_height",
         "manual_note",
     ]
     for col in text_cols:
@@ -3238,15 +3317,26 @@ def apply_card_overrides(df: pd.DataFrame | None, sheet_name: str) -> pd.DataFra
         name_override = normalize_text(ov.get("name_override", ""))
         if name_override:
             out.at[idx, "name"] = name_override
-        meta_model = normalize_text(ov.get("meta_model", ""))
-        if meta_model:
-            out.at[idx, "meta_model"] = meta_model
-        meta_code = normalize_text(ov.get("meta_manufacturer_code", ""))
-        if meta_code:
-            out.at[idx, "meta_manufacturer_code"] = meta_code
-        meta_fits = normalize_text(ov.get("meta_fits_models", ""))
-        if meta_fits:
-            out.at[idx, "meta_fits_models"] = meta_fits
+        for field_name in [
+            "meta_brand",
+            "meta_model",
+            "meta_manufacturer_code",
+            "meta_print_type",
+            "meta_color",
+            "meta_capacity",
+            "meta_iso_pages",
+            "meta_item_type",
+            "meta_print_technology",
+            "meta_description",
+            "meta_fits_models",
+            "meta_weight",
+            "meta_length",
+            "meta_width",
+            "meta_height",
+        ]:
+            field_value = normalize_text(ov.get(field_name, ""))
+            if field_value:
+                out.at[idx, field_name] = field_value
         note = normalize_text(ov.get("note", ""))
         if note:
             out.at[idx, "manual_note"] = note
@@ -3309,9 +3399,21 @@ def render_card_editor_panel(result_df: pd.DataFrame | None, sheet_name: str, ta
     art_norm = normalize_text(row.get("article_norm", ""))
     current_photo = normalize_text(row.get("photo_url", ""))
     current_name = normalize_text(row.get("name", ""))
+    current_brand = normalize_text(row.get("meta_brand", ""))
     current_model = normalize_text(row.get("meta_model", ""))
     current_code = normalize_text(row.get("meta_manufacturer_code", ""))
+    current_print_type = normalize_text(row.get("meta_print_type", ""))
+    current_color = normalize_text(row.get("meta_color", ""))
+    current_capacity = normalize_text(row.get("meta_capacity", ""))
+    current_iso_pages = normalize_text(row.get("meta_iso_pages", ""))
+    current_item_type = normalize_text(row.get("meta_item_type", ""))
+    current_print_technology = normalize_text(row.get("meta_print_technology", ""))
+    current_description = normalize_text(row.get("meta_description", ""))
     current_fits = normalize_text(row.get("meta_fits_models", ""))
+    current_weight = normalize_text(row.get("meta_weight", ""))
+    current_length = normalize_text(row.get("meta_length", ""))
+    current_width = normalize_text(row.get("meta_width", ""))
+    current_height = normalize_text(row.get("meta_height", ""))
     current_note = normalize_text(row.get("manual_note", ""))
 
     st.caption("Правки сохраняются как ручные overrides и накладываются поверх comparison-файла после каждой новой загрузки.")
@@ -3323,11 +3425,30 @@ def render_card_editor_panel(result_df: pd.DataFrame | None, sheet_name: str, ta
                 st.link_button("Открыть текущее фото", current_photo, use_container_width=True)
         with col2:
             name_override = st.text_area("Название", value=current_name, height=90, key=f"card_edit_name_{tab_key}_{art_norm}")
-        cmeta1, cmeta2 = st.columns(2)
-        meta_model = cmeta1.text_input("Модель", value=current_model, key=f"card_edit_model_{tab_key}_{art_norm}")
-        meta_code = cmeta2.text_input("Код производителя", value=current_code, key=f"card_edit_code_{tab_key}_{art_norm}")
-        meta_fits = st.text_area("Подходит к моделям", value=current_fits, height=80, key=f"card_edit_fits_{tab_key}_{art_norm}")
-        note = st.text_area("Заметка", value=current_note, height=70, key=f"card_edit_note_{tab_key}_{art_norm}")
+        cmeta1, cmeta2, cmeta3 = st.columns(3)
+        meta_brand = cmeta1.text_input("Бренд", value=current_brand, key=f"card_edit_brand_{tab_key}_{art_norm}")
+        meta_model = cmeta2.text_input("Модель", value=current_model, key=f"card_edit_model_{tab_key}_{art_norm}")
+        meta_code = cmeta3.text_input("Код производителя", value=current_code, key=f"card_edit_code_{tab_key}_{art_norm}")
+
+        cmeta4, cmeta5, cmeta6 = st.columns(3)
+        meta_print_type = cmeta4.text_input("Тип печати", value=current_print_type, key=f"card_edit_print_type_{tab_key}_{art_norm}")
+        meta_color = cmeta5.text_input("Цвет", value=current_color, key=f"card_edit_color_{tab_key}_{art_norm}")
+        meta_capacity = cmeta6.text_input("Емкость", value=current_capacity, key=f"card_edit_capacity_{tab_key}_{art_norm}")
+
+        cmeta7, cmeta8, cmeta9 = st.columns(3)
+        meta_iso_pages = cmeta7.text_input("Ресурс, стр.", value=current_iso_pages, key=f"card_edit_iso_pages_{tab_key}_{art_norm}")
+        meta_item_type = cmeta8.text_input("Тип", value=current_item_type, key=f"card_edit_item_type_{tab_key}_{art_norm}")
+        meta_print_technology = cmeta9.text_input("Технология", value=current_print_technology, key=f"card_edit_print_technology_{tab_key}_{art_norm}")
+
+        cmeta10, cmeta11, cmeta12, cmeta13 = st.columns(4)
+        meta_weight = cmeta10.text_input("Вес", value=current_weight, key=f"card_edit_weight_{tab_key}_{art_norm}")
+        meta_length = cmeta11.text_input("Длина", value=current_length, key=f"card_edit_length_{tab_key}_{art_norm}")
+        meta_width = cmeta12.text_input("Ширина", value=current_width, key=f"card_edit_width_{tab_key}_{art_norm}")
+        meta_height = cmeta13.text_input("Высота", value=current_height, key=f"card_edit_height_{tab_key}_{art_norm}")
+
+        meta_fits = st.text_area("Подходит к моделям", value=current_fits, height=70, key=f"card_edit_fits_{tab_key}_{art_norm}")
+        meta_description = st.text_area("Описание", value=current_description, height=65, key=f"card_edit_description_{tab_key}_{art_norm}")
+        note = st.text_area("Заметка", value=current_note, height=65, key=f"card_edit_note_{tab_key}_{art_norm}")
 
         st.markdown("### 🔔 Напоминание / задача")
         st.caption("Можно создать задачу на пересмотр позиции через несколько дней. Задача сохранится отдельно и не пропадёт после загрузки нового файла.")
@@ -3368,9 +3489,21 @@ def render_card_editor_panel(result_df: pd.DataFrame | None, sheet_name: str, ta
             {
                 "photo_url": photo_url,
                 "name_override": name_override,
+                "meta_brand": meta_brand,
                 "meta_model": meta_model,
                 "meta_manufacturer_code": meta_code,
+                "meta_print_type": meta_print_type,
+                "meta_color": meta_color,
+                "meta_capacity": meta_capacity,
+                "meta_iso_pages": meta_iso_pages,
+                "meta_item_type": meta_item_type,
+                "meta_print_technology": meta_print_technology,
+                "meta_description": meta_description,
                 "meta_fits_models": meta_fits,
+                "meta_weight": meta_weight,
+                "meta_length": meta_length,
+                "meta_width": meta_width,
+                "meta_height": meta_height,
                 "note": note,
             },
         )
@@ -6406,20 +6539,38 @@ def render_crm_card_center(
                 ("Габариты", dimensions),
             ]
 
+            compact_pairs = [
+                ("Бренд", brand),
+                ("Модель", model),
+                ("Код", mcode),
+                ("Цвет", color),
+                ("Ресурс", iso_pages),
+                ("Тип", item_type),
+            ]
+            compact_html = []
+            for label, value in compact_pairs:
+                if value:
+                    compact_html.append(
+                        f"<span style='display:inline-block;margin:0 8px 8px 0;padding:4px 10px;border:1px solid rgba(120,130,160,.25);border-radius:999px;background:rgba(120,130,160,.08);font-size:.92rem;'><b>{html.escape(label)}:</b> {html.escape(str(value))}</span>"
+                    )
+            if compact_html:
+                st.markdown("".join(compact_html), unsafe_allow_html=True)
+
             if any(v for _, v in quick_left + quick_right) or fits or description:
-                i1, i2 = st.columns(2)
-                with i1:
-                    for label, value in quick_left:
-                        if value:
-                            st.markdown(f"**{label}:** {value}")
-                with i2:
-                    for label, value in quick_right:
-                        if value:
-                            st.markdown(f"**{label}:** {value}")
-                if fits:
-                    st.markdown(f"**Подходит к моделям:** {fits}")
-                if description:
-                    st.caption(f"Описание: {description}")
+                with st.expander("Характеристики", expanded=False):
+                    i1, i2 = st.columns(2)
+                    with i1:
+                        for label, value in quick_left:
+                            if value:
+                                st.markdown(f"**{label}:** {value}")
+                    with i2:
+                        for label, value in quick_right:
+                            if value:
+                                st.markdown(f"**{label}:** {value}")
+                    if fits:
+                        st.markdown(f"**Подходит к моделям:** {fits}")
+                    if description:
+                        st.caption(f"Описание: {description}")
 
     with t_prices:
         st.caption("Здесь видно нашу цену и лучший рынок по текущей позиции. Это быстрый обзор, а полный блок 'Показать цены у всех' остаётся ниже.")
@@ -6458,9 +6609,21 @@ def render_crm_card_center(
         st.caption("Здесь можно быстро поправить карточку и сразу создать задачу на пересмотр без переходов вниз по странице.")
         current_photo = photo_url
         current_name = name
+        current_brand = brand
         current_model = model
         current_code = mcode
+        current_print_type = print_type
+        current_color = color
+        current_capacity = capacity
+        current_iso_pages = iso_pages
+        current_item_type = item_type
+        current_print_technology = print_technology
+        current_description = description
         current_fits = fits
+        current_weight = normalize_text(row.get("meta_weight", ""))
+        current_length = normalize_text(row.get("meta_length", ""))
+        current_width = normalize_text(row.get("meta_width", ""))
+        current_height = normalize_text(row.get("meta_height", ""))
         current_note = note
 
         with st.form(f"crm_card_form_{tab_key}_{art_norm}", clear_on_submit=False):
@@ -6469,11 +6632,30 @@ def render_crm_card_center(
                 photo_url_new = st.text_input("Фото (ссылка)", value=current_photo, key=f"crm_card_photo_{tab_key}_{art_norm}")
             with cc2:
                 name_new = st.text_area("Название", value=current_name, height=90, key=f"crm_card_name_{tab_key}_{art_norm}")
-            mm1, mm2 = st.columns(2)
-            model_new = mm1.text_input("Модель", value=current_model, key=f"crm_card_model_{tab_key}_{art_norm}")
-            code_new = mm2.text_input("Код производителя", value=current_code, key=f"crm_card_code_{tab_key}_{art_norm}")
-            fits_new = st.text_area("Подходит к моделям", value=current_fits, height=80, key=f"crm_card_fits_{tab_key}_{art_norm}")
-            note_new = st.text_area("Заметка", value=current_note, height=70, key=f"crm_card_note_{tab_key}_{art_norm}")
+            mm1, mm2, mm3 = st.columns(3)
+            brand_new = mm1.text_input("Бренд", value=current_brand, key=f"crm_card_brand_{tab_key}_{art_norm}")
+            model_new = mm2.text_input("Модель", value=current_model, key=f"crm_card_model_{tab_key}_{art_norm}")
+            code_new = mm3.text_input("Код производителя", value=current_code, key=f"crm_card_code_{tab_key}_{art_norm}")
+
+            mm4, mm5, mm6 = st.columns(3)
+            print_type_new = mm4.text_input("Тип печати", value=current_print_type, key=f"crm_card_print_type_{tab_key}_{art_norm}")
+            color_new = mm5.text_input("Цвет", value=current_color, key=f"crm_card_color_{tab_key}_{art_norm}")
+            capacity_new = mm6.text_input("Емкость", value=current_capacity, key=f"crm_card_capacity_{tab_key}_{art_norm}")
+
+            mm7, mm8, mm9 = st.columns(3)
+            iso_pages_new = mm7.text_input("Ресурс, стр.", value=current_iso_pages, key=f"crm_card_iso_pages_{tab_key}_{art_norm}")
+            item_type_new = mm8.text_input("Тип", value=current_item_type, key=f"crm_card_item_type_{tab_key}_{art_norm}")
+            print_technology_new = mm9.text_input("Технология", value=current_print_technology, key=f"crm_card_print_technology_{tab_key}_{art_norm}")
+
+            mm10, mm11, mm12, mm13 = st.columns(4)
+            weight_new = mm10.text_input("Вес", value=current_weight, key=f"crm_card_weight_{tab_key}_{art_norm}")
+            length_new = mm11.text_input("Длина", value=current_length, key=f"crm_card_length_{tab_key}_{art_norm}")
+            width_new = mm12.text_input("Ширина", value=current_width, key=f"crm_card_width_{tab_key}_{art_norm}")
+            height_new = mm13.text_input("Высота", value=current_height, key=f"crm_card_height_{tab_key}_{art_norm}")
+
+            fits_new = st.text_area("Подходит к моделям", value=current_fits, height=75, key=f"crm_card_fits_{tab_key}_{art_norm}")
+            description_new = st.text_area("Описание", value=current_description, height=70, key=f"crm_card_description_{tab_key}_{art_norm}")
+            note_new = st.text_area("Заметка", value=current_note, height=65, key=f"crm_card_note_{tab_key}_{art_norm}")
 
             st.markdown("#### 🔔 Создать задачу по карточке")
             st.caption("Заметка — это просто комментарий. Задача — отдельное напоминание со сроком, статусом и причиной.")
@@ -6513,9 +6695,21 @@ def render_crm_card_center(
                 {
                     "photo_url": photo_url_new,
                     "name_override": name_new,
+                    "meta_brand": brand_new,
                     "meta_model": model_new,
                     "meta_manufacturer_code": code_new,
+                    "meta_print_type": print_type_new,
+                    "meta_color": color_new,
+                    "meta_capacity": capacity_new,
+                    "meta_iso_pages": iso_pages_new,
+                    "meta_item_type": item_type_new,
+                    "meta_print_technology": print_technology_new,
+                    "meta_description": description_new,
                     "meta_fits_models": fits_new,
+                    "meta_weight": weight_new,
+                    "meta_length": length_new,
+                    "meta_width": width_new,
+                    "meta_height": height_new,
                     "note": note_new,
                 },
             )
