@@ -3031,6 +3031,7 @@ def render_task_center_lazy_panel() -> None:
     m2.metric("Новые", counts.get("new", 0))
     m3.metric("Активные", counts.get("active", 0))
     m4.metric("Просроченные", counts.get("overdue", 0))
+    st.caption("ⓘ Новые — ещё не разобраны. Активные — в работе. Просроченные — срок уже вышел. Этот блок нужен, чтобы не терять ручные проверки по карточкам.")
     st.caption(
         "Что показывает: задачи на пересмотр карточек и цен. "
         "Как пользоваться: смотри срочные задачи, открывай карточку и после проверки отмечай задачу выполненной."
@@ -5237,7 +5238,14 @@ with st.sidebar:
 
     st.markdown('<div class="sidebar-card">', unsafe_allow_html=True)
     render_sidebar_card_header("Ходовые позиции", "🔥", "Watchlist с продажами за период. Можно хранить на сервере и подсвечивать ходовые позиции прямо в результатах поиска.")
-    hot_uploaded = st.file_uploader("Загрузить watchlist", type=["xlsx", "xls", "csv"], key="hot_items_uploader", label_visibility="collapsed")
+    hot_uploaded = st.file_uploader(
+        "Загрузить watchlist",
+        type=["xlsx", "xls", "csv"],
+        key="hot_items_uploader",
+        label_visibility="collapsed",
+        help="Файл с продажами за период и полями watchlist. Именно он включает подсказки «ходовая / можно брать / невыгодно» в карточках и отчётах.",
+    )
+    st.caption("ⓘ Watchlist отвечает за спрос, дни запаса, приоритет и решение «можно брать / невыгодно» по ходовым позициям.")
     if hot_uploaded is not None:
         try:
             hot_bytes = hot_uploaded.getvalue()
@@ -5264,13 +5272,32 @@ with st.sidebar:
     hot_buy_total = 0
     if isinstance(hot_df_state, pd.DataFrame) and not hot_df_state.empty:
         hot_buy_total = int(hot_df_state.get("buy_signal_30pct", pd.Series(dtype=object)).fillna("").map(normalize_text).str.upper().eq("BUY").sum())
-    st.checkbox(f"Показать таблицу «можно брать» ({hot_buy_total})", key="show_hot_buy_watchlist_table", help="Лениво открывает таблицу только по ходовым позициям со статусом BUY. Пока чекбокс выключен, таблица не строится.")
+    st.checkbox(
+        f"Показать таблицу «можно брать» ({hot_buy_total})",
+        key="show_hot_buy_watchlist_table",
+        help="Лениво открывает таблицу только по ходовым позициям со статусом BUY. Пока чекбокс выключен, таблица не строится.",
+    )
+    st.caption("ⓘ Таблица «можно брать» показывает только те ходовые позиции, где поставщик проходит твой порог выгоды и есть остаток.")
     st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown('<div class="sidebar-card">', unsafe_allow_html=True)
     render_sidebar_card_header("Отчёт и цены", "📊", "Порог выгоды и минимальный остаток для пересчёта лучшей цены.")
-    st.number_input("Порог отчёта, %", min_value=0.0, max_value=95.0, step=1.0, key="distributor_threshold")
-    st.number_input("Мин. остаток у поставщика", min_value=1.0, max_value=999999.0, step=1.0, key="distributor_min_qty")
+    st.number_input(
+        "Порог отчёта, %",
+        min_value=0.0,
+        max_value=95.0,
+        step=1.0,
+        key="distributor_threshold",
+        help="Минимальный процент выгоды от нашей цены. Ниже этого порога поставщик не считается интересным для отчёта и части подсказок.",
+    )
+    st.number_input(
+        "Мин. остаток у поставщика",
+        min_value=1.0,
+        max_value=999999.0,
+        step=1.0,
+        key="distributor_min_qty",
+        help="Минимальный остаток у поставщика, ниже которого предложение считается слишком слабым и не участвует в сравнении.",
+    )
     st.markdown('<div class="sidebar-mini">Колонки Мин. у конкурентов / Разница из Excel не используются. Всё считаем заново прямо в приложении.</div>', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
@@ -5852,6 +5879,7 @@ def render_operational_analytics_block(sheet_df: pd.DataFrame, photo_df: pd.Data
     m2.metric("Нет в Avito", int(quality.get("in_price_not_in_avito", 0)))
     m3.metric("Дороже рынка", int(len(top_df) if isinstance(top_df, pd.DataFrame) else 0))
     m4.metric("История ручных правок", int(len(patch_history_df) if isinstance(patch_history_df, pd.DataFrame) else 0))
+    st.caption("ⓘ Метрики сверху: Без фото — карточки без изображения; Нет в Avito — позиции без объявления; Дороже рынка — где мы выше лучшего поставщика; История ручных правок — сколько записей накоплено по изменениям цены.")
 
     render_info_banner(
         "Что делать сегодня",
@@ -6033,6 +6061,7 @@ def render_crm_header_bar(
         help_text="Эта шапка ничего не меняет в comparison. Она только помогает быстро открыть нужный рабочий блок без долгой прокрутки.",
     )
     c1, c2, c3, c4, c5 = st.columns(5)
+    st.caption("ⓘ CRM-шапка — это быстрые переключатели по текущему листу: открыть задачи, выгодные закупки и сразу увидеть, где не хватает фото или Avito.")
     with c1:
         open_tasks = bool(st.checkbox(
             f"🔔 Задачи ({stats['tasks_open']})",
@@ -6135,6 +6164,7 @@ def render_crm_card_center(
         matched_ads = find_avito_ads(avito_df, one_row)
 
     t_overview, t_prices, t_avito, t_notes = st.tabs(["Обзор", "Цены", "Avito", "Заметки / задачи"])
+    st.caption("ⓘ Обзор — краткая карточка товара. Цены — наша цена и лучший рынок. Avito — объявления по позиции. Заметки / задачи — ручные комментарии и напоминания.")
 
     with t_overview:
         c1, c2 = st.columns([1, 2])
@@ -6338,6 +6368,7 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
             f"<div style='padding-top:9px;color:#64748b;font-size:12px;'>Тип поиска сейчас: <b>{html.escape(search_mode)}</b>. Для коротких OEM-кодов вроде TK-8600Y используй режим «Умный».</div>",
             unsafe_allow_html=True,
         )
+    st.caption("ⓘ Ниже — ленивые рабочие блоки. Каждый чекбокс включает только свой слой: шаблоны, цены, Avito, отчёт по листу или аналитику.")
     st.markdown('</div>', unsafe_allow_html=True)
 
     result_df = st.session_state.get(result_key)
@@ -6534,12 +6565,37 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
             render_card_editor_panel(display_result_df, sheet_name, tab_key)
 
             lazy_c0, lazy_c1, lazy_c2, lazy_c3, lazy_c4, lazy_c5 = st.columns(6)
-            lazy_c0.checkbox("Показать шаблоны", key=f"lazy_templates_{tab_key}")
-            lazy_c1.checkbox("Показать цены у всех", key=f"lazy_all_prices_{tab_key}")
-            lazy_c2.checkbox("Файл для руководителя", key=f"lazy_analysis_{tab_key}")
-            lazy_c3.checkbox("Показать Авито", key=f"lazy_avito_{tab_key}")
-            lazy_c4.checkbox("Считать отчёт по листу", key=f"lazy_report_{tab_key}")
-            lazy_c5.checkbox("Аналитика / задачи", key=f"lazy_analytics_{tab_key}")
+            lazy_c0.checkbox(
+                "Показать шаблоны",
+                key=f"lazy_templates_{tab_key}",
+                help="Готовые текстовые шаблоны по найденным позициям: для ответа клиенту, публикации или быстрой отправки.",
+            )
+            lazy_c1.checkbox(
+                "Показать цены у всех",
+                key=f"lazy_all_prices_{tab_key}",
+                help="Полное сравнение по каждому найденному товару: наша цена и все поставщики с остатками и разницей.",
+            )
+            lazy_c2.checkbox(
+                "Файл для руководителя",
+                key=f"lazy_analysis_{tab_key}",
+                help="Собирает Excel для согласования: артикулы, текущая цена, лучшая цена поставщика и поля для решения по пересмотру.",
+            )
+            lazy_c3.checkbox(
+                "Показать Авито",
+                key=f"lazy_avito_{tab_key}",
+                help="Проверяет, есть ли объявления Авито по найденным артикулам в загруженном файле.",
+            )
+            lazy_c4.checkbox(
+                "Считать отчёт по листу",
+                key=f"lazy_report_{tab_key}",
+                help="Строит управленческий отчёт по всему текущему листу, а не только по найденным строкам.",
+            )
+            lazy_c5.checkbox(
+                "Аналитика / задачи",
+                key=f"lazy_analytics_{tab_key}",
+                help="Открывает операционную аналитику: что пересмотреть, где нет фото/Avito, какие серии и правки требуют внимания.",
+            )
+            st.caption("ⓘ Что за что отвечает: шаблоны — тексты, цены у всех — полная рыночная картина, файл для руководителя — выгрузка на согласование, Авито — наличие объявлений, отчёт по листу — управленческий отчёт, аналитика / задачи — проблемные зоны и действия.")
 
             if st.session_state.get(f"lazy_templates_{tab_key}", False):
                 result_enriched_for_templates = apply_photo_map(result_df, photo_df) if isinstance(result_df, pd.DataFrame) else result_df
@@ -6636,6 +6692,7 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
             icon="📊",
             help_text="Отчёт строится по всему текущему листу, а не только по поисковой выдаче. Порог и минимальный остаток меняются в sidebar.",
         )
+        st.caption("ⓘ Отчёт по листу = управленческий отчёт по всему текущему листу. Если есть watchlist, сюда добавляются спрос, дни запаса, приоритет и действие.")
         report_hot_lookup = build_hot_watchlist_lookup(st.session_state.get("hot_items_df"), tab_label)
         report_df = build_report_df(
             base_sheet_df,
@@ -6750,8 +6807,13 @@ else:
         key="show_task_center_global",
         help="Открывает ленивый список задач и напоминаний по карточкам. Пока чекбокс выключен, список не строится.",
     )
-    switch_r.checkbox("Показать фото", key="show_photos_global")
+    switch_r.checkbox(
+        "Показать фото",
+        key="show_photos_global",
+        help="Включает изображения в карточках поиска. Если отключить, интерфейс становится легче и работает быстрее.",
+    )
 
+    st.caption("ⓘ Верхние переключатели отвечают за быстрый доступ: раздел, задачи и фото. Основные тяжёлые блоки ниже открываются только по чекбоксам.")
     active_sheet_name, active_tab_label, active_tab_key = label_to_spec[st.session_state.get("active_workspace_label", "Оригинал")]
     active_sheet_df = sheets.get(active_sheet_name) if isinstance(sheets, dict) else None
     if is_service_safe_boot_enabled():
