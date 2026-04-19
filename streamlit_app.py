@@ -2558,6 +2558,7 @@ def load_photo_registry_df() -> pd.DataFrame:
         df = pd.read_sql_query("SELECT * FROM photo_registry", conn)
     if df.empty:
         return df
+
     expected_cols = [
         "article", "article_norm", "photo_url", "source_sheet",
         "meta_brand", "meta_color", "meta_capacity", "meta_manufacturer_code",
@@ -2570,6 +2571,7 @@ def load_photo_registry_df() -> pd.DataFrame:
         if col not in df.columns:
             df[col] = ""
         df[col] = df[col].fillna("").map(normalize_text)
+
     # Откатили веб-парсер: старые web-fallback записи не подмешиваем в рабочий реестр.
     if "import_name" in df.columns:
         df = df[df["import_name"].fillna("") != "web-fallback"].copy()
@@ -3378,126 +3380,6 @@ def render_analytics_jump_helper(df: pd.DataFrame | None, tab_key: str, box_key:
     )
     if c2.button("Открыть", key=f"analytics_open_btn_{box_key}_{tab_key}", use_container_width=True):
         trigger_search_from_article(selected_article, tab_key)
-
-
-def render_crm_issue_open_helper(
-    df: pd.DataFrame | None,
-    tab_key: str,
-    box_key: str,
-    button_text: str = "Открыть",
-    open_editor: bool = False,
-) -> None:
-    if not isinstance(df, pd.DataFrame) or df.empty or "Артикул" not in df.columns:
-        return
-    articles = [normalize_text(x) for x in df["Артикул"].tolist() if normalize_text(x)]
-    articles = unique_preserve_order(articles)
-    if not articles:
-        return
-    c1, c2 = st.columns([4, 1.3])
-    selected_article = c1.selectbox(
-        "Открыть позицию в обычном поиске",
-        articles,
-        key=f"crm_issue_open_select_{box_key}_{tab_key}",
-        help="Открывает позицию в обычном поиске. Дальше можно сразу работать с шаблоном, Avito и карточкой.",
-    )
-    if c2.button(button_text, key=f"crm_issue_open_btn_{box_key}_{tab_key}", use_container_width=True):
-        if open_editor:
-            st.session_state[f"show_card_editor_{tab_key}"] = True
-        trigger_search_from_article(selected_article, tab_key)
-
-
-def render_crm_quality_issue_lazy_panels(
-    sheet_df: pd.DataFrame | None,
-    photo_df: pd.DataFrame | None,
-    avito_df: pd.DataFrame | None,
-    min_qty: float,
-    sheet_name: str,
-    tab_label: str,
-    tab_key: str,
-) -> None:
-    show_no_photo = bool(st.session_state.get(f"crm_show_no_photo_{sheet_name}", False))
-    show_no_avito = bool(st.session_state.get(f"crm_show_no_avito_{sheet_name}", False))
-    if not (show_no_photo or show_no_avito):
-        return
-    if not isinstance(sheet_df, pd.DataFrame) or sheet_df.empty:
-        return
-
-    registry_df = load_avito_registry_df()
-    bundle = build_operational_analytics_bundle(
-        sheet_df,
-        photo_df,
-        avito_df,
-        registry_df,
-        min_qty,
-        tab_label,
-        st.session_state.get("hot_items_df"),
-    )
-    meta_df = bundle.get("meta_df", pd.DataFrame()) if isinstance(bundle, dict) else pd.DataFrame()
-    if not isinstance(meta_df, pd.DataFrame) or meta_df.empty:
-        return
-
-    def _render_issue_panel(
-        issue_df: pd.DataFrame,
-        title: str,
-        subtitle: str,
-        icon: str,
-        box_key: str,
-        button_text: str,
-        open_editor: bool,
-    ) -> None:
-        st.markdown('<div class="result-wrap">', unsafe_allow_html=True)
-        render_block_header(
-            title,
-            subtitle,
-            icon=icon,
-            help_text="Это ленивый поверхностный инструмент CRM. Он ничего не меняет в ядре, а только помогает открыть нужные позиции в обычном поиске.",
-        )
-        if issue_df.empty:
-            st.info("По текущему листу строк не найдено.")
-        else:
-            view_cols = [
-                "Артикул", "Название", "Наш остаток", "Причины", "Объявлений Авито",
-                "Фото", "Шаблон", "Лучший поставщик", "Разница, %",
-            ]
-            view_cols = [c for c in view_cols if c in issue_df.columns]
-            view = issue_df[view_cols].copy()
-            st.dataframe(
-                view,
-                use_container_width=True,
-                hide_index=True,
-                height=min(520, 120 + len(view) * 35),
-            )
-            render_crm_issue_open_helper(issue_df, tab_key, box_key, button_text=button_text, open_editor=open_editor)
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    if show_no_photo:
-        no_photo_df = meta_df[meta_df.get("Фото", pd.Series(dtype=object)).fillna("").eq("Нет")].copy()
-        if not no_photo_df.empty:
-            no_photo_df = no_photo_df.sort_values(["Наш остаток", "Название"], ascending=[False, True], na_position="last").reset_index(drop=True)
-        _render_issue_panel(
-            no_photo_df,
-            f"Нет фото — позиции для доработки ({len(no_photo_df)})",
-            "Показывает только позиции текущего листа без фото. Можно быстро открыть товар в обычном поиске и сразу поправить карточку.",
-            icon="🖼️",
-            box_key="crm_no_photo",
-            button_text="Открыть и редактировать",
-            open_editor=True,
-        )
-
-    if show_no_avito:
-        no_avito_mask = pd.to_numeric(meta_df.get("Объявлений Авито", 0), errors="coerce").fillna(0).eq(0)
-        no_avito_df = meta_df[no_avito_mask].copy()
-        if not no_avito_df.empty:
-            no_avito_df = no_avito_df.sort_values(["Наш остаток", "Название"], ascending=[False, True], na_position="last").reset_index(drop=True)
-        _render_issue_panel(
-            no_avito_df,
-            f"Без Avito — позиции для размещения ({len(no_avito_df)})",
-            "Показывает только позиции текущего листа без объявлений Avito. Можно быстро открыть позицию в обычном поиске и перейти к шаблону/размещению.",
-            icon="🛒",
-            box_key="crm_no_avito",
-            button_text="Открыть",
-            open_editor=False,
-        )
 
 
 def render_card_editor_panel(result_df: pd.DataFrame | None, sheet_name: str, tab_key: str) -> None:
@@ -6540,25 +6422,11 @@ def render_crm_header_bar(
             st.session_state["crm_last_active_sheet_for_buy"] = str(sheet_name)
         st.caption("Показывает только выгодные позиции")
     with c3:
-        open_no_photo = bool(st.checkbox(
-            f"🖼️ Нет фото ({stats['without_photo']})",
-            value=bool(st.session_state.get(f"crm_show_no_photo_{sheet_name}", False)),
-            key=f"crm_show_no_photo_{sheet_name}",
-            help="Открывает таблицу только по позициям текущего листа без фото. Отсюда можно сразу открыть и поправить карточку.",
-        ))
-        if open_no_photo:
-            st.session_state["crm_last_active_sheet_for_no_photo"] = str(sheet_name)
-        st.caption("Показывает только позиции без фото")
+        st.metric("🖼️ Нет фото", stats["without_photo"])
+        st.caption("Сколько позиций на листе без фото")
     with c4:
-        open_no_avito = bool(st.checkbox(
-            f"🛒 Без Avito ({stats['without_avito']})",
-            value=bool(st.session_state.get(f"crm_show_no_avito_{sheet_name}", False)),
-            key=f"crm_show_no_avito_{sheet_name}",
-            help="Открывает таблицу только по позициям текущего листа без объявлений Avito. Отсюда можно перейти в обычный поиск и быстро разместить.",
-        ))
-        if open_no_avito:
-            st.session_state["crm_last_active_sheet_for_no_avito"] = str(sheet_name)
-        st.caption("Показывает только позиции без Avito")
+        st.metric("🛒 Без Avito", stats["without_avito"])
+        st.caption("Сколько позиций на листе без объявления")
     with c5:
         st.metric("Лист", tab_label)
         st.caption("CRM-метрики именно по текущему листу")
@@ -7395,15 +7263,6 @@ else:
         )
         render_task_center_lazy_panel()
         render_hot_buy_watchlist_lazy_panel()
-        render_crm_quality_issue_lazy_panels(
-            active_sheet_df,
-            st.session_state.get("photo_df"),
-            st.session_state.get("avito_df"),
-            st.session_state.get("distributor_min_qty", 1.0),
-            active_sheet_name,
-            active_tab_label,
-            active_tab_key,
-        )
         render_sheet_workspace(active_sheet_name, active_tab_label, active_tab_key)
 
 def normalize_watchlist_sheet_name(value: Any) -> str:
