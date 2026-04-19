@@ -517,18 +517,29 @@ def render_service_mode_sidebar() -> None:
     service_open = st.checkbox(
         "Открыть сервисный режим",
         key="service_mode_open",
-        help="Ленивая сервисная панель: проверка системы, snapshot, восстановление и backup.zip.",
+        help="Ленивая сервисная панель. Пока блок закрыт, проверки, сравнение snapshot и сбор backup.zip не запускаются.",
     )
     safe_boot_on = bool(status.get("safe_boot"))
     st.markdown(
         f"<div class='sidebar-mini'>Safe boot: <b>{'включён' if safe_boot_on else 'выключен'}</b></div>",
         unsafe_allow_html=True,
     )
+    st.caption("ⓘ Safe boot — облегчённый запуск. Полезен, если после неудачного обновления нужно спокойно зайти в систему и сделать откат.")
     sb1, sb2 = st.columns(2)
-    if sb1.button("Включить safe boot", use_container_width=True, key="service_enable_safe_boot"):
+    if sb1.button(
+        "Включить safe boot",
+        use_container_width=True,
+        key="service_enable_safe_boot",
+        help="Включает облегчённый запуск. Тяжёлые блоки можно не рендерить, чтобы быстрее восстановить систему.",
+    ):
         enable_service_safe_boot()
         st.rerun()
-    if sb2.button("Выключить safe boot", use_container_width=True, key="service_disable_safe_boot"):
+    if sb2.button(
+        "Выключить safe boot",
+        use_container_width=True,
+        key="service_disable_safe_boot",
+        help="Возвращает обычный режим работы приложения.",
+    ):
         disable_service_safe_boot()
         st.rerun()
 
@@ -543,6 +554,7 @@ def render_service_mode_sidebar() -> None:
         return
 
     st.markdown("**1. Статус системы**")
+    st.caption("ⓘ Показывает, что именно сейчас читается без ошибок: основные файлы, реестры SQLite, snapshots и safe boot.")
     for rec in status.get("checks", []):
         icon = "✅" if rec.get("status") == "ok" else ("⚠️" if rec.get("status") == "warn" else "❌")
         st.markdown(f"{icon} **{html.escape(str(rec.get('name', '')))}** — {html.escape(str(rec.get('details', '')))}")
@@ -552,13 +564,25 @@ def render_service_mode_sidebar() -> None:
     )
 
     st.markdown("**2. Сделать snapshot сейчас**")
-    st.text_input("Причина snapshot", key="service_snapshot_reason", placeholder="Например: перед загрузкой нового comparison")
-    if st.button("Сделать snapshot сейчас", use_container_width=True, key="service_snapshot_now"):
+    st.caption("ⓘ Snapshot — это точка отката. Перед рискованными действиями можно вручную сохранить текущее состояние системы.")
+    st.text_input(
+        "Причина snapshot",
+        key="service_snapshot_reason",
+        placeholder="Например: перед загрузкой нового comparison",
+        help="Коротко подпиши, зачем создаётся снимок. Потом по этой причине легче найти нужную точку отката.",
+    )
+    if st.button(
+        "Сделать snapshot сейчас",
+        use_container_width=True,
+        key="service_snapshot_now",
+        help="Сохраняет текущие файлы /data и внутренние реестры в отдельную папку snapshot.",
+    ):
         reason = st.session_state.get("service_snapshot_reason", "") or "manual snapshot"
         snap = create_service_snapshot(reason=reason, source="manual")
         st.success(f"Snapshot создан: {snap.name}")
 
     st.markdown("**3. Восстановление**")
+    st.caption("ⓘ Здесь можно сравнить текущее состояние с выбранным snapshot и вернуть систему назад. Перед восстановлением автоматически создаётся страховочный snapshot.")
     snapshots = list_service_snapshots(limit=100)
     if snapshots:
         options = [item["name"] for item in snapshots]
@@ -566,6 +590,7 @@ def render_service_mode_sidebar() -> None:
             "Выбери snapshot",
             options=options,
             key="service_selected_snapshot",
+            help="Список доступных точек отката. В названии и описании видно дату и причину создания.",
             format_func=lambda x: next(
                 (
                     f"{item.get('created_at', '')} • {item.get('reason', '') or item.get('name', '')}"
@@ -581,8 +606,14 @@ def render_service_mode_sidebar() -> None:
         st.checkbox(
             "Я понимаю, что текущее состояние будет заменено выбранным snapshot",
             key="service_restore_confirm",
+            help="Защита от случайного отката. Без этого подтверждения восстановление не запустится.",
         )
-        if st.button("Восстановить snapshot", use_container_width=True, key="service_restore_snapshot"):
+        if st.button(
+            "Восстановить snapshot",
+            use_container_width=True,
+            key="service_restore_snapshot",
+            help="Копирует файлы из выбранного snapshot обратно в рабочее состояние приложения.",
+        ):
             if not st.session_state.get("service_restore_confirm", False):
                 st.warning("Подтверди восстановление чекбоксом выше.")
             else:
@@ -593,8 +624,19 @@ def render_service_mode_sidebar() -> None:
         st.info("Snapshot пока нет.")
 
     st.markdown("**4. Скачать резервную копию**")
-    st.checkbox("Включить snapshots в backup.zip", key="service_backup_include_snapshots", value=True)
-    if st.button("Собрать backup.zip", use_container_width=True, key="service_build_backup_zip"):
+    st.caption("ⓘ Backup.zip — это архив всего важного состояния, который можно скачать наружу и хранить отдельно от сервера.")
+    st.checkbox(
+        "Включить snapshots в backup.zip",
+        key="service_backup_include_snapshots",
+        value=True,
+        help="Если включено, в архив попадут и live-файлы, и папка snapshots. Архив будет больше, но надёжнее.",
+    )
+    if st.button(
+        "Собрать backup.zip",
+        use_container_width=True,
+        key="service_build_backup_zip",
+        help="Собирает полный архив резервной копии для скачивания.",
+    ):
         backup_bytes = build_service_backup_zip_bytes(
             include_snapshots=bool(st.session_state.get("service_backup_include_snapshots", True))
         )
@@ -616,6 +658,7 @@ def render_service_mode_sidebar() -> None:
         )
 
     st.markdown("**5. Лог сервиса**")
+    st.caption("ⓘ Здесь видны последние сервисные действия: snapshot, backup, restore, safe boot и предупреждения проверки.")
     service_keywords = ("Сервис:", "snapshot", "restore", "backup", "safe boot")
     service_log_items = [
         item for item in st.session_state.get("operation_log", [])
