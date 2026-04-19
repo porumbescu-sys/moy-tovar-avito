@@ -8,6 +8,8 @@ import math
 import re
 import sqlite3
 import hashlib
+import shutil
+import zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
@@ -133,6 +135,496 @@ def render_operation_log_sidebar() -> None:
             st.caption("Пока пусто")
             return
         for item in reversed(log_items[-12:]):
+            icon = "✅" if item.get("level") == "success" else ("⚠️" if item.get("level") == "warning" else "•")
+            st.markdown(f"{icon} **{html.escape(str(item.get('time', '')))}** — {html.escape(str(item.get('message', '')))}", unsafe_allow_html=True)
+
+
+
+
+SERVICE_SNAPSHOT_DIRNAME = "_service_snapshots"
+SERVICE_EXPORT_DIRNAME = "_service_exports"
+SERVICE_SAFE_BOOT_FLAG = "_service_safe_boot.flag"
+
+
+def get_app_root_dir() -> Path:
+    try:
+        return Path(__file__).resolve().parent
+    except Exception:
+        return Path.cwd()
+
+
+def get_service_snapshots_dir() -> Path:
+    path = get_server_data_dir() / SERVICE_SNAPSHOT_DIRNAME
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def get_service_exports_dir() -> Path:
+    path = get_server_data_dir() / SERVICE_EXPORT_DIRNAME
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def get_service_safe_boot_flag_path() -> Path:
+    return get_server_data_dir() / SERVICE_SAFE_BOOT_FLAG
+
+
+def is_service_safe_boot_enabled() -> bool:
+    return get_service_safe_boot_flag_path().exists()
+
+
+def enable_service_safe_boot() -> None:
+    flag = get_service_safe_boot_flag_path()
+    flag.parent.mkdir(parents=True, exist_ok=True)
+    flag.write_text("1", encoding="utf-8")
+    log_operation("Сервис: включён безопасный запуск", "warning")
+
+
+def disable_service_safe_boot() -> None:
+    flag = get_service_safe_boot_flag_path()
+    if flag.exists():
+        flag.unlink()
+    log_operation("Сервис: безопасный запуск выключен", "success")
+
+
+def _service_db_path(filename: str) -> Path:
+    try:
+        return Path(__file__).resolve().with_name(filename)
+    except Exception:
+        return Path.cwd() / filename
+
+
+def _service_slug(value: str) -> str:
+    txt = normalize_text(value) or "snapshot"
+    txt = re.sub(r"[^A-Za-zА-Яа-я0-9._-]+", "_", txt)
+    txt = re.sub(r"_+", "_", txt).strip("._-")
+    return txt[:64] or "snapshot"
+
+
+def _service_rel_path(path: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(get_app_root_dir().resolve()))
+    except Exception:
+        return path.name
+
+
+def _service_file_md5(path: Path) -> str:
+    md5 = hashlib.md5()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            if not chunk:
+                break
+            md5.update(chunk)
+    return md5.hexdigest()
+
+
+def get_service_live_file_entries() -> list[dict[str, Any]]:
+    comparison = get_persisted_comparison_file_path()
+    photo = get_persisted_photo_file_path()
+    avito = get_persisted_avito_file_path()
+    watchlist = get_persisted_watchlist_file_path()
+    entries = [
+        {"label": "comparison", "path": comparison},
+        {"label": "comparison_meta", "path": get_persisted_meta_path(comparison)},
+        {"label": "photo", "path": photo},
+        {"label": "photo_meta", "path": get_persisted_meta_path(photo)},
+        {"label": "avito", "path": avito},
+        {"label": "avito_meta", "path": get_persisted_meta_path(avito)},
+        {"label": "watchlist", "path": watchlist},
+        {"label": "watchlist_meta", "path": get_persisted_meta_path(watchlist)},
+        {"label": "review_tasks_db", "path": _service_db_path("review_tasks.sqlite")},
+        {"label": "avito_registry_db", "path": _service_db_path("avito_registry.sqlite")},
+        {"label": "photo_registry_db", "path": _service_db_path("photo_registry.sqlite")},
+        {"label": "price_patch_history_db", "path": _service_db_path("price_patch_history.sqlite")},
+        {"label": "card_overrides_db", "path": _service_db_path("card_overrides.sqlite")},
+    ]
+    return entries
+
+
+def maybe_create_service_snapshot_before_action(action_key: str, content_sig: str, reason: str) -> str:
+    state_key = f"service_snapshot_sig__{action_key}"
+    if st.session_state.get(state_key) == content_sig:
+        return ""
+    snap_dir = create_service_snapshot(reason=reason, source="auto")
+    st.session_state[state_key] = content_sig
+    return snap_dir.name if isinstance(snap_dir, Path) else ""
+
+
+def create_service_snapshot(reason: str = "", source: str = "manual") -> Path:
+    snap_root = get_service_snapshots_dir()
+    timestamp = datetime.utcnow().strftime("%Y-%m-%d_%H-%M-%S")
+    folder_name = f"{timestamp}__{_service_slug(source)}__{_service_slug(reason or 'snapshot')}"
+    snap_dir = snap_root / folder_name
+    files_dir = snap_dir / "files"
+    files_dir.mkdir(parents=True, exist_ok=True)
+
+    files_meta: list[dict[str, Any]] = []
+    for entry in get_service_live_file_entries():
+        path = entry["path"]
+        if not path.exists() or not path.is_file():
+            continue
+        rel_path = _service_rel_path(path)
+        target = files_dir / rel_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, target)
+        files_meta.append({
+            "label": entry["label"],
+            "relative_path": rel_path,
+            "size": path.stat().st_size,
+            "md5": _service_file_md5(path),
+            "modified_at": datetime.utcfromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds"),
+        })
+
+    manifest = {
+        "snapshot_name": folder_name,
+        "created_at": datetime.utcnow().isoformat(timespec="seconds"),
+        "source": normalize_text(source),
+        "reason": normalize_text(reason),
+        "app_title": APP_TITLE,
+        "app_version": APP_VERSION,
+        "file_count": len(files_meta),
+        "files": files_meta,
+    }
+    (snap_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    log_operation(f"Сервис: создан snapshot {folder_name} ({len(files_meta)} файлов)", "success")
+    return snap_dir
+
+
+def _read_service_snapshot_manifest(snap_dir: Path) -> dict[str, Any]:
+    manifest_path = snap_dir / "manifest.json"
+    if manifest_path.exists():
+        try:
+            return json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {
+        "snapshot_name": snap_dir.name,
+        "created_at": "",
+        "source": "",
+        "reason": "",
+        "app_title": APP_TITLE,
+        "app_version": APP_VERSION,
+        "file_count": 0,
+        "files": [],
+    }
+
+
+def list_service_snapshots(limit: int = 50) -> list[dict[str, Any]]:
+    root = get_service_snapshots_dir()
+    items: list[dict[str, Any]] = []
+    for snap_dir in root.iterdir():
+        if not snap_dir.is_dir():
+            continue
+        meta = _read_service_snapshot_manifest(snap_dir)
+        meta["path"] = str(snap_dir)
+        meta["name"] = snap_dir.name
+        items.append(meta)
+    items.sort(key=lambda x: (str(x.get("created_at", "")), str(x.get("name", ""))), reverse=True)
+    return items[:limit]
+
+
+def build_service_snapshot_compare_df(snapshot_name: str) -> pd.DataFrame:
+    snap_dir = get_service_snapshots_dir() / snapshot_name
+    files_dir = snap_dir / "files"
+    rows: list[dict[str, Any]] = []
+    for entry in get_service_live_file_entries():
+        live_path = entry["path"]
+        rel_path = _service_rel_path(live_path)
+        snap_path = files_dir / rel_path
+        live_exists = live_path.exists()
+        snap_exists = snap_path.exists()
+        changed = ""
+        if live_exists and snap_exists:
+            try:
+                changed = "Да" if _service_file_md5(live_path) != _service_file_md5(snap_path) else "Нет"
+            except Exception:
+                changed = "?"
+        elif live_exists != snap_exists:
+            changed = "Да"
+        rows.append({
+            "Файл": rel_path,
+            "В snapshot": "Да" if snap_exists else "—",
+            "Сейчас": "Да" if live_exists else "—",
+            "Snapshot, КБ": round(snap_path.stat().st_size / 1024, 1) if snap_exists else 0.0,
+            "Сейчас, КБ": round(live_path.stat().st_size / 1024, 1) if live_exists else 0.0,
+            "Изменён": changed,
+        })
+    return pd.DataFrame(rows)
+
+
+def restore_service_snapshot(snapshot_name: str) -> dict[str, Any]:
+    snap_dir = get_service_snapshots_dir() / snapshot_name
+    files_dir = snap_dir / "files"
+    if not snap_dir.exists():
+        raise FileNotFoundError(f"Snapshot не найден: {snapshot_name}")
+
+    emergency = create_service_snapshot(reason=f"before restore {snapshot_name}", source="pre_restore")
+
+    restored: list[str] = []
+    removed: list[str] = []
+    for entry in get_service_live_file_entries():
+        live_path = entry["path"]
+        rel_path = _service_rel_path(live_path)
+        snap_path = files_dir / rel_path
+        if snap_path.exists():
+            live_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(snap_path, live_path)
+            restored.append(rel_path)
+        elif live_path.exists():
+            try:
+                live_path.unlink()
+                removed.append(rel_path)
+            except Exception:
+                pass
+
+    clear_loader_caches()
+    for key in [
+        "comparison_sheets", "comparison_name", "comparison_version", "current_df",
+        "photo_df", "photo_name", "photo_last_sync_sig", "photo_registry_message", "photo_registry_stats",
+        "avito_df", "avito_name", "avito_last_sync_sig", "avito_registry_message", "avito_registry_stats",
+        "hot_items_df", "hot_items_name", "hot_items_last_sync_sig",
+        "patch_message",
+        "last_result_original", "last_result_discount", "last_result_compatible",
+        "last_result_sig_original", "last_result_sig_discount", "last_result_sig_compatible",
+        "comparison_upload_applied_sig", "photo_upload_applied_sig", "avito_upload_applied_sig", "hot_upload_applied_sig",
+        "service_snapshot_sig__comparison_upload", "service_snapshot_sig__photo_upload",
+        "service_snapshot_sig__avito_upload", "service_snapshot_sig__watchlist_upload",
+    ]:
+        st.session_state.pop(key, None)
+
+    notice = (
+        f"Восстановлен snapshot: {snapshot_name}. "
+        f"Файлов восстановлено: {len(restored)}, удалено по снимку: {len(removed)}. "
+        f"Страховочный snapshot: {emergency.name}."
+    )
+    st.session_state["service_restore_notice"] = notice
+    log_operation(f"Сервис: выполнено восстановление из {snapshot_name}", "warning")
+    return {
+        "restored": len(restored),
+        "removed": len(removed),
+        "emergency_snapshot": emergency.name,
+        "notice": notice,
+    }
+
+
+def build_service_backup_zip_bytes(include_snapshots: bool = True) -> bytes:
+    buf = io.BytesIO()
+    export_meta = {
+        "exported_at": datetime.utcnow().isoformat(timespec="seconds"),
+        "app_title": APP_TITLE,
+        "app_version": APP_VERSION,
+        "include_snapshots": bool(include_snapshots),
+    }
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("export_manifest.json", json.dumps(export_meta, ensure_ascii=False, indent=2))
+        for entry in get_service_live_file_entries():
+            path = entry["path"]
+            if path.exists() and path.is_file():
+                zf.write(path, arcname=f"live/{_service_rel_path(path)}")
+        if include_snapshots:
+            snap_root = get_service_snapshots_dir()
+            for path in snap_root.rglob("*"):
+                if path.is_file():
+                    zf.write(path, arcname=f"snapshots/{path.relative_to(snap_root)}")
+    return buf.getvalue()
+
+
+def _service_sqlite_status(label: str, path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {"name": label, "status": "warn", "details": "файл ещё не создан"}
+    try:
+        with sqlite3.connect(path) as conn:
+            tables = pd.read_sql_query(
+                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name",
+                conn,
+            )
+        table_count = len(tables) if isinstance(tables, pd.DataFrame) else 0
+        return {"name": label, "status": "ok", "details": f"ok • таблиц: {table_count}"}
+    except Exception as exc:
+        return {"name": label, "status": "fail", "details": f"ошибка открытия: {normalize_text(exc)}"}
+
+
+def run_service_healthcheck() -> dict[str, Any]:
+    checks: list[dict[str, Any]] = []
+
+    comp_path = get_persisted_comparison_file_path()
+    if comp_path.exists():
+        try:
+            wb = load_comparison_workbook(read_persisted_original_name(comp_path, comp_path.name), comp_path.read_bytes())
+            sheets = list(wb.keys()) if isinstance(wb, dict) else []
+            total_rows = sum(len(df) for df in wb.values()) if isinstance(wb, dict) else 0
+            required = {"Сравнение", "Уценка", "Совместимые"}
+            missing = sorted(required - set(sheets))
+            status = "ok" if not missing else "warn"
+            details = f"ok • листов: {len(sheets)}, строк: {total_rows}"
+            if missing:
+                details += f" • нет листов: {', '.join(missing)}"
+            checks.append({"name": "comparison", "status": status, "details": details})
+        except Exception as exc:
+            checks.append({"name": "comparison", "status": "fail", "details": f"ошибка загрузки: {normalize_text(exc)}"})
+    else:
+        checks.append({"name": "comparison", "status": "fail", "details": "файл не найден"})
+
+    photo_path = get_persisted_photo_file_path()
+    if photo_path.exists():
+        try:
+            photo_df = load_photo_map_file(read_persisted_original_name(photo_path, photo_path.name), photo_path.read_bytes())
+            checks.append({"name": "фото", "status": "ok", "details": f"ok • строк: {len(photo_df)}"})
+        except Exception as exc:
+            checks.append({"name": "фото", "status": "fail", "details": f"ошибка загрузки: {normalize_text(exc)}"})
+    else:
+        checks.append({"name": "фото", "status": "warn", "details": "файл не найден"})
+
+    watch_path = get_persisted_watchlist_file_path()
+    if watch_path.exists():
+        try:
+            watch_df = load_hot_watchlist_file(read_persisted_original_name(watch_path, watch_path.name), watch_path.read_bytes())
+            status = "ok" if len(watch_df) > 0 else "warn"
+            details = f"ok • строк: {len(watch_df)}" if len(watch_df) > 0 else "файл читается, но валидных строк нет"
+            checks.append({"name": "watchlist", "status": status, "details": details})
+        except Exception as exc:
+            checks.append({"name": "watchlist", "status": "fail", "details": f"ошибка загрузки: {normalize_text(exc)}"})
+    else:
+        checks.append({"name": "watchlist", "status": "warn", "details": "файл не найден"})
+
+    avito_path = get_persisted_avito_file_path()
+    if avito_path.exists():
+        try:
+            avito_df = load_avito_file(read_persisted_original_name(avito_path, avito_path.name), avito_path.read_bytes())
+            checks.append({"name": "Avito registry input", "status": "ok", "details": f"ok • строк: {len(avito_df)}"})
+        except Exception as exc:
+            checks.append({"name": "Avito registry input", "status": "fail", "details": f"ошибка загрузки: {normalize_text(exc)}"})
+    else:
+        checks.append({"name": "Avito registry input", "status": "warn", "details": "файл не найден"})
+
+    checks.append(_service_sqlite_status("tasks DB", _service_db_path("review_tasks.sqlite")))
+    checks.append(_service_sqlite_status("photo registry DB", _service_db_path("photo_registry.sqlite")))
+    checks.append(_service_sqlite_status("Avito registry DB", _service_db_path("avito_registry.sqlite")))
+    checks.append(_service_sqlite_status("price history DB", _service_db_path("price_patch_history.sqlite")))
+
+    snaps = list_service_snapshots(limit=200)
+    last_snapshot = snaps[0].get("created_at", "") if snaps else ""
+    return {
+        "checks": checks,
+        "snapshots_count": len(snaps),
+        "last_snapshot": last_snapshot,
+        "safe_boot": is_service_safe_boot_enabled(),
+    }
+
+
+def render_service_mode_sidebar() -> None:
+    status = run_service_healthcheck()
+    service_open = st.checkbox(
+        "Открыть сервисный режим",
+        key="service_mode_open",
+        help="Ленивая сервисная панель: проверка системы, snapshot, восстановление и backup.zip.",
+    )
+    safe_boot_on = bool(status.get("safe_boot"))
+    st.markdown(
+        f"<div class='sidebar-mini'>Safe boot: <b>{'включён' if safe_boot_on else 'выключен'}</b></div>",
+        unsafe_allow_html=True,
+    )
+    sb1, sb2 = st.columns(2)
+    if sb1.button("Включить safe boot", use_container_width=True, key="service_enable_safe_boot"):
+        enable_service_safe_boot()
+        st.rerun()
+    if sb2.button("Выключить safe boot", use_container_width=True, key="service_disable_safe_boot"):
+        disable_service_safe_boot()
+        st.rerun()
+
+    if notice := st.session_state.get("service_restore_notice"):
+        st.success(notice)
+
+    if not service_open:
+        st.markdown(
+            "<div class='sidebar-mini'>Пока блок закрыт — проверки, архивы и сравнение snapshot не строятся.</div>",
+            unsafe_allow_html=True,
+        )
+        return
+
+    st.markdown("**1. Статус системы**")
+    for rec in status.get("checks", []):
+        icon = "✅" if rec.get("status") == "ok" else ("⚠️" if rec.get("status") == "warn" else "❌")
+        st.markdown(f"{icon} **{html.escape(str(rec.get('name', '')))}** — {html.escape(str(rec.get('details', '')))}")
+    st.markdown(
+        f"<div class='sidebar-mini'>Snapshots: <b>{int(status.get('snapshots_count', 0))}</b> • последний: <b>{html.escape(str(status.get('last_snapshot') or '—'))}</b></div>",
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("**2. Сделать snapshot сейчас**")
+    st.text_input("Причина snapshot", key="service_snapshot_reason", placeholder="Например: перед загрузкой нового comparison")
+    if st.button("Сделать snapshot сейчас", use_container_width=True, key="service_snapshot_now"):
+        reason = st.session_state.get("service_snapshot_reason", "") or "manual snapshot"
+        snap = create_service_snapshot(reason=reason, source="manual")
+        st.success(f"Snapshot создан: {snap.name}")
+
+    st.markdown("**3. Восстановление**")
+    snapshots = list_service_snapshots(limit=100)
+    if snapshots:
+        options = [item["name"] for item in snapshots]
+        st.selectbox(
+            "Выбери snapshot",
+            options=options,
+            key="service_selected_snapshot",
+            format_func=lambda x: next(
+                (
+                    f"{item.get('created_at', '')} • {item.get('reason', '') or item.get('name', '')}"
+                    for item in snapshots if item.get("name") == x
+                ),
+                x,
+            ),
+        )
+        selected_snapshot = st.session_state.get("service_selected_snapshot")
+        compare_df = build_service_snapshot_compare_df(selected_snapshot)
+        if not compare_df.empty:
+            st.dataframe(compare_df, use_container_width=True, height=180)
+        st.checkbox(
+            "Я понимаю, что текущее состояние будет заменено выбранным snapshot",
+            key="service_restore_confirm",
+        )
+        if st.button("Восстановить snapshot", use_container_width=True, key="service_restore_snapshot"):
+            if not st.session_state.get("service_restore_confirm", False):
+                st.warning("Подтверди восстановление чекбоксом выше.")
+            else:
+                restore_info = restore_service_snapshot(selected_snapshot)
+                st.success(restore_info.get("notice", "Snapshot восстановлен."))
+                st.rerun()
+    else:
+        st.info("Snapshot пока нет.")
+
+    st.markdown("**4. Скачать резервную копию**")
+    st.checkbox("Включить snapshots в backup.zip", key="service_backup_include_snapshots", value=True)
+    if st.button("Собрать backup.zip", use_container_width=True, key="service_build_backup_zip"):
+        backup_bytes = build_service_backup_zip_bytes(
+            include_snapshots=bool(st.session_state.get("service_backup_include_snapshots", True))
+        )
+        ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        export_path = get_service_exports_dir() / f"moy_tovar_backup_{ts}.zip"
+        export_path.write_bytes(backup_bytes)
+        st.session_state["service_backup_zip_path"] = str(export_path)
+        st.session_state["service_backup_zip_name"] = export_path.name
+        log_operation(f"Сервис: собран backup.zip ({export_path.name})", "success")
+    backup_path = Path(st.session_state["service_backup_zip_path"]) if st.session_state.get("service_backup_zip_path") else None
+    if backup_path and backup_path.exists():
+        st.download_button(
+            "⬇️ Скачать backup.zip",
+            data=backup_path.read_bytes(),
+            file_name=st.session_state.get("service_backup_zip_name", backup_path.name),
+            mime="application/zip",
+            use_container_width=True,
+            key="service_download_backup_zip",
+        )
+
+    st.markdown("**5. Лог сервиса**")
+    service_keywords = ("Сервис:", "snapshot", "restore", "backup", "safe boot")
+    service_log_items = [
+        item for item in st.session_state.get("operation_log", [])
+        if any(keyword.lower() in str(item.get("message", "")).lower() for keyword in service_keywords)
+    ]
+    if not service_log_items:
+        st.caption("Сервисный лог пока пуст.")
+    else:
+        for item in reversed(service_log_items[-10:]):
             icon = "✅" if item.get("level") == "success" else ("⚠️" if item.get("level") == "warning" else "•")
             st.markdown(f"{icon} **{html.escape(str(item.get('time', '')))}** — {html.escape(str(item.get('message', '')))}", unsafe_allow_html=True)
 
@@ -4591,17 +5083,21 @@ with st.sidebar:
     if uploaded is not None:
         try:
             comp_bytes = uploaded.getvalue()
-            save_uploaded_source_file(get_persisted_comparison_file_path(), comp_bytes, uploaded.name)
-            clear_loader_caches()
-            st.session_state.comparison_sheets = load_comparison_workbook(uploaded.name, comp_bytes)
-            st.session_state.comparison_name = uploaded.name + " • сохранён в /data"
-            st.session_state.comparison_version = datetime.utcnow().isoformat()
-            available = list(st.session_state.comparison_sheets.keys())
-            if available and st.session_state.selected_sheet not in available:
-                st.session_state.selected_sheet = available[0]
-            rebuild_current_df()
-            refresh_all_search_results()
-            log_operation(f"Обновлён comparison-файл: {uploaded.name}", "success")
+            comp_sig = hashlib.md5(comp_bytes).hexdigest()
+            if st.session_state.get("comparison_upload_applied_sig", "") != comp_sig:
+                maybe_create_service_snapshot_before_action("comparison_upload", comp_sig, f"before comparison upload: {uploaded.name}")
+                save_uploaded_source_file(get_persisted_comparison_file_path(), comp_bytes, uploaded.name)
+                clear_loader_caches()
+                st.session_state.comparison_sheets = load_comparison_workbook(uploaded.name, comp_bytes)
+                st.session_state.comparison_name = uploaded.name + " • сохранён в /data"
+                st.session_state.comparison_version = datetime.utcnow().isoformat()
+                available = list(st.session_state.comparison_sheets.keys())
+                if available and st.session_state.selected_sheet not in available:
+                    st.session_state.selected_sheet = available[0]
+                rebuild_current_df()
+                refresh_all_search_results()
+                st.session_state["comparison_upload_applied_sig"] = comp_sig
+                log_operation(f"Обновлён comparison-файл: {uploaded.name}", "success")
         except Exception as exc:
             log_operation(f"Ошибка comparison-файла: {exc}", "warning")
             st.error(f"Ошибка файла: {exc}")
@@ -4619,30 +5115,33 @@ with st.sidebar:
     if photo_uploaded is not None:
         try:
             photo_bytes = photo_uploaded.getvalue()
-            save_uploaded_source_file(get_persisted_photo_file_path(), photo_bytes, photo_uploaded.name)
-            clear_loader_caches()
             photo_sig = hashlib.md5(photo_bytes).hexdigest()
-            loaded_photo_df = load_photo_map_file(photo_uploaded.name, photo_bytes)
-            if st.session_state.get("photo_last_sync_sig", "") != photo_sig:
-                photo_stats = sync_photo_registry(loaded_photo_df, photo_uploaded.name)
-                st.session_state.photo_registry_stats = photo_stats
-                st.session_state.photo_registry_message = (
-                    f"Синхронизация фото: новых {photo_stats.get('new', 0)}, обновлённых {photo_stats.get('changed', 0)}, без изменений {photo_stats.get('unchanged', 0)}. Исходник сохранён в /data"
-                )
-                st.session_state.photo_last_sync_sig = photo_sig
-            reg_df = load_photo_registry_df()
-            if isinstance(reg_df, pd.DataFrame) and not reg_df.empty:
-                st.session_state.photo_df = reg_df[[
-                    "article", "article_norm", "photo_url", "source_sheet",
-                    "meta_color", "meta_iso_pages", "meta_manufacturer_code",
-                    "meta_model", "meta_fits_models",
-                ]].copy()
-            else:
-                st.session_state.photo_df = loaded_photo_df
-            st.session_state.photo_name = photo_uploaded.name + " • сохранён в /data"
-            rebuild_current_df()
-            refresh_all_search_results()
-            log_operation(f"Обновлён каталог фото: {photo_uploaded.name}", "success")
+            if st.session_state.get("photo_upload_applied_sig", "") != photo_sig:
+                maybe_create_service_snapshot_before_action("photo_upload", photo_sig, f"before photo upload: {photo_uploaded.name}")
+                save_uploaded_source_file(get_persisted_photo_file_path(), photo_bytes, photo_uploaded.name)
+                clear_loader_caches()
+                loaded_photo_df = load_photo_map_file(photo_uploaded.name, photo_bytes)
+                if st.session_state.get("photo_last_sync_sig", "") != photo_sig:
+                    photo_stats = sync_photo_registry(loaded_photo_df, photo_uploaded.name)
+                    st.session_state.photo_registry_stats = photo_stats
+                    st.session_state.photo_registry_message = (
+                        f"Синхронизация фото: новых {photo_stats.get('new', 0)}, обновлённых {photo_stats.get('changed', 0)}, без изменений {photo_stats.get('unchanged', 0)}. Исходник сохранён в /data"
+                    )
+                    st.session_state.photo_last_sync_sig = photo_sig
+                reg_df = load_photo_registry_df()
+                if isinstance(reg_df, pd.DataFrame) and not reg_df.empty:
+                    st.session_state.photo_df = reg_df[[
+                        "article", "article_norm", "photo_url", "source_sheet",
+                        "meta_color", "meta_iso_pages", "meta_manufacturer_code",
+                        "meta_model", "meta_fits_models",
+                    ]].copy()
+                else:
+                    st.session_state.photo_df = loaded_photo_df
+                st.session_state.photo_name = photo_uploaded.name + " • сохранён в /data"
+                rebuild_current_df()
+                refresh_all_search_results()
+                st.session_state["photo_upload_applied_sig"] = photo_sig
+                log_operation(f"Обновлён каталог фото: {photo_uploaded.name}", "success")
         except Exception as exc:
             log_operation(f"Ошибка файла фото: {exc}", "warning")
             st.error(f"Ошибка файла фото: {exc}")
@@ -4664,19 +5163,22 @@ with st.sidebar:
     if avito_uploaded is not None:
         try:
             avito_bytes = avito_uploaded.getvalue()
-            save_uploaded_source_file(get_persisted_avito_file_path(), avito_bytes, avito_uploaded.name)
-            clear_loader_caches()
             avito_sig = hashlib.md5(avito_bytes).hexdigest()
-            st.session_state.avito_df = load_avito_file(avito_uploaded.name, avito_bytes)
-            st.session_state.avito_name = avito_uploaded.name + " • сохранён в /data"
-            if st.session_state.get("avito_last_sync_sig", "") != avito_sig:
-                sync_stats = sync_avito_registry(st.session_state.avito_df, avito_uploaded.name)
-                st.session_state.avito_registry_stats = sync_stats
-                st.session_state.avito_registry_message = (
-                    f"Синхронизация: новых {sync_stats.get('new', 0)}, изменённых {sync_stats.get('changed', 0)}, без изменений {sync_stats.get('unchanged', 0)}. Исходник сохранён в /data"
-                )
-                st.session_state.avito_last_sync_sig = avito_sig
-            log_operation(f"Обновлён файл Авито: {avito_uploaded.name}", "success")
+            if st.session_state.get("avito_upload_applied_sig", "") != avito_sig:
+                maybe_create_service_snapshot_before_action("avito_upload", avito_sig, f"before avito upload: {avito_uploaded.name}")
+                save_uploaded_source_file(get_persisted_avito_file_path(), avito_bytes, avito_uploaded.name)
+                clear_loader_caches()
+                st.session_state.avito_df = load_avito_file(avito_uploaded.name, avito_bytes)
+                st.session_state.avito_name = avito_uploaded.name + " • сохранён в /data"
+                if st.session_state.get("avito_last_sync_sig", "") != avito_sig:
+                    sync_stats = sync_avito_registry(st.session_state.avito_df, avito_uploaded.name)
+                    st.session_state.avito_registry_stats = sync_stats
+                    st.session_state.avito_registry_message = (
+                        f"Синхронизация: новых {sync_stats.get('new', 0)}, изменённых {sync_stats.get('changed', 0)}, без изменений {sync_stats.get('unchanged', 0)}. Исходник сохранён в /data"
+                    )
+                    st.session_state.avito_last_sync_sig = avito_sig
+                st.session_state["avito_upload_applied_sig"] = avito_sig
+                log_operation(f"Обновлён файл Авито: {avito_uploaded.name}", "success")
         except Exception as exc:
             log_operation(f"Ошибка файла Авито: {exc}", "warning")
             st.error(f"Ошибка файла Авито: {exc}")
@@ -4696,12 +5198,16 @@ with st.sidebar:
     if hot_uploaded is not None:
         try:
             hot_bytes = hot_uploaded.getvalue()
-            save_uploaded_source_file(get_persisted_watchlist_file_path(), hot_bytes, hot_uploaded.name)
-            clear_loader_caches()
-            st.session_state.hot_items_df = load_hot_watchlist_file(hot_uploaded.name, hot_bytes)
-            st.session_state.hot_items_name = hot_uploaded.name + " • сохранён в /data"
-            st.session_state.hot_items_last_sync_sig = hashlib.md5(hot_bytes).hexdigest()
-            log_operation(f"Обновлён watchlist ходовых: {hot_uploaded.name}", "success")
+            hot_sig = hashlib.md5(hot_bytes).hexdigest()
+            if st.session_state.get("hot_upload_applied_sig", "") != hot_sig:
+                maybe_create_service_snapshot_before_action("watchlist_upload", hot_sig, f"before watchlist upload: {hot_uploaded.name}")
+                save_uploaded_source_file(get_persisted_watchlist_file_path(), hot_bytes, hot_uploaded.name)
+                clear_loader_caches()
+                st.session_state.hot_items_df = load_hot_watchlist_file(hot_uploaded.name, hot_bytes)
+                st.session_state.hot_items_name = hot_uploaded.name + " • сохранён в /data"
+                st.session_state.hot_items_last_sync_sig = hot_sig
+                st.session_state["hot_upload_applied_sig"] = hot_sig
+                log_operation(f"Обновлён watchlist ходовых: {hot_uploaded.name}", "success")
         except Exception as exc:
             log_operation(f"Ошибка файла ходовых: {exc}", "warning")
             st.error(f"Ошибка watchlist: {exc}")
@@ -4734,6 +5240,7 @@ with st.sidebar:
         original_name = read_persisted_original_name(persisted_path, persisted_path.name) if persisted_path.exists() else st.session_state.get("comparison_name", "comparison_latest.xlsx")
         if persisted_path.exists():
             try:
+                create_service_snapshot(reason="before price patch", source="auto")
                 before_snapshot = build_price_snapshot_for_updates(st.session_state.get("comparison_sheets"), st.session_state.price_patch_input)
                 updated_bytes, patch_message = patch_comparison_workbook_bytes(persisted_path.read_bytes(), st.session_state.price_patch_input)
                 if updated_bytes is not None:
@@ -4773,6 +5280,12 @@ with st.sidebar:
         st.markdown(f'<div class="sidebar-mini">{html.escape(st.session_state.patch_message)}</div>', unsafe_allow_html=True)
     else:
         st.markdown('<div class="sidebar-mini">Прайс сохраняется локально. После правок цены не пропадут до загрузки нового файла.</div>', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+
+    st.markdown('<div class="sidebar-card">', unsafe_allow_html=True)
+    render_sidebar_card_header("Сервисный режим", "🛡️", "Ленивый блок для проверки системы, snapshot, восстановления и backup.zip.")
+    render_service_mode_sidebar()
     st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown('<div class="sidebar-card">', unsafe_allow_html=True)
@@ -6198,17 +6711,20 @@ else:
 
     active_sheet_name, active_tab_label, active_tab_key = label_to_spec[st.session_state.get("active_workspace_label", "Оригинал")]
     active_sheet_df = sheets.get(active_sheet_name) if isinstance(sheets, dict) else None
-    render_crm_header_bar(
-        active_sheet_df,
-        st.session_state.get("photo_df"),
-        st.session_state.get("avito_df"),
-        active_sheet_name,
-        active_tab_label,
-        st.session_state.get("distributor_min_qty", 1.0),
-    )
-    render_task_center_lazy_panel()
-    render_hot_buy_watchlist_lazy_panel()
-    render_sheet_workspace(active_sheet_name, active_tab_label, active_tab_key)
+    if is_service_safe_boot_enabled():
+        st.warning("Включён безопасный запуск. Основные тяжёлые блоки временно отключены. Открой 🛡️ Сервисный режим в боковой панели, чтобы проверить систему, восстановить snapshot или выключить safe boot.")
+    else:
+        render_crm_header_bar(
+            active_sheet_df,
+            st.session_state.get("photo_df"),
+            st.session_state.get("avito_df"),
+            active_sheet_name,
+            active_tab_label,
+            st.session_state.get("distributor_min_qty", 1.0),
+        )
+        render_task_center_lazy_panel()
+        render_hot_buy_watchlist_lazy_panel()
+        render_sheet_workspace(active_sheet_name, active_tab_label, active_tab_key)
 
 def normalize_watchlist_sheet_name(value: Any) -> str:
     txt = contains_text(value)
