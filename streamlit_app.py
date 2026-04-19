@@ -5641,12 +5641,14 @@ def build_operational_analytics_bundle(
     avito_registry_df: pd.DataFrame | None,
     min_qty: float,
     sheet_name: str,
+    hot_items_df: pd.DataFrame | None = None,
 ) -> dict[str, Any]:
     enriched = apply_photo_map(sheet_df, photo_df)
     if enriched is None or enriched.empty:
         return {}
     merged_avito = combine_avito_sources(avito_df, avito_registry_df)
     _, avito_index = build_avito_code_index(merged_avito)
+    hot_lookup = build_hot_watchlist_lookup(hot_items_df, tab_label=sheet_name)
 
     rows_meta: list[dict[str, Any]] = []
     source_counter: Counter[str] = Counter()
@@ -5668,6 +5670,13 @@ def build_operational_analytics_bundle(
         delta_rub = own_price - safe_float((best_offer or {}).get("price"), 0.0) if better_market else 0.0
         delta_pct = ((delta_rub / own_price) * 100.0) if better_market and own_price > 0 else 0.0
         priority_score = round(max(delta_pct, 0.0) * max(own_qty, 0.0) * max(ad_count, 1), 2)
+
+        hot_rec = pick_hot_watch_rec(row, hot_lookup) if hot_lookup else None
+        sales_per_month = safe_float((hot_rec or {}).get("sales_per_month"), 0.0)
+        stock_months = round(own_qty / sales_per_month, 1) if sales_per_month > 0 else None
+        best_offer_price = safe_float((best_offer or {}).get("price"), 0.0) if best_offer else 0.0
+        recommended_price = round(best_offer_price * 0.95, 2) if better_market and best_offer_price > 0 else None
+
         photo_url = normalize_text(row.get("photo_url", ""))
         has_photo = bool(photo_url)
         has_model = bool(normalize_text(row.get("meta_model", "")))
@@ -5705,7 +5714,10 @@ def build_operational_analytics_bundle(
             "Бренд": brand_guess,
             "Наша цена": own_price,
             "Наш остаток": own_qty,
-            "Лучшая цена дистрибьютора": safe_float((best_offer or {}).get("price"), 0.0) if best_offer else None,
+            "Продажи, шт/мес": round(sales_per_month, 2) if sales_per_month > 0 else None,
+            "Наш запас, мес": stock_months,
+            "Лучшая цена дистрибьютора": best_offer_price if best_offer else None,
+            "Рекомендую, руб": recommended_price,
             "Лучший поставщик": normalize_text((best_offer or {}).get("source", "")) if best_offer else "",
             "Остаток дистрибьютора": safe_float((best_offer or {}).get("qty"), 0.0) if best_offer else None,
             "Разница, руб": delta_rub if better_market else None,
@@ -5860,7 +5872,15 @@ def analytics_bundle_to_excel_bytes(bundle: dict[str, Any]) -> bytes:
 
 def render_operational_analytics_block(sheet_df: pd.DataFrame, photo_df: pd.DataFrame | None, avito_df: pd.DataFrame | None, min_qty: float, sheet_name: str, tab_key: str) -> None:
     registry_df = load_avito_registry_df()
-    bundle = build_operational_analytics_bundle(sheet_df, photo_df, avito_df, registry_df, min_qty, sheet_name)
+    bundle = build_operational_analytics_bundle(
+        sheet_df,
+        photo_df,
+        avito_df,
+        registry_df,
+        min_qty,
+        sheet_name,
+        st.session_state.get("hot_items_df"),
+    )
     if not bundle:
         st.info("Для аналитики нет данных.")
         return
@@ -5895,11 +5915,24 @@ def render_operational_analytics_block(sheet_df: pd.DataFrame, photo_df: pd.Data
     with st.expander("1. Приоритет на пересмотр цены ❔", expanded=False):
         st.caption(
             "Что показывает: где мы дороже рынка и что стоит пересмотреть в первую очередь. "
-            "Как считается приоритет: Разница, % × Наш остаток × Количество связанных объявлений Avito (минимум 1). "
-            "Как пользоваться: чем выше приоритет, тем полезнее сначала проверить именно эту позицию."
+            "Добавлено для решения по цене: продажи в месяц, запас в месяцах и колонка 'Рекомендую, руб' = лучшая цена дистрибьютора минус 5%. "
+            "Как пользоваться: смотри сначала товары с хорошими продажами, небольшим запасом и понятной рекомендованной ценой."
         )
         if isinstance(top_df, pd.DataFrame) and not top_df.empty:
-            view = top_df[["Артикул", "Название", "Наша цена", "Лучшая цена дистрибьютора", "Лучший поставщик", "Разница, руб", "Разница, %", "Наш остаток", "Остаток дистрибьютора", "Приоритет"]].head(100)
+            view = top_df[[
+                "Артикул",
+                "Название",
+                "Продажи, шт/мес",
+                "Наш запас, мес",
+                "Наша цена",
+                "Лучшая цена дистрибьютора",
+                "Рекомендую, руб",
+                "Лучший поставщик",
+                "Разница, руб",
+                "Разница, %",
+                "Наш остаток",
+                "Остаток дистрибьютора",
+            ]].head(100)
             st.dataframe(view, use_container_width=True, hide_index=True)
             render_analytics_jump_helper(view, tab_key, "top")
         else:
@@ -6033,7 +6066,13 @@ def build_crm_header_stats(
         if isinstance(sheet_df, pd.DataFrame) and not sheet_df.empty:
             registry_df = load_avito_registry_df()
             bundle = build_operational_analytics_bundle(
-                sheet_df, photo_df, avito_df, registry_df, float(min_qty), str(tab_label)
+                sheet_df,
+                photo_df,
+                avito_df,
+                registry_df,
+                float(min_qty),
+                str(tab_label),
+                st.session_state.get("hot_items_df"),
             )
             quality = bundle.get("quality", {}) if isinstance(bundle, dict) else {}
             stats["without_photo"] = int(quality.get("without_photo", 0) or 0)
