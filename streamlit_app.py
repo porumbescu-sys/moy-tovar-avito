@@ -1071,11 +1071,21 @@ PHOTO_COLUMN_ALIASES = {
         "photo_url", "url", "link", "picture", "картинка", "ссылка",
         "imag", "images"
     ],
+    "brand": ["brend", "бренд", "brand"],
     "color": ["czvet", "цвет", "color"],
-    "iso_pages": ["resurs-po-iso-str", "ресурс-по-iso-стр", "ресурс", "iso", "pages"],
+    "capacity": ["emkost-kartridzha", "емкость-картриджа", "емкость картриджа", "capacity"],
     "manufacturer_code": ["kod-proizvoditelya", "код-производителя", "код производителя"],
     "model": ["model", "модель"],
+    "description": ["originalinosti", "описание", "description"],
     "fits_models": ["podhodit-k-modelyam", "подходит-к-моделям", "подходит к моделям"],
+    "iso_pages": ["resurs-po-iso-str", "ресурс-по-iso-стр", "ресурс", "iso", "pages"],
+    "print_technology": ["tehnologiya-pechati", "технология-печати", "технология печати"],
+    "item_type": ["tip", "тип"],
+    "print_type": ["tip-pechati", "тип-печати", "тип печати"],
+    "weight": ["weight", "вес"],
+    "length": ["length", "длина"],
+    "width": ["width", "ширина"],
+    "height": ["height", "высота"],
 }
 
 AVITO_COLUMN_ALIASES = {
@@ -1254,6 +1264,39 @@ def normalize_pages_value(value: object) -> str:
             except Exception:
                 return digits
     return raw
+
+
+def normalize_meta_measure(value: object) -> str:
+    raw = normalize_text(value)
+    if not raw:
+        return ""
+    try:
+        num = float(str(raw).replace(" ", "").replace(",", "."))
+        if abs(num - int(num)) < 1e-9:
+            return str(int(num))
+        txt = f"{num:.2f}".rstrip("0").rstrip(".")
+        return txt.replace(".", ",")
+    except Exception:
+        return raw
+
+
+def format_meta_dimensions(length: object, width: object, height: object) -> str:
+    l = normalize_meta_measure(length)
+    w = normalize_meta_measure(width)
+    h = normalize_meta_measure(height)
+    if not (l or w or h):
+        return ""
+    parts = [x for x in [l, w, h] if x]
+    return " × ".join(parts) + " см"
+
+
+def format_meta_weight(weight: object) -> str:
+    w = normalize_meta_measure(weight)
+    if not w:
+        return ""
+    if re.search(r"[A-Za-zА-Яа-яЁё]", w):
+        return w
+    return f"{w} кг"
 
 
 def simplify_template_color(value: object) -> str:
@@ -1969,7 +2012,9 @@ def load_photo_map_file(file_name: str, file_bytes: bytes) -> pd.DataFrame:
     def _empty_df() -> pd.DataFrame:
         return pd.DataFrame(columns=[
             "article", "article_norm", "photo_url", "source_sheet", "sheet_priority",
-            "meta_color", "meta_iso_pages", "meta_manufacturer_code", "meta_model", "meta_fits_models",
+            "meta_brand", "meta_color", "meta_capacity", "meta_manufacturer_code", "meta_model",
+            "meta_description", "meta_fits_models", "meta_iso_pages", "meta_print_technology",
+            "meta_item_type", "meta_print_type", "meta_weight", "meta_length", "meta_width", "meta_height",
         ])
 
     def _from_raw(raw: pd.DataFrame, sheet_name: str = "") -> pd.DataFrame:
@@ -2014,11 +2059,21 @@ def load_photo_map_file(file_name: str, file_bytes: bytes) -> pd.DataFrame:
         out["photo_url"] = raw[mapping["photo_url"]].map(extract_first_url) if mapping.get("photo_url") else ""
         out["source_sheet"] = sheet_name
         out["sheet_priority"] = _sheet_priority(sheet_name)
+        out["meta_brand"] = raw[mapping["brand"]].map(normalize_text) if mapping.get("brand") else ""
         out["meta_color"] = raw[mapping["color"]].map(normalize_text) if mapping.get("color") else ""
-        out["meta_iso_pages"] = raw[mapping["iso_pages"]].map(normalize_text) if mapping.get("iso_pages") else ""
+        out["meta_capacity"] = raw[mapping["capacity"]].map(normalize_text) if mapping.get("capacity") else ""
         out["meta_manufacturer_code"] = raw[mapping["manufacturer_code"]].map(normalize_text) if mapping.get("manufacturer_code") else ""
         out["meta_model"] = raw[mapping["model"]].map(normalize_text) if mapping.get("model") else ""
+        out["meta_description"] = raw[mapping["description"]].map(normalize_text) if mapping.get("description") else ""
         out["meta_fits_models"] = raw[mapping["fits_models"]].map(normalize_text) if mapping.get("fits_models") else ""
+        out["meta_iso_pages"] = raw[mapping["iso_pages"]].map(normalize_text) if mapping.get("iso_pages") else ""
+        out["meta_print_technology"] = raw[mapping["print_technology"]].map(normalize_text) if mapping.get("print_technology") else ""
+        out["meta_item_type"] = raw[mapping["item_type"]].map(normalize_text) if mapping.get("item_type") else ""
+        out["meta_print_type"] = raw[mapping["print_type"]].map(normalize_text) if mapping.get("print_type") else ""
+        out["meta_weight"] = raw[mapping["weight"]].map(normalize_text) if mapping.get("weight") else ""
+        out["meta_length"] = raw[mapping["length"]].map(normalize_text) if mapping.get("length") else ""
+        out["meta_width"] = raw[mapping["width"]].map(normalize_text) if mapping.get("width") else ""
+        out["meta_height"] = raw[mapping["height"]].map(normalize_text) if mapping.get("height") else ""
         out = out[out["article_norm"] != ""].reset_index(drop=True)
         return out if not out.empty else _empty_df()
 
@@ -2033,7 +2088,12 @@ def load_photo_map_file(file_name: str, file_bytes: bytes) -> pd.DataFrame:
         if out.empty:
             raise ValueError("В файле фото нужны колонки с артикулом и хотя бы с фото или полезными полями.")
         out = out.sort_values(["sheet_priority", "article_norm"]).drop_duplicates(subset=["article_norm"], keep="first").reset_index(drop=True)
-        return out[["article", "article_norm", "photo_url", "source_sheet", "meta_color", "meta_iso_pages", "meta_manufacturer_code", "meta_model", "meta_fits_models"]]
+        return out[[
+            "article", "article_norm", "photo_url", "source_sheet",
+            "meta_brand", "meta_color", "meta_capacity", "meta_manufacturer_code", "meta_model",
+            "meta_description", "meta_fits_models", "meta_iso_pages", "meta_print_technology",
+            "meta_item_type", "meta_print_type", "meta_weight", "meta_length", "meta_width", "meta_height",
+        ]]
 
     sheets = pd.read_excel(io.BytesIO(file_bytes), sheet_name=None)
     parts: list[pd.DataFrame] = []
@@ -2070,23 +2130,43 @@ def load_photo_map_file(file_name: str, file_bytes: bytes) -> pd.DataFrame:
             "article_norm": article_norm,
             "photo_url": _best_photo(grp["photo_url"]),
             "source_sheet": _first_non_empty(grp["source_sheet"]),
+            "meta_brand": _first_non_empty(grp["meta_brand"]),
             "meta_color": _first_non_empty(grp["meta_color"]),
-            "meta_iso_pages": _first_non_empty(grp["meta_iso_pages"]),
+            "meta_capacity": _first_non_empty(grp["meta_capacity"]),
             "meta_manufacturer_code": _first_non_empty(grp["meta_manufacturer_code"]),
             "meta_model": _first_non_empty(grp["meta_model"]),
+            "meta_description": _first_non_empty(grp["meta_description"]),
             "meta_fits_models": _first_non_empty(grp["meta_fits_models"]),
+            "meta_iso_pages": _first_non_empty(grp["meta_iso_pages"]),
+            "meta_print_technology": _first_non_empty(grp["meta_print_technology"]),
+            "meta_item_type": _first_non_empty(grp["meta_item_type"]),
+            "meta_print_type": _first_non_empty(grp["meta_print_type"]),
+            "meta_weight": _first_non_empty(grp["meta_weight"]),
+            "meta_length": _first_non_empty(grp["meta_length"]),
+            "meta_width": _first_non_empty(grp["meta_width"]),
+            "meta_height": _first_non_empty(grp["meta_height"]),
         }
         rows.append(row)
 
     combined = pd.DataFrame(rows)
-    return combined[["article", "article_norm", "photo_url", "source_sheet", "meta_color", "meta_iso_pages", "meta_manufacturer_code", "meta_model", "meta_fits_models"]]
+    return combined[[
+        "article", "article_norm", "photo_url", "source_sheet",
+        "meta_brand", "meta_color", "meta_capacity", "meta_manufacturer_code", "meta_model",
+        "meta_description", "meta_fits_models", "meta_iso_pages", "meta_print_technology",
+        "meta_item_type", "meta_print_type", "meta_weight", "meta_length", "meta_width", "meta_height",
+    ]]
 
 
 def apply_photo_map(df: pd.DataFrame | None, photo_df: pd.DataFrame | None) -> pd.DataFrame | None:
     if df is None:
         return None
     out = df.copy()
-    for col in ["photo_url", "photo_name", "meta_color", "meta_iso_pages", "meta_manufacturer_code", "meta_model", "meta_fits_models"]:
+    for col in [
+        "photo_url", "photo_name", "meta_brand", "meta_color", "meta_capacity",
+        "meta_manufacturer_code", "meta_model", "meta_description", "meta_fits_models",
+        "meta_iso_pages", "meta_print_technology", "meta_item_type", "meta_print_type",
+        "meta_weight", "meta_length", "meta_width", "meta_height",
+    ]:
         if col not in out.columns:
             out[col] = ""
     if photo_df is None or photo_df.empty:
@@ -2098,11 +2178,21 @@ def apply_photo_map(df: pd.DataFrame | None, photo_df: pd.DataFrame | None) -> p
         return normalize_text(row.get(key, ""))
     out["photo_url"] = out["article_norm"].map(lambda x: _meta(x, "photo_url"))
     out["photo_name"] = out["name"]
+    out["meta_brand"] = out["article_norm"].map(lambda x: _meta(x, "meta_brand"))
     out["meta_color"] = out["article_norm"].map(lambda x: _meta(x, "meta_color"))
-    out["meta_iso_pages"] = out["article_norm"].map(lambda x: _meta(x, "meta_iso_pages"))
+    out["meta_capacity"] = out["article_norm"].map(lambda x: _meta(x, "meta_capacity"))
     out["meta_manufacturer_code"] = out["article_norm"].map(lambda x: _meta(x, "meta_manufacturer_code"))
     out["meta_model"] = out["article_norm"].map(lambda x: _meta(x, "meta_model"))
+    out["meta_description"] = out["article_norm"].map(lambda x: _meta(x, "meta_description"))
     out["meta_fits_models"] = out["article_norm"].map(lambda x: _meta(x, "meta_fits_models"))
+    out["meta_iso_pages"] = out["article_norm"].map(lambda x: _meta(x, "meta_iso_pages"))
+    out["meta_print_technology"] = out["article_norm"].map(lambda x: _meta(x, "meta_print_technology"))
+    out["meta_item_type"] = out["article_norm"].map(lambda x: _meta(x, "meta_item_type"))
+    out["meta_print_type"] = out["article_norm"].map(lambda x: _meta(x, "meta_print_type"))
+    out["meta_weight"] = out["article_norm"].map(lambda x: _meta(x, "meta_weight"))
+    out["meta_length"] = out["article_norm"].map(lambda x: _meta(x, "meta_length"))
+    out["meta_width"] = out["article_norm"].map(lambda x: _meta(x, "meta_width"))
+    out["meta_height"] = out["article_norm"].map(lambda x: _meta(x, "meta_height"))
     return out
 
 
@@ -2395,6 +2485,32 @@ def get_photo_registry_path() -> Path:
 
 def ensure_photo_registry() -> None:
     path = get_photo_registry_path()
+    required_columns = {
+        "article_norm": "TEXT PRIMARY KEY",
+        "article": "TEXT",
+        "photo_url": "TEXT",
+        "source_sheet": "TEXT",
+        "meta_brand": "TEXT",
+        "meta_color": "TEXT",
+        "meta_capacity": "TEXT",
+        "meta_manufacturer_code": "TEXT",
+        "meta_model": "TEXT",
+        "meta_description": "TEXT",
+        "meta_fits_models": "TEXT",
+        "meta_iso_pages": "TEXT",
+        "meta_print_technology": "TEXT",
+        "meta_item_type": "TEXT",
+        "meta_print_type": "TEXT",
+        "meta_weight": "TEXT",
+        "meta_length": "TEXT",
+        "meta_width": "TEXT",
+        "meta_height": "TEXT",
+        "first_seen": "TEXT",
+        "last_seen": "TEXT",
+        "last_changed_at": "TEXT",
+        "import_name": "TEXT",
+        "change_count": "INTEGER DEFAULT 0",
+    }
     with sqlite3.connect(path) as conn:
         conn.execute(
             """
@@ -2403,11 +2519,21 @@ def ensure_photo_registry() -> None:
                 article TEXT,
                 photo_url TEXT,
                 source_sheet TEXT,
+                meta_brand TEXT,
                 meta_color TEXT,
-                meta_iso_pages TEXT,
+                meta_capacity TEXT,
                 meta_manufacturer_code TEXT,
                 meta_model TEXT,
+                meta_description TEXT,
                 meta_fits_models TEXT,
+                meta_iso_pages TEXT,
+                meta_print_technology TEXT,
+                meta_item_type TEXT,
+                meta_print_type TEXT,
+                meta_weight TEXT,
+                meta_length TEXT,
+                meta_width TEXT,
+                meta_height TEXT,
                 first_seen TEXT,
                 last_seen TEXT,
                 last_changed_at TEXT,
@@ -2416,6 +2542,10 @@ def ensure_photo_registry() -> None:
             )
             """
         )
+        existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(photo_registry)")}
+        for col_name, col_type in required_columns.items():
+            if col_name not in existing_cols:
+                conn.execute(f"ALTER TABLE photo_registry ADD COLUMN {col_name} {col_type}")
         conn.commit()
 
 
@@ -2429,9 +2559,11 @@ def load_photo_registry_df() -> pd.DataFrame:
         return df
     for col in [
         "article", "article_norm", "photo_url", "source_sheet",
-        "meta_color", "meta_iso_pages", "meta_manufacturer_code",
-        "meta_model", "meta_fits_models", "first_seen", "last_seen",
-        "last_changed_at", "import_name",
+        "meta_brand", "meta_color", "meta_capacity", "meta_manufacturer_code",
+        "meta_model", "meta_description", "meta_fits_models", "meta_iso_pages",
+        "meta_print_technology", "meta_item_type", "meta_print_type",
+        "meta_weight", "meta_length", "meta_width", "meta_height",
+        "first_seen", "last_seen", "last_changed_at", "import_name",
     ]:
         if col in df.columns:
             df[col] = df[col].fillna("").map(normalize_text)
@@ -2450,9 +2582,11 @@ def photo_registry_summary_text() -> str:
     with_photo = int(df.get("photo_url", pd.Series(dtype=object)).fillna("").map(lambda x: 1 if normalize_text(x) else 0).sum())
     with_meta = int((
         df.get("meta_model", pd.Series(dtype=object)).fillna("").map(bool)
+        | df.get("meta_brand", pd.Series(dtype=object)).fillna("").map(bool)
         | df.get("meta_fits_models", pd.Series(dtype=object)).fillna("").map(bool)
         | df.get("meta_color", pd.Series(dtype=object)).fillna("").map(bool)
         | df.get("meta_iso_pages", pd.Series(dtype=object)).fillna("").map(bool)
+        | df.get("meta_description", pd.Series(dtype=object)).fillna("").map(bool)
     ).sum())
     return f"В реестре: {len(df)} • с фото: {with_photo} • с метаданными: {with_meta}"
 
@@ -2467,8 +2601,10 @@ def sync_photo_registry(photo_df: pd.DataFrame, import_name: str) -> dict[str, A
 
     use_cols = [
         "article", "article_norm", "photo_url", "source_sheet",
-        "meta_color", "meta_iso_pages", "meta_manufacturer_code",
-        "meta_model", "meta_fits_models",
+        "meta_brand", "meta_color", "meta_capacity", "meta_manufacturer_code",
+        "meta_model", "meta_description", "meta_fits_models", "meta_iso_pages",
+        "meta_print_technology", "meta_item_type", "meta_print_type",
+        "meta_weight", "meta_length", "meta_width", "meta_height",
     ]
     for col in use_cols:
         if col not in work.columns:
@@ -2480,8 +2616,10 @@ def sync_photo_registry(photo_df: pd.DataFrame, import_name: str) -> dict[str, A
     stats = {"new": 0, "changed": 0, "unchanged": 0, "total": len(work)}
     tracked_cols = [
         "article", "photo_url", "source_sheet",
-        "meta_color", "meta_iso_pages", "meta_manufacturer_code",
-        "meta_model", "meta_fits_models",
+        "meta_brand", "meta_color", "meta_capacity", "meta_manufacturer_code",
+        "meta_model", "meta_description", "meta_fits_models", "meta_iso_pages",
+        "meta_print_technology", "meta_item_type", "meta_print_type",
+        "meta_weight", "meta_length", "meta_width", "meta_height",
     ]
 
     with sqlite3.connect(path) as conn:
@@ -2504,13 +2642,17 @@ def sync_photo_registry(photo_df: pd.DataFrame, import_name: str) -> dict[str, A
                     """
                     INSERT INTO photo_registry (
                         article_norm, article, photo_url, source_sheet,
-                        meta_color, meta_iso_pages, meta_manufacturer_code, meta_model, meta_fits_models,
+                        meta_brand, meta_color, meta_capacity, meta_manufacturer_code, meta_model,
+                        meta_description, meta_fits_models, meta_iso_pages, meta_print_technology,
+                        meta_item_type, meta_print_type, meta_weight, meta_length, meta_width, meta_height,
                         first_seen, last_seen, last_changed_at, import_name, change_count
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
                     """,
                     (
                         key, payload["article"], payload["photo_url"], payload["source_sheet"],
-                        payload["meta_color"], payload["meta_iso_pages"], payload["meta_manufacturer_code"], payload["meta_model"], payload["meta_fits_models"],
+                        payload["meta_brand"], payload["meta_color"], payload["meta_capacity"], payload["meta_manufacturer_code"], payload["meta_model"],
+                        payload["meta_description"], payload["meta_fits_models"], payload["meta_iso_pages"], payload["meta_print_technology"],
+                        payload["meta_item_type"], payload["meta_print_type"], payload["meta_weight"], payload["meta_length"], payload["meta_width"], payload["meta_height"],
                         now, now, now, normalize_text(import_name),
                     ),
                 )
@@ -2525,11 +2667,21 @@ def sync_photo_registry(photo_df: pd.DataFrame, import_name: str) -> dict[str, A
                             article=?,
                             photo_url=?,
                             source_sheet=?,
+                            meta_brand=?,
                             meta_color=?,
-                            meta_iso_pages=?,
+                            meta_capacity=?,
                             meta_manufacturer_code=?,
                             meta_model=?,
+                            meta_description=?,
                             meta_fits_models=?,
+                            meta_iso_pages=?,
+                            meta_print_technology=?,
+                            meta_item_type=?,
+                            meta_print_type=?,
+                            meta_weight=?,
+                            meta_length=?,
+                            meta_width=?,
+                            meta_height=?,
                             last_seen=?,
                             last_changed_at=?,
                             import_name=?,
@@ -2538,7 +2690,9 @@ def sync_photo_registry(photo_df: pd.DataFrame, import_name: str) -> dict[str, A
                         """,
                         (
                             payload["article"], payload["photo_url"], payload["source_sheet"],
-                            payload["meta_color"], payload["meta_iso_pages"], payload["meta_manufacturer_code"], payload["meta_model"], payload["meta_fits_models"],
+                            payload["meta_brand"], payload["meta_color"], payload["meta_capacity"], payload["meta_manufacturer_code"], payload["meta_model"],
+                            payload["meta_description"], payload["meta_fits_models"], payload["meta_iso_pages"], payload["meta_print_technology"],
+                            payload["meta_item_type"], payload["meta_print_type"], payload["meta_weight"], payload["meta_length"], payload["meta_width"], payload["meta_height"],
                             now, now, normalize_text(import_name), change_count, key,
                         ),
                     )
@@ -2560,8 +2714,10 @@ def ensure_photo_registry_loaded() -> None:
     if isinstance(reg, pd.DataFrame) and not reg.empty:
         st.session_state.photo_df = reg[[
             "article", "article_norm", "photo_url", "source_sheet",
-            "meta_color", "meta_iso_pages", "meta_manufacturer_code",
-            "meta_model", "meta_fits_models",
+            "meta_brand", "meta_color", "meta_capacity", "meta_manufacturer_code",
+            "meta_model", "meta_description", "meta_fits_models", "meta_iso_pages",
+            "meta_print_technology", "meta_item_type", "meta_print_type",
+            "meta_weight", "meta_length", "meta_width", "meta_height",
         ]].copy()
         if normalize_text(st.session_state.get("photo_name", "")) in {"", "ещё не загружен"}:
             st.session_state.photo_name = "из реестра сервера"
@@ -5176,8 +5332,10 @@ with st.sidebar:
                 if isinstance(reg_df, pd.DataFrame) and not reg_df.empty:
                     st.session_state.photo_df = reg_df[[
                         "article", "article_norm", "photo_url", "source_sheet",
-                        "meta_color", "meta_iso_pages", "meta_manufacturer_code",
-                        "meta_model", "meta_fits_models",
+                        "meta_brand", "meta_color", "meta_capacity", "meta_manufacturer_code",
+                        "meta_model", "meta_description", "meta_fits_models", "meta_iso_pages",
+                        "meta_print_technology", "meta_item_type", "meta_print_type",
+                        "meta_weight", "meta_length", "meta_width", "meta_height",
                     ]].copy()
                 else:
                     st.session_state.photo_df = loaded_photo_df
@@ -6182,9 +6340,19 @@ def render_crm_card_center(
     name = normalize_text(row.get("name", ""))
     photo_url = normalize_text(row.get("photo_url", ""))
     note = normalize_text(row.get("manual_note", ""))
+    brand = normalize_text(row.get("meta_brand", ""))
     model = normalize_text(row.get("meta_model", ""))
     mcode = normalize_text(row.get("meta_manufacturer_code", ""))
+    print_type = normalize_text(row.get("meta_print_type", ""))
+    color = normalize_text(row.get("meta_color", ""))
+    capacity = normalize_text(row.get("meta_capacity", ""))
+    iso_pages = normalize_pages_value(row.get("meta_iso_pages", ""))
+    item_type = normalize_text(row.get("meta_item_type", ""))
+    print_technology = normalize_text(row.get("meta_print_technology", ""))
+    description = normalize_text(row.get("meta_description", ""))
     fits = normalize_text(row.get("meta_fits_models", ""))
+    weight = format_meta_weight(row.get("meta_weight", ""))
+    dimensions = format_meta_dimensions(row.get("meta_length", ""), row.get("meta_width", ""), row.get("meta_height", ""))
     own_price = safe_float(row.get("sale_price"), 0.0)
     own_stock = parse_qty_generic(row.get("free_qty"))
     best = get_best_offer(row, min_qty=float(st.session_state.get("distributor_min_qty", 1.0)))
@@ -6221,13 +6389,37 @@ def render_crm_card_center(
             m3.metric("Лучший поставщик", best_source or "—")
             if note:
                 st.info(f"Заметка: {note}")
-            if model or mcode or fits:
-                if model:
-                    st.write(f"**Модель:** {model}")
-                if mcode:
-                    st.write(f"**Код производителя:** {mcode}")
+
+            quick_left = [
+                ("Бренд", brand),
+                ("Модель", model),
+                ("Код производителя", mcode),
+                ("Тип печати", print_type),
+                ("Цвет", color),
+                ("Емкость", capacity),
+            ]
+            quick_right = [
+                ("Ресурс, стр.", iso_pages),
+                ("Тип", item_type),
+                ("Технология", print_technology),
+                ("Вес", weight),
+                ("Габариты", dimensions),
+            ]
+
+            if any(v for _, v in quick_left + quick_right) or fits or description:
+                i1, i2 = st.columns(2)
+                with i1:
+                    for label, value in quick_left:
+                        if value:
+                            st.markdown(f"**{label}:** {value}")
+                with i2:
+                    for label, value in quick_right:
+                        if value:
+                            st.markdown(f"**{label}:** {value}")
                 if fits:
-                    st.write(f"**Подходит к моделям:** {fits}")
+                    st.markdown(f"**Подходит к моделям:** {fits}")
+                if description:
+                    st.caption(f"Описание: {description}")
 
     with t_prices:
         st.caption("Здесь видно нашу цену и лучший рынок по текущей позиции. Это быстрый обзор, а полный блок 'Показать цены у всех' остаётся ниже.")
