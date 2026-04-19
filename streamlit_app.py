@@ -2550,6 +2550,7 @@ def ensure_photo_registry() -> None:
 
 
 def load_photo_registry_df() -> pd.DataFrame:
+    ensure_photo_registry()
     path = get_photo_registry_path()
     if not path.exists():
         return pd.DataFrame()
@@ -2557,16 +2558,20 @@ def load_photo_registry_df() -> pd.DataFrame:
         df = pd.read_sql_query("SELECT * FROM photo_registry", conn)
     if df.empty:
         return df
-    for col in [
+
+    expected_cols = [
         "article", "article_norm", "photo_url", "source_sheet",
         "meta_brand", "meta_color", "meta_capacity", "meta_manufacturer_code",
         "meta_model", "meta_description", "meta_fits_models", "meta_iso_pages",
         "meta_print_technology", "meta_item_type", "meta_print_type",
         "meta_weight", "meta_length", "meta_width", "meta_height",
         "first_seen", "last_seen", "last_changed_at", "import_name",
-    ]:
-        if col in df.columns:
-            df[col] = df[col].fillna("").map(normalize_text)
+    ]
+    for col in expected_cols:
+        if col not in df.columns:
+            df[col] = ""
+        df[col] = df[col].fillna("").map(normalize_text)
+
     # Откатили веб-парсер: старые web-fallback записи не подмешиваем в рабочий реестр.
     if "import_name" in df.columns:
         df = df[df["import_name"].fillna("") != "web-fallback"].copy()
@@ -2712,13 +2717,17 @@ def ensure_photo_registry_loaded() -> None:
         return
     reg = load_photo_registry_df()
     if isinstance(reg, pd.DataFrame) and not reg.empty:
-        st.session_state.photo_df = reg[[
+        required_cols = [
             "article", "article_norm", "photo_url", "source_sheet",
             "meta_brand", "meta_color", "meta_capacity", "meta_manufacturer_code",
             "meta_model", "meta_description", "meta_fits_models", "meta_iso_pages",
             "meta_print_technology", "meta_item_type", "meta_print_type",
             "meta_weight", "meta_length", "meta_width", "meta_height",
-        ]].copy()
+        ]
+        for col in required_cols:
+            if col not in reg.columns:
+                reg[col] = ""
+        st.session_state.photo_df = reg[required_cols].copy()
         if normalize_text(st.session_state.get("photo_name", "")) in {"", "ещё не загружен"}:
             st.session_state.photo_name = "из реестра сервера"
 
