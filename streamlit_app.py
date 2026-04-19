@@ -8,6 +8,8 @@ import math
 import re
 import sqlite3
 import hashlib
+import shutil
+import zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
@@ -133,6 +135,536 @@ def render_operation_log_sidebar() -> None:
             st.caption("Пока пусто")
             return
         for item in reversed(log_items[-12:]):
+            icon = "✅" if item.get("level") == "success" else ("⚠️" if item.get("level") == "warning" else "•")
+            st.markdown(f"{icon} **{html.escape(str(item.get('time', '')))}** — {html.escape(str(item.get('message', '')))}", unsafe_allow_html=True)
+
+
+
+
+SERVICE_SNAPSHOT_DIRNAME = "_service_snapshots"
+SERVICE_EXPORT_DIRNAME = "_service_exports"
+SERVICE_SAFE_BOOT_FLAG = "_service_safe_boot.flag"
+
+
+def get_app_root_dir() -> Path:
+    try:
+        return Path(__file__).resolve().parent
+    except Exception:
+        return Path.cwd()
+
+
+def get_service_snapshots_dir() -> Path:
+    path = get_server_data_dir() / SERVICE_SNAPSHOT_DIRNAME
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def get_service_exports_dir() -> Path:
+    path = get_server_data_dir() / SERVICE_EXPORT_DIRNAME
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def get_service_safe_boot_flag_path() -> Path:
+    return get_server_data_dir() / SERVICE_SAFE_BOOT_FLAG
+
+
+def is_service_safe_boot_enabled() -> bool:
+    # TEST: safe boot полностью отключён, чтобы исключить влияние сервисного режима.
+    return False
+
+
+def enable_service_safe_boot() -> None:
+    flag = get_service_safe_boot_flag_path()
+    flag.parent.mkdir(parents=True, exist_ok=True)
+    flag.write_text("1", encoding="utf-8")
+    log_operation("Сервис: включён безопасный запуск", "warning")
+
+
+def disable_service_safe_boot() -> None:
+    flag = get_service_safe_boot_flag_path()
+    if flag.exists():
+        flag.unlink()
+    log_operation("Сервис: безопасный запуск выключен", "success")
+
+
+def _service_db_path(filename: str) -> Path:
+    try:
+        return Path(__file__).resolve().with_name(filename)
+    except Exception:
+        return Path.cwd() / filename
+
+
+def _service_slug(value: str) -> str:
+    txt = normalize_text(value) or "snapshot"
+    txt = re.sub(r"[^A-Za-zА-Яа-я0-9._-]+", "_", txt)
+    txt = re.sub(r"_+", "_", txt).strip("._-")
+    return txt[:64] or "snapshot"
+
+
+def _service_rel_path(path: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(get_app_root_dir().resolve()))
+    except Exception:
+        return path.name
+
+
+def _service_file_md5(path: Path) -> str:
+    md5 = hashlib.md5()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            if not chunk:
+                break
+            md5.update(chunk)
+    return md5.hexdigest()
+
+
+def get_service_live_file_entries() -> list[dict[str, Any]]:
+    comparison = get_persisted_comparison_file_path()
+    photo = get_persisted_photo_file_path()
+    avito = get_persisted_avito_file_path()
+    watchlist = get_persisted_watchlist_file_path()
+    entries = [
+        {"label": "comparison", "path": comparison},
+        {"label": "comparison_meta", "path": get_persisted_meta_path(comparison)},
+        {"label": "photo", "path": photo},
+        {"label": "photo_meta", "path": get_persisted_meta_path(photo)},
+        {"label": "avito", "path": avito},
+        {"label": "avito_meta", "path": get_persisted_meta_path(avito)},
+        {"label": "watchlist", "path": watchlist},
+        {"label": "watchlist_meta", "path": get_persisted_meta_path(watchlist)},
+        {"label": "review_tasks_db", "path": _service_db_path("review_tasks.sqlite")},
+        {"label": "avito_registry_db", "path": _service_db_path("avito_registry.sqlite")},
+        {"label": "photo_registry_db", "path": _service_db_path("photo_registry.sqlite")},
+        {"label": "price_patch_history_db", "path": _service_db_path("price_patch_history.sqlite")},
+        {"label": "card_overrides_db", "path": _service_db_path("card_overrides.sqlite")},
+    ]
+    return entries
+
+
+def maybe_create_service_snapshot_before_action(action_key: str, content_sig: str, reason: str) -> str:
+    # TEST: сервисные snapshot перед действиями временно отключены.
+    return ""
+
+
+def create_service_snapshot(reason: str = "", source: str = "manual") -> Path:
+    snap_root = get_service_snapshots_dir()
+    timestamp = datetime.utcnow().strftime("%Y-%m-%d_%H-%M-%S")
+    folder_name = f"{timestamp}__{_service_slug(source)}__{_service_slug(reason or 'snapshot')}"
+    snap_dir = snap_root / folder_name
+    files_dir = snap_dir / "files"
+    files_dir.mkdir(parents=True, exist_ok=True)
+
+    files_meta: list[dict[str, Any]] = []
+    for entry in get_service_live_file_entries():
+        path = entry["path"]
+        if not path.exists() or not path.is_file():
+            continue
+        rel_path = _service_rel_path(path)
+        target = files_dir / rel_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, target)
+        files_meta.append({
+            "label": entry["label"],
+            "relative_path": rel_path,
+            "size": path.stat().st_size,
+            "md5": _service_file_md5(path),
+            "modified_at": datetime.utcfromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds"),
+        })
+
+    manifest = {
+        "snapshot_name": folder_name,
+        "created_at": datetime.utcnow().isoformat(timespec="seconds"),
+        "source": normalize_text(source),
+        "reason": normalize_text(reason),
+        "app_title": APP_TITLE,
+        "app_version": APP_VERSION,
+        "file_count": len(files_meta),
+        "files": files_meta,
+    }
+    (snap_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    log_operation(f"Сервис: создан snapshot {folder_name} ({len(files_meta)} файлов)", "success")
+    return snap_dir
+
+
+def _read_service_snapshot_manifest(snap_dir: Path) -> dict[str, Any]:
+    manifest_path = snap_dir / "manifest.json"
+    if manifest_path.exists():
+        try:
+            return json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {
+        "snapshot_name": snap_dir.name,
+        "created_at": "",
+        "source": "",
+        "reason": "",
+        "app_title": APP_TITLE,
+        "app_version": APP_VERSION,
+        "file_count": 0,
+        "files": [],
+    }
+
+
+def list_service_snapshots(limit: int = 50) -> list[dict[str, Any]]:
+    root = get_service_snapshots_dir()
+    items: list[dict[str, Any]] = []
+    for snap_dir in root.iterdir():
+        if not snap_dir.is_dir():
+            continue
+        meta = _read_service_snapshot_manifest(snap_dir)
+        meta["path"] = str(snap_dir)
+        meta["name"] = snap_dir.name
+        items.append(meta)
+    items.sort(key=lambda x: (str(x.get("created_at", "")), str(x.get("name", ""))), reverse=True)
+    return items[:limit]
+
+
+def build_service_snapshot_compare_df(snapshot_name: str) -> pd.DataFrame:
+    snap_dir = get_service_snapshots_dir() / snapshot_name
+    files_dir = snap_dir / "files"
+    rows: list[dict[str, Any]] = []
+    for entry in get_service_live_file_entries():
+        live_path = entry["path"]
+        rel_path = _service_rel_path(live_path)
+        snap_path = files_dir / rel_path
+        live_exists = live_path.exists()
+        snap_exists = snap_path.exists()
+        changed = ""
+        if live_exists and snap_exists:
+            try:
+                changed = "Да" if _service_file_md5(live_path) != _service_file_md5(snap_path) else "Нет"
+            except Exception:
+                changed = "?"
+        elif live_exists != snap_exists:
+            changed = "Да"
+        rows.append({
+            "Файл": rel_path,
+            "В snapshot": "Да" if snap_exists else "—",
+            "Сейчас": "Да" if live_exists else "—",
+            "Snapshot, КБ": round(snap_path.stat().st_size / 1024, 1) if snap_exists else 0.0,
+            "Сейчас, КБ": round(live_path.stat().st_size / 1024, 1) if live_exists else 0.0,
+            "Изменён": changed,
+        })
+    return pd.DataFrame(rows)
+
+
+def restore_service_snapshot(snapshot_name: str) -> dict[str, Any]:
+    snap_dir = get_service_snapshots_dir() / snapshot_name
+    files_dir = snap_dir / "files"
+    if not snap_dir.exists():
+        raise FileNotFoundError(f"Snapshot не найден: {snapshot_name}")
+
+    emergency = create_service_snapshot(reason=f"before restore {snapshot_name}", source="pre_restore")
+
+    restored: list[str] = []
+    removed: list[str] = []
+    for entry in get_service_live_file_entries():
+        live_path = entry["path"]
+        rel_path = _service_rel_path(live_path)
+        snap_path = files_dir / rel_path
+        if snap_path.exists():
+            live_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(snap_path, live_path)
+            restored.append(rel_path)
+        elif live_path.exists():
+            try:
+                live_path.unlink()
+                removed.append(rel_path)
+            except Exception:
+                pass
+
+    clear_loader_caches()
+    for key in [
+        "comparison_sheets", "comparison_name", "comparison_version", "current_df",
+        "photo_df", "photo_name", "photo_last_sync_sig", "photo_registry_message", "photo_registry_stats",
+        "avito_df", "avito_name", "avito_last_sync_sig", "avito_registry_message", "avito_registry_stats",
+        "hot_items_df", "hot_items_name", "hot_items_last_sync_sig",
+        "patch_message",
+        "last_result_original", "last_result_discount", "last_result_compatible",
+        "last_result_sig_original", "last_result_sig_discount", "last_result_sig_compatible",
+        "comparison_upload_applied_sig", "photo_upload_applied_sig", "avito_upload_applied_sig", "hot_upload_applied_sig",
+        "service_snapshot_sig__comparison_upload", "service_snapshot_sig__photo_upload",
+        "service_snapshot_sig__avito_upload", "service_snapshot_sig__watchlist_upload",
+    ]:
+        st.session_state.pop(key, None)
+
+    notice = (
+        f"Восстановлен snapshot: {snapshot_name}. "
+        f"Файлов восстановлено: {len(restored)}, удалено по снимку: {len(removed)}. "
+        f"Страховочный snapshot: {emergency.name}."
+    )
+    st.session_state["service_restore_notice"] = notice
+    log_operation(f"Сервис: выполнено восстановление из {snapshot_name}", "warning")
+    return {
+        "restored": len(restored),
+        "removed": len(removed),
+        "emergency_snapshot": emergency.name,
+        "notice": notice,
+    }
+
+
+def build_service_backup_zip_bytes(include_snapshots: bool = True) -> bytes:
+    buf = io.BytesIO()
+    export_meta = {
+        "exported_at": datetime.utcnow().isoformat(timespec="seconds"),
+        "app_title": APP_TITLE,
+        "app_version": APP_VERSION,
+        "include_snapshots": bool(include_snapshots),
+    }
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("export_manifest.json", json.dumps(export_meta, ensure_ascii=False, indent=2))
+        for entry in get_service_live_file_entries():
+            path = entry["path"]
+            if path.exists() and path.is_file():
+                zf.write(path, arcname=f"live/{_service_rel_path(path)}")
+        if include_snapshots:
+            snap_root = get_service_snapshots_dir()
+            for path in snap_root.rglob("*"):
+                if path.is_file():
+                    zf.write(path, arcname=f"snapshots/{path.relative_to(snap_root)}")
+    return buf.getvalue()
+
+
+def _service_sqlite_status(label: str, path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {"name": label, "status": "warn", "details": "файл ещё не создан"}
+    try:
+        with sqlite3.connect(path) as conn:
+            tables = pd.read_sql_query(
+                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name",
+                conn,
+            )
+        table_count = len(tables) if isinstance(tables, pd.DataFrame) else 0
+        return {"name": label, "status": "ok", "details": f"ok • таблиц: {table_count}"}
+    except Exception as exc:
+        return {"name": label, "status": "fail", "details": f"ошибка открытия: {normalize_text(exc)}"}
+
+
+def run_service_healthcheck() -> dict[str, Any]:
+    checks: list[dict[str, Any]] = []
+
+    comp_path = get_persisted_comparison_file_path()
+    if comp_path.exists():
+        try:
+            wb = load_comparison_workbook(read_persisted_original_name(comp_path, comp_path.name), comp_path.read_bytes())
+            sheets = list(wb.keys()) if isinstance(wb, dict) else []
+            total_rows = sum(len(df) for df in wb.values()) if isinstance(wb, dict) else 0
+            required = {"Сравнение", "Уценка", "Совместимые"}
+            missing = sorted(required - set(sheets))
+            status = "ok" if not missing else "warn"
+            details = f"ok • листов: {len(sheets)}, строк: {total_rows}"
+            if missing:
+                details += f" • нет листов: {', '.join(missing)}"
+            checks.append({"name": "comparison", "status": status, "details": details})
+        except Exception as exc:
+            checks.append({"name": "comparison", "status": "fail", "details": f"ошибка загрузки: {normalize_text(exc)}"})
+    else:
+        checks.append({"name": "comparison", "status": "fail", "details": "файл не найден"})
+
+    photo_path = get_persisted_photo_file_path()
+    if photo_path.exists():
+        try:
+            photo_df = load_photo_map_file(read_persisted_original_name(photo_path, photo_path.name), photo_path.read_bytes())
+            checks.append({"name": "фото", "status": "ok", "details": f"ok • строк: {len(photo_df)}"})
+        except Exception as exc:
+            checks.append({"name": "фото", "status": "fail", "details": f"ошибка загрузки: {normalize_text(exc)}"})
+    else:
+        checks.append({"name": "фото", "status": "warn", "details": "файл не найден"})
+
+    watch_path = get_persisted_watchlist_file_path()
+    if watch_path.exists():
+        try:
+            watch_df = load_hot_watchlist_file(read_persisted_original_name(watch_path, watch_path.name), watch_path.read_bytes())
+            status = "ok" if len(watch_df) > 0 else "warn"
+            details = f"ok • строк: {len(watch_df)}" if len(watch_df) > 0 else "файл читается, но валидных строк нет"
+            checks.append({"name": "watchlist", "status": status, "details": details})
+        except Exception as exc:
+            checks.append({"name": "watchlist", "status": "fail", "details": f"ошибка загрузки: {normalize_text(exc)}"})
+    else:
+        checks.append({"name": "watchlist", "status": "warn", "details": "файл не найден"})
+
+    avito_path = get_persisted_avito_file_path()
+    if avito_path.exists():
+        try:
+            avito_df = load_avito_file(read_persisted_original_name(avito_path, avito_path.name), avito_path.read_bytes())
+            checks.append({"name": "Avito registry input", "status": "ok", "details": f"ok • строк: {len(avito_df)}"})
+        except Exception as exc:
+            checks.append({"name": "Avito registry input", "status": "fail", "details": f"ошибка загрузки: {normalize_text(exc)}"})
+    else:
+        checks.append({"name": "Avito registry input", "status": "warn", "details": "файл не найден"})
+
+    checks.append(_service_sqlite_status("tasks DB", _service_db_path("review_tasks.sqlite")))
+    checks.append(_service_sqlite_status("photo registry DB", _service_db_path("photo_registry.sqlite")))
+    checks.append(_service_sqlite_status("Avito registry DB", _service_db_path("avito_registry.sqlite")))
+    checks.append(_service_sqlite_status("price history DB", _service_db_path("price_patch_history.sqlite")))
+
+    snaps = list_service_snapshots(limit=200)
+    last_snapshot = snaps[0].get("created_at", "") if snaps else ""
+    return {
+        "checks": checks,
+        "snapshots_count": len(snaps),
+        "last_snapshot": last_snapshot,
+        "safe_boot": is_service_safe_boot_enabled(),
+    }
+
+
+def render_service_mode_sidebar() -> None:
+    status = run_service_healthcheck()
+    service_open = st.checkbox(
+        "Открыть сервисный режим",
+        key="service_mode_open",
+        help="Ленивая сервисная панель. Пока блок закрыт, проверки, сравнение snapshot и сбор backup.zip не запускаются.",
+    )
+    safe_boot_on = bool(status.get("safe_boot"))
+    st.markdown(
+        f"<div class='sidebar-mini'>Safe boot: <b>{'включён' if safe_boot_on else 'выключен'}</b></div>",
+        unsafe_allow_html=True,
+    )
+    st.caption("ⓘ Safe boot — облегчённый запуск. Полезен, если после неудачного обновления нужно спокойно зайти в систему и сделать откат.")
+    sb1, sb2 = st.columns(2)
+    if sb1.button(
+        "Включить safe boot",
+        use_container_width=True,
+        key="service_enable_safe_boot",
+        help="Включает облегчённый запуск. Тяжёлые блоки можно не рендерить, чтобы быстрее восстановить систему.",
+    ):
+        enable_service_safe_boot()
+        st.rerun()
+    if sb2.button(
+        "Выключить safe boot",
+        use_container_width=True,
+        key="service_disable_safe_boot",
+        help="Возвращает обычный режим работы приложения.",
+    ):
+        disable_service_safe_boot()
+        st.rerun()
+
+    if notice := st.session_state.get("service_restore_notice"):
+        st.success(notice)
+
+    if not service_open:
+        st.markdown(
+            "<div class='sidebar-mini'>Пока блок закрыт — проверки, архивы и сравнение snapshot не строятся.</div>",
+            unsafe_allow_html=True,
+        )
+        return
+
+    st.markdown("**1. Статус системы**")
+    st.caption("ⓘ Показывает, что именно сейчас читается без ошибок: основные файлы, реестры SQLite, snapshots и safe boot.")
+    for rec in status.get("checks", []):
+        icon = "✅" if rec.get("status") == "ok" else ("⚠️" if rec.get("status") == "warn" else "❌")
+        st.markdown(f"{icon} **{html.escape(str(rec.get('name', '')))}** — {html.escape(str(rec.get('details', '')))}")
+    st.markdown(
+        f"<div class='sidebar-mini'>Snapshots: <b>{int(status.get('snapshots_count', 0))}</b> • последний: <b>{html.escape(str(status.get('last_snapshot') or '—'))}</b></div>",
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("**2. Сделать snapshot сейчас**")
+    st.caption("ⓘ Snapshot — это точка отката. Перед рискованными действиями можно вручную сохранить текущее состояние системы.")
+    st.text_input(
+        "Причина snapshot",
+        key="service_snapshot_reason",
+        placeholder="Например: перед загрузкой нового comparison",
+        help="Коротко подпиши, зачем создаётся снимок. Потом по этой причине легче найти нужную точку отката.",
+    )
+    if st.button(
+        "Сделать snapshot сейчас",
+        use_container_width=True,
+        key="service_snapshot_now",
+        help="Сохраняет текущие файлы /data и внутренние реестры в отдельную папку snapshot.",
+    ):
+        reason = st.session_state.get("service_snapshot_reason", "") or "manual snapshot"
+        snap = create_service_snapshot(reason=reason, source="manual")
+        st.success(f"Snapshot создан: {snap.name}")
+
+    st.markdown("**3. Восстановление**")
+    st.caption("ⓘ Здесь можно сравнить текущее состояние с выбранным snapshot и вернуть систему назад. Перед восстановлением автоматически создаётся страховочный snapshot.")
+    snapshots = list_service_snapshots(limit=100)
+    if snapshots:
+        options = [item["name"] for item in snapshots]
+        st.selectbox(
+            "Выбери snapshot",
+            options=options,
+            key="service_selected_snapshot",
+            help="Список доступных точек отката. В названии и описании видно дату и причину создания.",
+            format_func=lambda x: next(
+                (
+                    f"{item.get('created_at', '')} • {item.get('reason', '') or item.get('name', '')}"
+                    for item in snapshots if item.get("name") == x
+                ),
+                x,
+            ),
+        )
+        selected_snapshot = st.session_state.get("service_selected_snapshot")
+        compare_df = build_service_snapshot_compare_df(selected_snapshot)
+        if not compare_df.empty:
+            st.dataframe(compare_df, use_container_width=True, height=180)
+        st.checkbox(
+            "Я понимаю, что текущее состояние будет заменено выбранным snapshot",
+            key="service_restore_confirm",
+            help="Защита от случайного отката. Без этого подтверждения восстановление не запустится.",
+        )
+        if st.button(
+            "Восстановить snapshot",
+            use_container_width=True,
+            key="service_restore_snapshot",
+            help="Копирует файлы из выбранного snapshot обратно в рабочее состояние приложения.",
+        ):
+            if not st.session_state.get("service_restore_confirm", False):
+                st.warning("Подтверди восстановление чекбоксом выше.")
+            else:
+                restore_info = restore_service_snapshot(selected_snapshot)
+                st.success(restore_info.get("notice", "Snapshot восстановлен."))
+                st.rerun()
+    else:
+        st.info("Snapshot пока нет.")
+
+    st.markdown("**4. Скачать резервную копию**")
+    st.caption("ⓘ Backup.zip — это архив всего важного состояния, который можно скачать наружу и хранить отдельно от сервера.")
+    st.checkbox(
+        "Включить snapshots в backup.zip",
+        key="service_backup_include_snapshots",
+        value=True,
+        help="Если включено, в архив попадут и live-файлы, и папка snapshots. Архив будет больше, но надёжнее.",
+    )
+    if st.button(
+        "Собрать backup.zip",
+        use_container_width=True,
+        key="service_build_backup_zip",
+        help="Собирает полный архив резервной копии для скачивания.",
+    ):
+        backup_bytes = build_service_backup_zip_bytes(
+            include_snapshots=bool(st.session_state.get("service_backup_include_snapshots", True))
+        )
+        ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        export_path = get_service_exports_dir() / f"moy_tovar_backup_{ts}.zip"
+        export_path.write_bytes(backup_bytes)
+        st.session_state["service_backup_zip_path"] = str(export_path)
+        st.session_state["service_backup_zip_name"] = export_path.name
+        log_operation(f"Сервис: собран backup.zip ({export_path.name})", "success")
+    backup_path = Path(st.session_state["service_backup_zip_path"]) if st.session_state.get("service_backup_zip_path") else None
+    if backup_path and backup_path.exists():
+        st.download_button(
+            "⬇️ Скачать backup.zip",
+            data=backup_path.read_bytes(),
+            file_name=st.session_state.get("service_backup_zip_name", backup_path.name),
+            mime="application/zip",
+            use_container_width=True,
+            key="service_download_backup_zip",
+        )
+
+    st.markdown("**5. Лог сервиса**")
+    st.caption("ⓘ Здесь видны последние сервисные действия: snapshot, backup, restore, safe boot и предупреждения проверки.")
+    service_keywords = ("Сервис:", "snapshot", "restore", "backup", "safe boot")
+    service_log_items = [
+        item for item in st.session_state.get("operation_log", [])
+        if any(keyword.lower() in str(item.get("message", "")).lower() for keyword in service_keywords)
+    ]
+    if not service_log_items:
+        st.caption("Сервисный лог пока пуст.")
+    else:
+        for item in reversed(service_log_items[-10:]):
             icon = "✅" if item.get("level") == "success" else ("⚠️" if item.get("level") == "warning" else "•")
             st.markdown(f"{icon} **{html.escape(str(item.get('time', '')))}** — {html.escape(str(item.get('message', '')))}", unsafe_allow_html=True)
 
@@ -536,11 +1068,21 @@ PHOTO_COLUMN_ALIASES = {
         "photo_url", "url", "link", "picture", "картинка", "ссылка",
         "imag", "images"
     ],
+    "brand": ["brend", "бренд", "brand"],
     "color": ["czvet", "цвет", "color"],
-    "iso_pages": ["resurs-po-iso-str", "ресурс-по-iso-стр", "ресурс", "iso", "pages"],
+    "capacity": ["emkost-kartridzha", "емкость-картриджа", "емкость картриджа", "capacity"],
     "manufacturer_code": ["kod-proizvoditelya", "код-производителя", "код производителя"],
     "model": ["model", "модель"],
+    "description": ["originalinosti", "описание", "description"],
     "fits_models": ["podhodit-k-modelyam", "подходит-к-моделям", "подходит к моделям"],
+    "iso_pages": ["resurs-po-iso-str", "ресурс-по-iso-стр", "ресурс", "iso", "pages"],
+    "print_technology": ["tehnologiya-pechati", "технология-печати", "технология печати"],
+    "item_type": ["tip", "тип"],
+    "print_type": ["tip-pechati", "тип-печати", "тип печати"],
+    "weight": ["weight", "вес"],
+    "length": ["length", "длина"],
+    "width": ["width", "ширина"],
+    "height": ["height", "высота"],
 }
 
 AVITO_COLUMN_ALIASES = {
@@ -719,6 +1261,39 @@ def normalize_pages_value(value: object) -> str:
             except Exception:
                 return digits
     return raw
+
+
+def normalize_meta_measure(value: object) -> str:
+    raw = normalize_text(value)
+    if not raw:
+        return ""
+    try:
+        num = float(str(raw).replace(" ", "").replace(",", "."))
+        if abs(num - int(num)) < 1e-9:
+            return str(int(num))
+        txt = f"{num:.2f}".rstrip("0").rstrip(".")
+        return txt.replace(".", ",")
+    except Exception:
+        return raw
+
+
+def format_meta_dimensions(length: object, width: object, height: object) -> str:
+    l = normalize_meta_measure(length)
+    w = normalize_meta_measure(width)
+    h = normalize_meta_measure(height)
+    if not (l or w or h):
+        return ""
+    parts = [x for x in [l, w, h] if x]
+    return " × ".join(parts) + " см"
+
+
+def format_meta_weight(weight: object) -> str:
+    w = normalize_meta_measure(weight)
+    if not w:
+        return ""
+    if re.search(r"[A-Za-zА-Яа-яЁё]", w):
+        return w
+    return f"{w} кг"
 
 
 def simplify_template_color(value: object) -> str:
@@ -1434,7 +2009,9 @@ def load_photo_map_file(file_name: str, file_bytes: bytes) -> pd.DataFrame:
     def _empty_df() -> pd.DataFrame:
         return pd.DataFrame(columns=[
             "article", "article_norm", "photo_url", "source_sheet", "sheet_priority",
-            "meta_color", "meta_iso_pages", "meta_manufacturer_code", "meta_model", "meta_fits_models",
+            "meta_brand", "meta_color", "meta_capacity", "meta_manufacturer_code", "meta_model",
+            "meta_description", "meta_fits_models", "meta_iso_pages", "meta_print_technology",
+            "meta_item_type", "meta_print_type", "meta_weight", "meta_length", "meta_width", "meta_height",
         ])
 
     def _from_raw(raw: pd.DataFrame, sheet_name: str = "") -> pd.DataFrame:
@@ -1479,11 +2056,21 @@ def load_photo_map_file(file_name: str, file_bytes: bytes) -> pd.DataFrame:
         out["photo_url"] = raw[mapping["photo_url"]].map(extract_first_url) if mapping.get("photo_url") else ""
         out["source_sheet"] = sheet_name
         out["sheet_priority"] = _sheet_priority(sheet_name)
+        out["meta_brand"] = raw[mapping["brand"]].map(normalize_text) if mapping.get("brand") else ""
         out["meta_color"] = raw[mapping["color"]].map(normalize_text) if mapping.get("color") else ""
-        out["meta_iso_pages"] = raw[mapping["iso_pages"]].map(normalize_text) if mapping.get("iso_pages") else ""
+        out["meta_capacity"] = raw[mapping["capacity"]].map(normalize_text) if mapping.get("capacity") else ""
         out["meta_manufacturer_code"] = raw[mapping["manufacturer_code"]].map(normalize_text) if mapping.get("manufacturer_code") else ""
         out["meta_model"] = raw[mapping["model"]].map(normalize_text) if mapping.get("model") else ""
+        out["meta_description"] = raw[mapping["description"]].map(normalize_text) if mapping.get("description") else ""
         out["meta_fits_models"] = raw[mapping["fits_models"]].map(normalize_text) if mapping.get("fits_models") else ""
+        out["meta_iso_pages"] = raw[mapping["iso_pages"]].map(normalize_text) if mapping.get("iso_pages") else ""
+        out["meta_print_technology"] = raw[mapping["print_technology"]].map(normalize_text) if mapping.get("print_technology") else ""
+        out["meta_item_type"] = raw[mapping["item_type"]].map(normalize_text) if mapping.get("item_type") else ""
+        out["meta_print_type"] = raw[mapping["print_type"]].map(normalize_text) if mapping.get("print_type") else ""
+        out["meta_weight"] = raw[mapping["weight"]].map(normalize_text) if mapping.get("weight") else ""
+        out["meta_length"] = raw[mapping["length"]].map(normalize_text) if mapping.get("length") else ""
+        out["meta_width"] = raw[mapping["width"]].map(normalize_text) if mapping.get("width") else ""
+        out["meta_height"] = raw[mapping["height"]].map(normalize_text) if mapping.get("height") else ""
         out = out[out["article_norm"] != ""].reset_index(drop=True)
         return out if not out.empty else _empty_df()
 
@@ -1498,7 +2085,12 @@ def load_photo_map_file(file_name: str, file_bytes: bytes) -> pd.DataFrame:
         if out.empty:
             raise ValueError("В файле фото нужны колонки с артикулом и хотя бы с фото или полезными полями.")
         out = out.sort_values(["sheet_priority", "article_norm"]).drop_duplicates(subset=["article_norm"], keep="first").reset_index(drop=True)
-        return out[["article", "article_norm", "photo_url", "source_sheet", "meta_color", "meta_iso_pages", "meta_manufacturer_code", "meta_model", "meta_fits_models"]]
+        return out[[
+            "article", "article_norm", "photo_url", "source_sheet",
+            "meta_brand", "meta_color", "meta_capacity", "meta_manufacturer_code", "meta_model",
+            "meta_description", "meta_fits_models", "meta_iso_pages", "meta_print_technology",
+            "meta_item_type", "meta_print_type", "meta_weight", "meta_length", "meta_width", "meta_height",
+        ]]
 
     sheets = pd.read_excel(io.BytesIO(file_bytes), sheet_name=None)
     parts: list[pd.DataFrame] = []
@@ -1535,23 +2127,43 @@ def load_photo_map_file(file_name: str, file_bytes: bytes) -> pd.DataFrame:
             "article_norm": article_norm,
             "photo_url": _best_photo(grp["photo_url"]),
             "source_sheet": _first_non_empty(grp["source_sheet"]),
+            "meta_brand": _first_non_empty(grp["meta_brand"]),
             "meta_color": _first_non_empty(grp["meta_color"]),
-            "meta_iso_pages": _first_non_empty(grp["meta_iso_pages"]),
+            "meta_capacity": _first_non_empty(grp["meta_capacity"]),
             "meta_manufacturer_code": _first_non_empty(grp["meta_manufacturer_code"]),
             "meta_model": _first_non_empty(grp["meta_model"]),
+            "meta_description": _first_non_empty(grp["meta_description"]),
             "meta_fits_models": _first_non_empty(grp["meta_fits_models"]),
+            "meta_iso_pages": _first_non_empty(grp["meta_iso_pages"]),
+            "meta_print_technology": _first_non_empty(grp["meta_print_technology"]),
+            "meta_item_type": _first_non_empty(grp["meta_item_type"]),
+            "meta_print_type": _first_non_empty(grp["meta_print_type"]),
+            "meta_weight": _first_non_empty(grp["meta_weight"]),
+            "meta_length": _first_non_empty(grp["meta_length"]),
+            "meta_width": _first_non_empty(grp["meta_width"]),
+            "meta_height": _first_non_empty(grp["meta_height"]),
         }
         rows.append(row)
 
     combined = pd.DataFrame(rows)
-    return combined[["article", "article_norm", "photo_url", "source_sheet", "meta_color", "meta_iso_pages", "meta_manufacturer_code", "meta_model", "meta_fits_models"]]
+    return combined[[
+        "article", "article_norm", "photo_url", "source_sheet",
+        "meta_brand", "meta_color", "meta_capacity", "meta_manufacturer_code", "meta_model",
+        "meta_description", "meta_fits_models", "meta_iso_pages", "meta_print_technology",
+        "meta_item_type", "meta_print_type", "meta_weight", "meta_length", "meta_width", "meta_height",
+    ]]
 
 
 def apply_photo_map(df: pd.DataFrame | None, photo_df: pd.DataFrame | None) -> pd.DataFrame | None:
     if df is None:
         return None
     out = df.copy()
-    for col in ["photo_url", "photo_name", "meta_color", "meta_iso_pages", "meta_manufacturer_code", "meta_model", "meta_fits_models"]:
+    for col in [
+        "photo_url", "photo_name", "meta_brand", "meta_color", "meta_capacity",
+        "meta_manufacturer_code", "meta_model", "meta_description", "meta_fits_models",
+        "meta_iso_pages", "meta_print_technology", "meta_item_type", "meta_print_type",
+        "meta_weight", "meta_length", "meta_width", "meta_height",
+    ]:
         if col not in out.columns:
             out[col] = ""
     if photo_df is None or photo_df.empty:
@@ -1563,11 +2175,21 @@ def apply_photo_map(df: pd.DataFrame | None, photo_df: pd.DataFrame | None) -> p
         return normalize_text(row.get(key, ""))
     out["photo_url"] = out["article_norm"].map(lambda x: _meta(x, "photo_url"))
     out["photo_name"] = out["name"]
+    out["meta_brand"] = out["article_norm"].map(lambda x: _meta(x, "meta_brand"))
     out["meta_color"] = out["article_norm"].map(lambda x: _meta(x, "meta_color"))
-    out["meta_iso_pages"] = out["article_norm"].map(lambda x: _meta(x, "meta_iso_pages"))
+    out["meta_capacity"] = out["article_norm"].map(lambda x: _meta(x, "meta_capacity"))
     out["meta_manufacturer_code"] = out["article_norm"].map(lambda x: _meta(x, "meta_manufacturer_code"))
     out["meta_model"] = out["article_norm"].map(lambda x: _meta(x, "meta_model"))
+    out["meta_description"] = out["article_norm"].map(lambda x: _meta(x, "meta_description"))
     out["meta_fits_models"] = out["article_norm"].map(lambda x: _meta(x, "meta_fits_models"))
+    out["meta_iso_pages"] = out["article_norm"].map(lambda x: _meta(x, "meta_iso_pages"))
+    out["meta_print_technology"] = out["article_norm"].map(lambda x: _meta(x, "meta_print_technology"))
+    out["meta_item_type"] = out["article_norm"].map(lambda x: _meta(x, "meta_item_type"))
+    out["meta_print_type"] = out["article_norm"].map(lambda x: _meta(x, "meta_print_type"))
+    out["meta_weight"] = out["article_norm"].map(lambda x: _meta(x, "meta_weight"))
+    out["meta_length"] = out["article_norm"].map(lambda x: _meta(x, "meta_length"))
+    out["meta_width"] = out["article_norm"].map(lambda x: _meta(x, "meta_width"))
+    out["meta_height"] = out["article_norm"].map(lambda x: _meta(x, "meta_height"))
     return out
 
 
@@ -1860,6 +2482,32 @@ def get_photo_registry_path() -> Path:
 
 def ensure_photo_registry() -> None:
     path = get_photo_registry_path()
+    required_columns = {
+        "article_norm": "TEXT PRIMARY KEY",
+        "article": "TEXT",
+        "photo_url": "TEXT",
+        "source_sheet": "TEXT",
+        "meta_brand": "TEXT",
+        "meta_color": "TEXT",
+        "meta_capacity": "TEXT",
+        "meta_manufacturer_code": "TEXT",
+        "meta_model": "TEXT",
+        "meta_description": "TEXT",
+        "meta_fits_models": "TEXT",
+        "meta_iso_pages": "TEXT",
+        "meta_print_technology": "TEXT",
+        "meta_item_type": "TEXT",
+        "meta_print_type": "TEXT",
+        "meta_weight": "TEXT",
+        "meta_length": "TEXT",
+        "meta_width": "TEXT",
+        "meta_height": "TEXT",
+        "first_seen": "TEXT",
+        "last_seen": "TEXT",
+        "last_changed_at": "TEXT",
+        "import_name": "TEXT",
+        "change_count": "INTEGER DEFAULT 0",
+    }
     with sqlite3.connect(path) as conn:
         conn.execute(
             """
@@ -1868,11 +2516,21 @@ def ensure_photo_registry() -> None:
                 article TEXT,
                 photo_url TEXT,
                 source_sheet TEXT,
+                meta_brand TEXT,
                 meta_color TEXT,
-                meta_iso_pages TEXT,
+                meta_capacity TEXT,
                 meta_manufacturer_code TEXT,
                 meta_model TEXT,
+                meta_description TEXT,
                 meta_fits_models TEXT,
+                meta_iso_pages TEXT,
+                meta_print_technology TEXT,
+                meta_item_type TEXT,
+                meta_print_type TEXT,
+                meta_weight TEXT,
+                meta_length TEXT,
+                meta_width TEXT,
+                meta_height TEXT,
                 first_seen TEXT,
                 last_seen TEXT,
                 last_changed_at TEXT,
@@ -1881,10 +2539,15 @@ def ensure_photo_registry() -> None:
             )
             """
         )
+        existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(photo_registry)")}
+        for col_name, col_type in required_columns.items():
+            if col_name not in existing_cols:
+                conn.execute(f"ALTER TABLE photo_registry ADD COLUMN {col_name} {col_type}")
         conn.commit()
 
 
 def load_photo_registry_df() -> pd.DataFrame:
+    ensure_photo_registry()
     path = get_photo_registry_path()
     if not path.exists():
         return pd.DataFrame()
@@ -1892,14 +2555,18 @@ def load_photo_registry_df() -> pd.DataFrame:
         df = pd.read_sql_query("SELECT * FROM photo_registry", conn)
     if df.empty:
         return df
-    for col in [
+    expected_cols = [
         "article", "article_norm", "photo_url", "source_sheet",
-        "meta_color", "meta_iso_pages", "meta_manufacturer_code",
-        "meta_model", "meta_fits_models", "first_seen", "last_seen",
-        "last_changed_at", "import_name",
-    ]:
-        if col in df.columns:
-            df[col] = df[col].fillna("").map(normalize_text)
+        "meta_brand", "meta_color", "meta_capacity", "meta_manufacturer_code",
+        "meta_model", "meta_description", "meta_fits_models", "meta_iso_pages",
+        "meta_print_technology", "meta_item_type", "meta_print_type",
+        "meta_weight", "meta_length", "meta_width", "meta_height",
+        "first_seen", "last_seen", "last_changed_at", "import_name",
+    ]
+    for col in expected_cols:
+        if col not in df.columns:
+            df[col] = ""
+        df[col] = df[col].fillna("").map(normalize_text)
     # Откатили веб-парсер: старые web-fallback записи не подмешиваем в рабочий реестр.
     if "import_name" in df.columns:
         df = df[df["import_name"].fillna("") != "web-fallback"].copy()
@@ -1915,9 +2582,11 @@ def photo_registry_summary_text() -> str:
     with_photo = int(df.get("photo_url", pd.Series(dtype=object)).fillna("").map(lambda x: 1 if normalize_text(x) else 0).sum())
     with_meta = int((
         df.get("meta_model", pd.Series(dtype=object)).fillna("").map(bool)
+        | df.get("meta_brand", pd.Series(dtype=object)).fillna("").map(bool)
         | df.get("meta_fits_models", pd.Series(dtype=object)).fillna("").map(bool)
         | df.get("meta_color", pd.Series(dtype=object)).fillna("").map(bool)
         | df.get("meta_iso_pages", pd.Series(dtype=object)).fillna("").map(bool)
+        | df.get("meta_description", pd.Series(dtype=object)).fillna("").map(bool)
     ).sum())
     return f"В реестре: {len(df)} • с фото: {with_photo} • с метаданными: {with_meta}"
 
@@ -1932,8 +2601,10 @@ def sync_photo_registry(photo_df: pd.DataFrame, import_name: str) -> dict[str, A
 
     use_cols = [
         "article", "article_norm", "photo_url", "source_sheet",
-        "meta_color", "meta_iso_pages", "meta_manufacturer_code",
-        "meta_model", "meta_fits_models",
+        "meta_brand", "meta_color", "meta_capacity", "meta_manufacturer_code",
+        "meta_model", "meta_description", "meta_fits_models", "meta_iso_pages",
+        "meta_print_technology", "meta_item_type", "meta_print_type",
+        "meta_weight", "meta_length", "meta_width", "meta_height",
     ]
     for col in use_cols:
         if col not in work.columns:
@@ -1945,8 +2616,10 @@ def sync_photo_registry(photo_df: pd.DataFrame, import_name: str) -> dict[str, A
     stats = {"new": 0, "changed": 0, "unchanged": 0, "total": len(work)}
     tracked_cols = [
         "article", "photo_url", "source_sheet",
-        "meta_color", "meta_iso_pages", "meta_manufacturer_code",
-        "meta_model", "meta_fits_models",
+        "meta_brand", "meta_color", "meta_capacity", "meta_manufacturer_code",
+        "meta_model", "meta_description", "meta_fits_models", "meta_iso_pages",
+        "meta_print_technology", "meta_item_type", "meta_print_type",
+        "meta_weight", "meta_length", "meta_width", "meta_height",
     ]
 
     with sqlite3.connect(path) as conn:
@@ -1969,13 +2642,17 @@ def sync_photo_registry(photo_df: pd.DataFrame, import_name: str) -> dict[str, A
                     """
                     INSERT INTO photo_registry (
                         article_norm, article, photo_url, source_sheet,
-                        meta_color, meta_iso_pages, meta_manufacturer_code, meta_model, meta_fits_models,
+                        meta_brand, meta_color, meta_capacity, meta_manufacturer_code, meta_model,
+                        meta_description, meta_fits_models, meta_iso_pages, meta_print_technology,
+                        meta_item_type, meta_print_type, meta_weight, meta_length, meta_width, meta_height,
                         first_seen, last_seen, last_changed_at, import_name, change_count
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
                     """,
                     (
                         key, payload["article"], payload["photo_url"], payload["source_sheet"],
-                        payload["meta_color"], payload["meta_iso_pages"], payload["meta_manufacturer_code"], payload["meta_model"], payload["meta_fits_models"],
+                        payload["meta_brand"], payload["meta_color"], payload["meta_capacity"], payload["meta_manufacturer_code"], payload["meta_model"],
+                        payload["meta_description"], payload["meta_fits_models"], payload["meta_iso_pages"], payload["meta_print_technology"],
+                        payload["meta_item_type"], payload["meta_print_type"], payload["meta_weight"], payload["meta_length"], payload["meta_width"], payload["meta_height"],
                         now, now, now, normalize_text(import_name),
                     ),
                 )
@@ -1990,11 +2667,21 @@ def sync_photo_registry(photo_df: pd.DataFrame, import_name: str) -> dict[str, A
                             article=?,
                             photo_url=?,
                             source_sheet=?,
+                            meta_brand=?,
                             meta_color=?,
-                            meta_iso_pages=?,
+                            meta_capacity=?,
                             meta_manufacturer_code=?,
                             meta_model=?,
+                            meta_description=?,
                             meta_fits_models=?,
+                            meta_iso_pages=?,
+                            meta_print_technology=?,
+                            meta_item_type=?,
+                            meta_print_type=?,
+                            meta_weight=?,
+                            meta_length=?,
+                            meta_width=?,
+                            meta_height=?,
                             last_seen=?,
                             last_changed_at=?,
                             import_name=?,
@@ -2003,7 +2690,9 @@ def sync_photo_registry(photo_df: pd.DataFrame, import_name: str) -> dict[str, A
                         """,
                         (
                             payload["article"], payload["photo_url"], payload["source_sheet"],
-                            payload["meta_color"], payload["meta_iso_pages"], payload["meta_manufacturer_code"], payload["meta_model"], payload["meta_fits_models"],
+                            payload["meta_brand"], payload["meta_color"], payload["meta_capacity"], payload["meta_manufacturer_code"], payload["meta_model"],
+                            payload["meta_description"], payload["meta_fits_models"], payload["meta_iso_pages"], payload["meta_print_technology"],
+                            payload["meta_item_type"], payload["meta_print_type"], payload["meta_weight"], payload["meta_length"], payload["meta_width"], payload["meta_height"],
                             now, now, normalize_text(import_name), change_count, key,
                         ),
                     )
@@ -2023,11 +2712,17 @@ def ensure_photo_registry_loaded() -> None:
         return
     reg = load_photo_registry_df()
     if isinstance(reg, pd.DataFrame) and not reg.empty:
-        st.session_state.photo_df = reg[[
+        required_cols = [
             "article", "article_norm", "photo_url", "source_sheet",
-            "meta_color", "meta_iso_pages", "meta_manufacturer_code",
-            "meta_model", "meta_fits_models",
-        ]].copy()
+            "meta_brand", "meta_color", "meta_capacity", "meta_manufacturer_code",
+            "meta_model", "meta_description", "meta_fits_models", "meta_iso_pages",
+            "meta_print_technology", "meta_item_type", "meta_print_type",
+            "meta_weight", "meta_length", "meta_width", "meta_height",
+        ]
+        for col in required_cols:
+            if col not in reg.columns:
+                reg[col] = ""
+        st.session_state.photo_df = reg[required_cols].copy()
         if normalize_text(st.session_state.get("photo_name", "")) in {"", "ещё не загружен"}:
             st.session_state.photo_name = "из реестра сервера"
 
@@ -2057,6 +2752,30 @@ def get_card_override_path() -> Path:
 def ensure_card_override_db() -> None:
     path = get_card_override_path()
     path.parent.mkdir(parents=True, exist_ok=True)
+    required_columns = {
+        "sheet_name": "TEXT NOT NULL",
+        "article_norm": "TEXT NOT NULL",
+        "article": "TEXT",
+        "photo_url": "TEXT",
+        "name_override": "TEXT",
+        "meta_brand": "TEXT",
+        "meta_model": "TEXT",
+        "meta_manufacturer_code": "TEXT",
+        "meta_print_type": "TEXT",
+        "meta_color": "TEXT",
+        "meta_capacity": "TEXT",
+        "meta_iso_pages": "TEXT",
+        "meta_item_type": "TEXT",
+        "meta_print_technology": "TEXT",
+        "meta_description": "TEXT",
+        "meta_fits_models": "TEXT",
+        "meta_weight": "TEXT",
+        "meta_length": "TEXT",
+        "meta_width": "TEXT",
+        "meta_height": "TEXT",
+        "note": "TEXT",
+        "updated_at": "TEXT",
+    }
     with sqlite3.connect(path) as conn:
         conn.execute(
             """
@@ -2066,15 +2785,31 @@ def ensure_card_override_db() -> None:
                 article TEXT,
                 photo_url TEXT,
                 name_override TEXT,
+                meta_brand TEXT,
                 meta_model TEXT,
                 meta_manufacturer_code TEXT,
+                meta_print_type TEXT,
+                meta_color TEXT,
+                meta_capacity TEXT,
+                meta_iso_pages TEXT,
+                meta_item_type TEXT,
+                meta_print_technology TEXT,
+                meta_description TEXT,
                 meta_fits_models TEXT,
+                meta_weight TEXT,
+                meta_length TEXT,
+                meta_width TEXT,
+                meta_height TEXT,
                 note TEXT,
                 updated_at TEXT,
                 PRIMARY KEY (sheet_name, article_norm)
             )
             """
         )
+        existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(card_overrides)")}
+        for col_name, col_type in required_columns.items():
+            if col_name not in existing_cols:
+                conn.execute(f"ALTER TABLE card_overrides ADD COLUMN {col_name} {col_type}")
         conn.commit()
 
 
@@ -2087,7 +2822,14 @@ def load_card_overrides_df() -> pd.DataFrame:
         df = pd.read_sql_query("SELECT * FROM card_overrides", conn)
     if df.empty:
         return df
-    for col in ["sheet_name", "article_norm", "article", "photo_url", "name_override", "meta_model", "meta_manufacturer_code", "meta_fits_models", "note", "updated_at"]:
+    for col in [
+        "sheet_name", "article_norm", "article", "photo_url", "name_override",
+        "meta_brand", "meta_model", "meta_manufacturer_code", "meta_print_type",
+        "meta_color", "meta_capacity", "meta_iso_pages", "meta_item_type",
+        "meta_print_technology", "meta_description", "meta_fits_models",
+        "meta_weight", "meta_length", "meta_width", "meta_height",
+        "note", "updated_at",
+    ]:
         if col in df.columns:
             df[col] = df[col].fillna("").map(normalize_text)
     return df
@@ -2109,22 +2851,42 @@ def save_card_override(sheet_name: str, article: str, article_norm: str, payload
             """
             INSERT INTO card_overrides (
                 sheet_name, article_norm, article, photo_url, name_override,
-                meta_model, meta_manufacturer_code, meta_fits_models, note, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                meta_brand, meta_model, meta_manufacturer_code, meta_print_type,
+                meta_color, meta_capacity, meta_iso_pages, meta_item_type,
+                meta_print_technology, meta_description, meta_fits_models,
+                meta_weight, meta_length, meta_width, meta_height,
+                note, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(sheet_name, article_norm) DO UPDATE SET
                 article=excluded.article,
                 photo_url=excluded.photo_url,
                 name_override=excluded.name_override,
+                meta_brand=excluded.meta_brand,
                 meta_model=excluded.meta_model,
                 meta_manufacturer_code=excluded.meta_manufacturer_code,
+                meta_print_type=excluded.meta_print_type,
+                meta_color=excluded.meta_color,
+                meta_capacity=excluded.meta_capacity,
+                meta_iso_pages=excluded.meta_iso_pages,
+                meta_item_type=excluded.meta_item_type,
+                meta_print_technology=excluded.meta_print_technology,
+                meta_description=excluded.meta_description,
                 meta_fits_models=excluded.meta_fits_models,
+                meta_weight=excluded.meta_weight,
+                meta_length=excluded.meta_length,
+                meta_width=excluded.meta_width,
+                meta_height=excluded.meta_height,
                 note=excluded.note,
                 updated_at=excluded.updated_at
             """,
             (
                 normalize_text(sheet_name), normalize_text(article_norm), normalize_text(article),
-                clean.get("photo_url", ""), clean.get("name_override", ""), clean.get("meta_model", ""),
-                clean.get("meta_manufacturer_code", ""), clean.get("meta_fits_models", ""), clean.get("note", ""), now
+                clean.get("photo_url", ""), clean.get("name_override", ""), clean.get("meta_brand", ""),
+                clean.get("meta_model", ""), clean.get("meta_manufacturer_code", ""), clean.get("meta_print_type", ""),
+                clean.get("meta_color", ""), clean.get("meta_capacity", ""), clean.get("meta_iso_pages", ""),
+                clean.get("meta_item_type", ""), clean.get("meta_print_technology", ""), clean.get("meta_description", ""),
+                clean.get("meta_fits_models", ""), clean.get("meta_weight", ""), clean.get("meta_length", ""),
+                clean.get("meta_width", ""), clean.get("meta_height", ""), clean.get("note", ""), now
             ),
         )
         conn.commit()
@@ -2496,6 +3258,7 @@ def render_task_center_lazy_panel() -> None:
     m2.metric("Новые", counts.get("new", 0))
     m3.metric("Активные", counts.get("active", 0))
     m4.metric("Просроченные", counts.get("overdue", 0))
+    st.caption("ⓘ Новые — ещё не разобраны. Активные — в работе. Просроченные — срок уже вышел. Этот блок нужен, чтобы не терять ручные проверки по карточкам.")
     st.caption(
         "Что показывает: задачи на пересмотр карточек и цен. "
         "Как пользоваться: смотри срочные задачи, открывай карточку и после проверки отмечай задачу выполненной."
@@ -2521,9 +3284,21 @@ def apply_card_overrides(df: pd.DataFrame | None, sheet_name: str) -> pd.DataFra
         "photo_url",
         "source_sheet",
         "name",
+        "meta_brand",
         "meta_model",
         "meta_manufacturer_code",
+        "meta_print_type",
+        "meta_color",
+        "meta_capacity",
+        "meta_iso_pages",
+        "meta_item_type",
+        "meta_print_technology",
+        "meta_description",
         "meta_fits_models",
+        "meta_weight",
+        "meta_length",
+        "meta_width",
+        "meta_height",
         "manual_note",
     ]
     for col in text_cols:
@@ -2546,15 +3321,26 @@ def apply_card_overrides(df: pd.DataFrame | None, sheet_name: str) -> pd.DataFra
         name_override = normalize_text(ov.get("name_override", ""))
         if name_override:
             out.at[idx, "name"] = name_override
-        meta_model = normalize_text(ov.get("meta_model", ""))
-        if meta_model:
-            out.at[idx, "meta_model"] = meta_model
-        meta_code = normalize_text(ov.get("meta_manufacturer_code", ""))
-        if meta_code:
-            out.at[idx, "meta_manufacturer_code"] = meta_code
-        meta_fits = normalize_text(ov.get("meta_fits_models", ""))
-        if meta_fits:
-            out.at[idx, "meta_fits_models"] = meta_fits
+        for field_name in [
+            "meta_brand",
+            "meta_model",
+            "meta_manufacturer_code",
+            "meta_print_type",
+            "meta_color",
+            "meta_capacity",
+            "meta_iso_pages",
+            "meta_item_type",
+            "meta_print_technology",
+            "meta_description",
+            "meta_fits_models",
+            "meta_weight",
+            "meta_length",
+            "meta_width",
+            "meta_height",
+        ]:
+            field_value = normalize_text(ov.get(field_name, ""))
+            if field_value:
+                out.at[idx, field_name] = field_value
         note = normalize_text(ov.get("note", ""))
         if note:
             out.at[idx, "manual_note"] = note
@@ -2591,6 +3377,126 @@ def render_analytics_jump_helper(df: pd.DataFrame | None, tab_key: str, box_key:
         trigger_search_from_article(selected_article, tab_key)
 
 
+def render_crm_issue_open_helper(
+    df: pd.DataFrame | None,
+    tab_key: str,
+    box_key: str,
+    button_text: str = "Открыть",
+    open_editor: bool = False,
+) -> None:
+    if not isinstance(df, pd.DataFrame) or df.empty or "Артикул" not in df.columns:
+        return
+    articles = [normalize_text(x) for x in df["Артикул"].tolist() if normalize_text(x)]
+    articles = unique_preserve_order(articles)
+    if not articles:
+        return
+    c1, c2 = st.columns([4, 1.3])
+    selected_article = c1.selectbox(
+        "Открыть позицию в обычном поиске",
+        articles,
+        key=f"crm_issue_open_select_{box_key}_{tab_key}",
+        help="Открывает позицию в обычном поиске. Дальше можно сразу работать с шаблоном, Avito и карточкой.",
+    )
+    if c2.button(button_text, key=f"crm_issue_open_btn_{box_key}_{tab_key}", use_container_width=True):
+        if open_editor:
+            st.session_state[f"show_card_editor_{tab_key}"] = True
+        trigger_search_from_article(selected_article, tab_key)
+
+
+def render_crm_quality_issue_lazy_panels(
+    sheet_df: pd.DataFrame | None,
+    photo_df: pd.DataFrame | None,
+    avito_df: pd.DataFrame | None,
+    min_qty: float,
+    sheet_name: str,
+    tab_label: str,
+    tab_key: str,
+) -> None:
+    show_no_photo = bool(st.session_state.get(f"crm_show_no_photo_{sheet_name}", False))
+    show_no_avito = bool(st.session_state.get(f"crm_show_no_avito_{sheet_name}", False))
+    if not (show_no_photo or show_no_avito):
+        return
+    if not isinstance(sheet_df, pd.DataFrame) or sheet_df.empty:
+        return
+
+    registry_df = load_avito_registry_df()
+    bundle = build_operational_analytics_bundle(
+        sheet_df,
+        photo_df,
+        avito_df,
+        registry_df,
+        min_qty,
+        tab_label,
+        st.session_state.get("hot_items_df"),
+    )
+    meta_df = bundle.get("meta_df", pd.DataFrame()) if isinstance(bundle, dict) else pd.DataFrame()
+    if not isinstance(meta_df, pd.DataFrame) or meta_df.empty:
+        return
+
+    def _render_issue_panel(
+        issue_df: pd.DataFrame,
+        title: str,
+        subtitle: str,
+        icon: str,
+        box_key: str,
+        button_text: str,
+        open_editor: bool,
+    ) -> None:
+        st.markdown('<div class="result-wrap">', unsafe_allow_html=True)
+        render_block_header(
+            title,
+            subtitle,
+            icon=icon,
+            help_text="Это ленивый поверхностный инструмент CRM. Он ничего не меняет в ядре, а только помогает открыть нужные позиции в обычном поиске.",
+        )
+        if issue_df.empty:
+            st.info("По текущему листу строк не найдено.")
+        else:
+            view_cols = [
+                "Артикул", "Название", "Наш остаток", "Причины", "Объявлений Авито",
+                "Фото", "Шаблон", "Лучший поставщик", "Разница, %",
+            ]
+            view_cols = [c for c in view_cols if c in issue_df.columns]
+            view = issue_df[view_cols].copy()
+            st.dataframe(
+                view,
+                use_container_width=True,
+                hide_index=True,
+                height=min(520, 120 + len(view) * 35),
+            )
+            render_crm_issue_open_helper(issue_df, tab_key, box_key, button_text=button_text, open_editor=open_editor)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    if show_no_photo:
+        no_photo_df = meta_df[meta_df.get("Фото", pd.Series(dtype=object)).fillna("").eq("Нет")].copy()
+        if not no_photo_df.empty:
+            no_photo_df = no_photo_df.sort_values(["Наш остаток", "Название"], ascending=[False, True], na_position="last").reset_index(drop=True)
+        _render_issue_panel(
+            no_photo_df,
+            f"Нет фото — позиции для доработки ({len(no_photo_df)})",
+            "Показывает только позиции текущего листа без фото. Можно быстро открыть товар в обычном поиске и сразу поправить карточку.",
+            icon="🖼️",
+            box_key="crm_no_photo",
+            button_text="Открыть и редактировать",
+            open_editor=True,
+        )
+
+    if show_no_avito:
+        no_avito_mask = pd.to_numeric(meta_df.get("Объявлений Авито", 0), errors="coerce").fillna(0).eq(0)
+        no_avito_df = meta_df[no_avito_mask].copy()
+        if not no_avito_df.empty:
+            no_avito_df = no_avito_df.sort_values(["Наш остаток", "Название"], ascending=[False, True], na_position="last").reset_index(drop=True)
+        _render_issue_panel(
+            no_avito_df,
+            f"Без Avito — позиции для размещения ({len(no_avito_df)})",
+            "Показывает только позиции текущего листа без объявлений Avito. Можно быстро открыть позицию в обычном поиске и перейти к шаблону/размещению.",
+            icon="🛒",
+            box_key="crm_no_avito",
+            button_text="Открыть",
+            open_editor=False,
+        )
+
+
 def render_card_editor_panel(result_df: pd.DataFrame | None, sheet_name: str, tab_key: str) -> None:
     if not isinstance(result_df, pd.DataFrame) or result_df.empty:
         return
@@ -2617,9 +3523,21 @@ def render_card_editor_panel(result_df: pd.DataFrame | None, sheet_name: str, ta
     art_norm = normalize_text(row.get("article_norm", ""))
     current_photo = normalize_text(row.get("photo_url", ""))
     current_name = normalize_text(row.get("name", ""))
+    current_brand = normalize_text(row.get("meta_brand", ""))
     current_model = normalize_text(row.get("meta_model", ""))
     current_code = normalize_text(row.get("meta_manufacturer_code", ""))
+    current_print_type = normalize_text(row.get("meta_print_type", ""))
+    current_color = normalize_text(row.get("meta_color", ""))
+    current_capacity = normalize_text(row.get("meta_capacity", ""))
+    current_iso_pages = normalize_text(row.get("meta_iso_pages", ""))
+    current_item_type = normalize_text(row.get("meta_item_type", ""))
+    current_print_technology = normalize_text(row.get("meta_print_technology", ""))
+    current_description = normalize_text(row.get("meta_description", ""))
     current_fits = normalize_text(row.get("meta_fits_models", ""))
+    current_weight = normalize_text(row.get("meta_weight", ""))
+    current_length = normalize_text(row.get("meta_length", ""))
+    current_width = normalize_text(row.get("meta_width", ""))
+    current_height = normalize_text(row.get("meta_height", ""))
     current_note = normalize_text(row.get("manual_note", ""))
 
     st.caption("Правки сохраняются как ручные overrides и накладываются поверх comparison-файла после каждой новой загрузки.")
@@ -2631,11 +3549,30 @@ def render_card_editor_panel(result_df: pd.DataFrame | None, sheet_name: str, ta
                 st.link_button("Открыть текущее фото", current_photo, use_container_width=True)
         with col2:
             name_override = st.text_area("Название", value=current_name, height=90, key=f"card_edit_name_{tab_key}_{art_norm}")
-        cmeta1, cmeta2 = st.columns(2)
-        meta_model = cmeta1.text_input("Модель", value=current_model, key=f"card_edit_model_{tab_key}_{art_norm}")
-        meta_code = cmeta2.text_input("Код производителя", value=current_code, key=f"card_edit_code_{tab_key}_{art_norm}")
-        meta_fits = st.text_area("Подходит к моделям", value=current_fits, height=80, key=f"card_edit_fits_{tab_key}_{art_norm}")
-        note = st.text_area("Заметка", value=current_note, height=70, key=f"card_edit_note_{tab_key}_{art_norm}")
+        cmeta1, cmeta2, cmeta3 = st.columns(3)
+        meta_brand = cmeta1.text_input("Бренд", value=current_brand, key=f"card_edit_brand_{tab_key}_{art_norm}")
+        meta_model = cmeta2.text_input("Модель", value=current_model, key=f"card_edit_model_{tab_key}_{art_norm}")
+        meta_code = cmeta3.text_input("Код производителя", value=current_code, key=f"card_edit_code_{tab_key}_{art_norm}")
+
+        cmeta4, cmeta5, cmeta6 = st.columns(3)
+        meta_print_type = cmeta4.text_input("Тип печати", value=current_print_type, key=f"card_edit_print_type_{tab_key}_{art_norm}")
+        meta_color = cmeta5.text_input("Цвет", value=current_color, key=f"card_edit_color_{tab_key}_{art_norm}")
+        meta_capacity = cmeta6.text_input("Емкость", value=current_capacity, key=f"card_edit_capacity_{tab_key}_{art_norm}")
+
+        cmeta7, cmeta8, cmeta9 = st.columns(3)
+        meta_iso_pages = cmeta7.text_input("Ресурс, стр.", value=current_iso_pages, key=f"card_edit_iso_pages_{tab_key}_{art_norm}")
+        meta_item_type = cmeta8.text_input("Тип", value=current_item_type, key=f"card_edit_item_type_{tab_key}_{art_norm}")
+        meta_print_technology = cmeta9.text_input("Технология", value=current_print_technology, key=f"card_edit_print_technology_{tab_key}_{art_norm}")
+
+        cmeta10, cmeta11, cmeta12, cmeta13 = st.columns(4)
+        meta_weight = cmeta10.text_input("Вес", value=current_weight, key=f"card_edit_weight_{tab_key}_{art_norm}")
+        meta_length = cmeta11.text_input("Длина", value=current_length, key=f"card_edit_length_{tab_key}_{art_norm}")
+        meta_width = cmeta12.text_input("Ширина", value=current_width, key=f"card_edit_width_{tab_key}_{art_norm}")
+        meta_height = cmeta13.text_input("Высота", value=current_height, key=f"card_edit_height_{tab_key}_{art_norm}")
+
+        meta_fits = st.text_area("Подходит к моделям", value=current_fits, height=70, key=f"card_edit_fits_{tab_key}_{art_norm}")
+        meta_description = st.text_area("Описание", value=current_description, height=65, key=f"card_edit_description_{tab_key}_{art_norm}")
+        note = st.text_area("Заметка", value=current_note, height=65, key=f"card_edit_note_{tab_key}_{art_norm}")
 
         st.markdown("### 🔔 Напоминание / задача")
         st.caption("Можно создать задачу на пересмотр позиции через несколько дней. Задача сохранится отдельно и не пропадёт после загрузки нового файла.")
@@ -2676,9 +3613,21 @@ def render_card_editor_panel(result_df: pd.DataFrame | None, sheet_name: str, ta
             {
                 "photo_url": photo_url,
                 "name_override": name_override,
+                "meta_brand": meta_brand,
                 "meta_model": meta_model,
                 "meta_manufacturer_code": meta_code,
+                "meta_print_type": meta_print_type,
+                "meta_color": meta_color,
+                "meta_capacity": meta_capacity,
+                "meta_iso_pages": meta_iso_pages,
+                "meta_item_type": meta_item_type,
+                "meta_print_technology": meta_print_technology,
+                "meta_description": meta_description,
                 "meta_fits_models": meta_fits,
+                "meta_weight": meta_weight,
+                "meta_length": meta_length,
+                "meta_width": meta_width,
+                "meta_height": meta_height,
                 "note": note,
             },
         )
@@ -4591,17 +5540,21 @@ with st.sidebar:
     if uploaded is not None:
         try:
             comp_bytes = uploaded.getvalue()
-            save_uploaded_source_file(get_persisted_comparison_file_path(), comp_bytes, uploaded.name)
-            clear_loader_caches()
-            st.session_state.comparison_sheets = load_comparison_workbook(uploaded.name, comp_bytes)
-            st.session_state.comparison_name = uploaded.name + " • сохранён в /data"
-            st.session_state.comparison_version = datetime.utcnow().isoformat()
-            available = list(st.session_state.comparison_sheets.keys())
-            if available and st.session_state.selected_sheet not in available:
-                st.session_state.selected_sheet = available[0]
-            rebuild_current_df()
-            refresh_all_search_results()
-            log_operation(f"Обновлён comparison-файл: {uploaded.name}", "success")
+            comp_sig = hashlib.md5(comp_bytes).hexdigest()
+            if st.session_state.get("comparison_upload_applied_sig", "") != comp_sig:
+                maybe_create_service_snapshot_before_action("comparison_upload", comp_sig, f"before comparison upload: {uploaded.name}")
+                save_uploaded_source_file(get_persisted_comparison_file_path(), comp_bytes, uploaded.name)
+                clear_loader_caches()
+                st.session_state.comparison_sheets = load_comparison_workbook(uploaded.name, comp_bytes)
+                st.session_state.comparison_name = uploaded.name + " • сохранён в /data"
+                st.session_state.comparison_version = datetime.utcnow().isoformat()
+                available = list(st.session_state.comparison_sheets.keys())
+                if available and st.session_state.selected_sheet not in available:
+                    st.session_state.selected_sheet = available[0]
+                rebuild_current_df()
+                refresh_all_search_results()
+                st.session_state["comparison_upload_applied_sig"] = comp_sig
+                log_operation(f"Обновлён comparison-файл: {uploaded.name}", "success")
         except Exception as exc:
             log_operation(f"Ошибка comparison-файла: {exc}", "warning")
             st.error(f"Ошибка файла: {exc}")
@@ -4619,30 +5572,35 @@ with st.sidebar:
     if photo_uploaded is not None:
         try:
             photo_bytes = photo_uploaded.getvalue()
-            save_uploaded_source_file(get_persisted_photo_file_path(), photo_bytes, photo_uploaded.name)
-            clear_loader_caches()
             photo_sig = hashlib.md5(photo_bytes).hexdigest()
-            loaded_photo_df = load_photo_map_file(photo_uploaded.name, photo_bytes)
-            if st.session_state.get("photo_last_sync_sig", "") != photo_sig:
-                photo_stats = sync_photo_registry(loaded_photo_df, photo_uploaded.name)
-                st.session_state.photo_registry_stats = photo_stats
-                st.session_state.photo_registry_message = (
-                    f"Синхронизация фото: новых {photo_stats.get('new', 0)}, обновлённых {photo_stats.get('changed', 0)}, без изменений {photo_stats.get('unchanged', 0)}. Исходник сохранён в /data"
-                )
-                st.session_state.photo_last_sync_sig = photo_sig
-            reg_df = load_photo_registry_df()
-            if isinstance(reg_df, pd.DataFrame) and not reg_df.empty:
-                st.session_state.photo_df = reg_df[[
-                    "article", "article_norm", "photo_url", "source_sheet",
-                    "meta_color", "meta_iso_pages", "meta_manufacturer_code",
-                    "meta_model", "meta_fits_models",
-                ]].copy()
-            else:
-                st.session_state.photo_df = loaded_photo_df
-            st.session_state.photo_name = photo_uploaded.name + " • сохранён в /data"
-            rebuild_current_df()
-            refresh_all_search_results()
-            log_operation(f"Обновлён каталог фото: {photo_uploaded.name}", "success")
+            if st.session_state.get("photo_upload_applied_sig", "") != photo_sig:
+                maybe_create_service_snapshot_before_action("photo_upload", photo_sig, f"before photo upload: {photo_uploaded.name}")
+                save_uploaded_source_file(get_persisted_photo_file_path(), photo_bytes, photo_uploaded.name)
+                clear_loader_caches()
+                loaded_photo_df = load_photo_map_file(photo_uploaded.name, photo_bytes)
+                if st.session_state.get("photo_last_sync_sig", "") != photo_sig:
+                    photo_stats = sync_photo_registry(loaded_photo_df, photo_uploaded.name)
+                    st.session_state.photo_registry_stats = photo_stats
+                    st.session_state.photo_registry_message = (
+                        f"Синхронизация фото: новых {photo_stats.get('new', 0)}, обновлённых {photo_stats.get('changed', 0)}, без изменений {photo_stats.get('unchanged', 0)}. Исходник сохранён в /data"
+                    )
+                    st.session_state.photo_last_sync_sig = photo_sig
+                reg_df = load_photo_registry_df()
+                if isinstance(reg_df, pd.DataFrame) and not reg_df.empty:
+                    st.session_state.photo_df = reg_df[[
+                        "article", "article_norm", "photo_url", "source_sheet",
+                        "meta_brand", "meta_color", "meta_capacity", "meta_manufacturer_code",
+                        "meta_model", "meta_description", "meta_fits_models", "meta_iso_pages",
+                        "meta_print_technology", "meta_item_type", "meta_print_type",
+                        "meta_weight", "meta_length", "meta_width", "meta_height",
+                    ]].copy()
+                else:
+                    st.session_state.photo_df = loaded_photo_df
+                st.session_state.photo_name = photo_uploaded.name + " • сохранён в /data"
+                rebuild_current_df()
+                refresh_all_search_results()
+                st.session_state["photo_upload_applied_sig"] = photo_sig
+                log_operation(f"Обновлён каталог фото: {photo_uploaded.name}", "success")
         except Exception as exc:
             log_operation(f"Ошибка файла фото: {exc}", "warning")
             st.error(f"Ошибка файла фото: {exc}")
@@ -4664,19 +5622,22 @@ with st.sidebar:
     if avito_uploaded is not None:
         try:
             avito_bytes = avito_uploaded.getvalue()
-            save_uploaded_source_file(get_persisted_avito_file_path(), avito_bytes, avito_uploaded.name)
-            clear_loader_caches()
             avito_sig = hashlib.md5(avito_bytes).hexdigest()
-            st.session_state.avito_df = load_avito_file(avito_uploaded.name, avito_bytes)
-            st.session_state.avito_name = avito_uploaded.name + " • сохранён в /data"
-            if st.session_state.get("avito_last_sync_sig", "") != avito_sig:
-                sync_stats = sync_avito_registry(st.session_state.avito_df, avito_uploaded.name)
-                st.session_state.avito_registry_stats = sync_stats
-                st.session_state.avito_registry_message = (
-                    f"Синхронизация: новых {sync_stats.get('new', 0)}, изменённых {sync_stats.get('changed', 0)}, без изменений {sync_stats.get('unchanged', 0)}. Исходник сохранён в /data"
-                )
-                st.session_state.avito_last_sync_sig = avito_sig
-            log_operation(f"Обновлён файл Авито: {avito_uploaded.name}", "success")
+            if st.session_state.get("avito_upload_applied_sig", "") != avito_sig:
+                maybe_create_service_snapshot_before_action("avito_upload", avito_sig, f"before avito upload: {avito_uploaded.name}")
+                save_uploaded_source_file(get_persisted_avito_file_path(), avito_bytes, avito_uploaded.name)
+                clear_loader_caches()
+                st.session_state.avito_df = load_avito_file(avito_uploaded.name, avito_bytes)
+                st.session_state.avito_name = avito_uploaded.name + " • сохранён в /data"
+                if st.session_state.get("avito_last_sync_sig", "") != avito_sig:
+                    sync_stats = sync_avito_registry(st.session_state.avito_df, avito_uploaded.name)
+                    st.session_state.avito_registry_stats = sync_stats
+                    st.session_state.avito_registry_message = (
+                        f"Синхронизация: новых {sync_stats.get('new', 0)}, изменённых {sync_stats.get('changed', 0)}, без изменений {sync_stats.get('unchanged', 0)}. Исходник сохранён в /data"
+                    )
+                    st.session_state.avito_last_sync_sig = avito_sig
+                st.session_state["avito_upload_applied_sig"] = avito_sig
+                log_operation(f"Обновлён файл Авито: {avito_uploaded.name}", "success")
         except Exception as exc:
             log_operation(f"Ошибка файла Авито: {exc}", "warning")
             st.error(f"Ошибка файла Авито: {exc}")
@@ -4692,16 +5653,27 @@ with st.sidebar:
 
     st.markdown('<div class="sidebar-card">', unsafe_allow_html=True)
     render_sidebar_card_header("Ходовые позиции", "🔥", "Watchlist с продажами за период. Можно хранить на сервере и подсвечивать ходовые позиции прямо в результатах поиска.")
-    hot_uploaded = st.file_uploader("Загрузить watchlist", type=["xlsx", "xls", "csv"], key="hot_items_uploader", label_visibility="collapsed")
+    hot_uploaded = st.file_uploader(
+        "Загрузить watchlist",
+        type=["xlsx", "xls", "csv"],
+        key="hot_items_uploader",
+        label_visibility="collapsed",
+        help="Файл с продажами за период и полями watchlist. Именно он включает подсказки «ходовая / можно брать / невыгодно» в карточках и отчётах.",
+    )
+    st.caption("ⓘ Watchlist отвечает за спрос, дни запаса, приоритет и решение «можно брать / невыгодно» по ходовым позициям.")
     if hot_uploaded is not None:
         try:
             hot_bytes = hot_uploaded.getvalue()
-            save_uploaded_source_file(get_persisted_watchlist_file_path(), hot_bytes, hot_uploaded.name)
-            clear_loader_caches()
-            st.session_state.hot_items_df = load_hot_watchlist_file(hot_uploaded.name, hot_bytes)
-            st.session_state.hot_items_name = hot_uploaded.name + " • сохранён в /data"
-            st.session_state.hot_items_last_sync_sig = hashlib.md5(hot_bytes).hexdigest()
-            log_operation(f"Обновлён watchlist ходовых: {hot_uploaded.name}", "success")
+            hot_sig = hashlib.md5(hot_bytes).hexdigest()
+            if st.session_state.get("hot_upload_applied_sig", "") != hot_sig:
+                maybe_create_service_snapshot_before_action("watchlist_upload", hot_sig, f"before watchlist upload: {hot_uploaded.name}")
+                save_uploaded_source_file(get_persisted_watchlist_file_path(), hot_bytes, hot_uploaded.name)
+                clear_loader_caches()
+                st.session_state.hot_items_df = load_hot_watchlist_file(hot_uploaded.name, hot_bytes)
+                st.session_state.hot_items_name = hot_uploaded.name + " • сохранён в /data"
+                st.session_state.hot_items_last_sync_sig = hot_sig
+                st.session_state["hot_upload_applied_sig"] = hot_sig
+                log_operation(f"Обновлён watchlist ходовых: {hot_uploaded.name}", "success")
         except Exception as exc:
             log_operation(f"Ошибка файла ходовых: {exc}", "warning")
             st.error(f"Ошибка watchlist: {exc}")
@@ -4715,13 +5687,32 @@ with st.sidebar:
     hot_buy_total = 0
     if isinstance(hot_df_state, pd.DataFrame) and not hot_df_state.empty:
         hot_buy_total = int(hot_df_state.get("buy_signal_30pct", pd.Series(dtype=object)).fillna("").map(normalize_text).str.upper().eq("BUY").sum())
-    st.checkbox(f"Показать таблицу «можно брать» ({hot_buy_total})", key="show_hot_buy_watchlist_table", help="Лениво открывает таблицу только по ходовым позициям со статусом BUY. Пока чекбокс выключен, таблица не строится.")
+    st.checkbox(
+        f"Показать таблицу «можно брать» ({hot_buy_total})",
+        key="show_hot_buy_watchlist_table",
+        help="Лениво открывает таблицу только по ходовым позициям со статусом BUY. Пока чекбокс выключен, таблица не строится.",
+    )
+    st.caption("ⓘ Таблица «можно брать» показывает только те ходовые позиции, где поставщик проходит твой порог выгоды и есть остаток.")
     st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown('<div class="sidebar-card">', unsafe_allow_html=True)
     render_sidebar_card_header("Отчёт и цены", "📊", "Порог выгоды и минимальный остаток для пересчёта лучшей цены.")
-    st.number_input("Порог отчёта, %", min_value=0.0, max_value=95.0, step=1.0, key="distributor_threshold")
-    st.number_input("Мин. остаток у поставщика", min_value=1.0, max_value=999999.0, step=1.0, key="distributor_min_qty")
+    st.number_input(
+        "Порог отчёта, %",
+        min_value=0.0,
+        max_value=95.0,
+        step=1.0,
+        key="distributor_threshold",
+        help="Минимальный процент выгоды от нашей цены. Ниже этого порога поставщик не считается интересным для отчёта и части подсказок.",
+    )
+    st.number_input(
+        "Мин. остаток у поставщика",
+        min_value=1.0,
+        max_value=999999.0,
+        step=1.0,
+        key="distributor_min_qty",
+        help="Минимальный остаток у поставщика, ниже которого предложение считается слишком слабым и не участвует в сравнении.",
+    )
     st.markdown('<div class="sidebar-mini">Колонки Мин. у конкурентов / Разница из Excel не используются. Всё считаем заново прямо в приложении.</div>', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
@@ -4734,6 +5725,7 @@ with st.sidebar:
         original_name = read_persisted_original_name(persisted_path, persisted_path.name) if persisted_path.exists() else st.session_state.get("comparison_name", "comparison_latest.xlsx")
         if persisted_path.exists():
             try:
+                create_service_snapshot(reason="before price patch", source="auto")
                 before_snapshot = build_price_snapshot_for_updates(st.session_state.get("comparison_sheets"), st.session_state.price_patch_input)
                 updated_bytes, patch_message = patch_comparison_workbook_bytes(persisted_path.read_bytes(), st.session_state.price_patch_input)
                 if updated_bytes is not None:
@@ -5058,12 +6050,14 @@ def build_operational_analytics_bundle(
     avito_registry_df: pd.DataFrame | None,
     min_qty: float,
     sheet_name: str,
+    hot_items_df: pd.DataFrame | None = None,
 ) -> dict[str, Any]:
     enriched = apply_photo_map(sheet_df, photo_df)
     if enriched is None or enriched.empty:
         return {}
     merged_avito = combine_avito_sources(avito_df, avito_registry_df)
     _, avito_index = build_avito_code_index(merged_avito)
+    hot_lookup = build_hot_watchlist_lookup(hot_items_df, tab_label=sheet_name)
 
     rows_meta: list[dict[str, Any]] = []
     source_counter: Counter[str] = Counter()
@@ -5085,6 +6079,13 @@ def build_operational_analytics_bundle(
         delta_rub = own_price - safe_float((best_offer or {}).get("price"), 0.0) if better_market else 0.0
         delta_pct = ((delta_rub / own_price) * 100.0) if better_market and own_price > 0 else 0.0
         priority_score = round(max(delta_pct, 0.0) * max(own_qty, 0.0) * max(ad_count, 1), 2)
+
+        hot_rec = pick_hot_watch_rec(row, hot_lookup) if hot_lookup else None
+        sales_per_month = safe_float((hot_rec or {}).get("sales_per_month"), 0.0)
+        stock_months = round(own_qty / sales_per_month, 1) if sales_per_month > 0 else None
+        best_offer_price = safe_float((best_offer or {}).get("price"), 0.0) if best_offer else 0.0
+        recommended_price = round(best_offer_price * 0.95, 2) if better_market and best_offer_price > 0 else None
+
         photo_url = normalize_text(row.get("photo_url", ""))
         has_photo = bool(photo_url)
         has_model = bool(normalize_text(row.get("meta_model", "")))
@@ -5122,7 +6123,10 @@ def build_operational_analytics_bundle(
             "Бренд": brand_guess,
             "Наша цена": own_price,
             "Наш остаток": own_qty,
-            "Лучшая цена дистрибьютора": safe_float((best_offer or {}).get("price"), 0.0) if best_offer else None,
+            "Продажи, шт/мес": round(sales_per_month, 2) if sales_per_month > 0 else None,
+            "Наш запас, мес": stock_months,
+            "Лучшая цена дистрибьютора": best_offer_price if best_offer else None,
+            "Рекомендую, руб": recommended_price,
             "Лучший поставщик": normalize_text((best_offer or {}).get("source", "")) if best_offer else "",
             "Остаток дистрибьютора": safe_float((best_offer or {}).get("qty"), 0.0) if best_offer else None,
             "Разница, руб": delta_rub if better_market else None,
@@ -5277,7 +6281,15 @@ def analytics_bundle_to_excel_bytes(bundle: dict[str, Any]) -> bytes:
 
 def render_operational_analytics_block(sheet_df: pd.DataFrame, photo_df: pd.DataFrame | None, avito_df: pd.DataFrame | None, min_qty: float, sheet_name: str, tab_key: str) -> None:
     registry_df = load_avito_registry_df()
-    bundle = build_operational_analytics_bundle(sheet_df, photo_df, avito_df, registry_df, min_qty, sheet_name)
+    bundle = build_operational_analytics_bundle(
+        sheet_df,
+        photo_df,
+        avito_df,
+        registry_df,
+        min_qty,
+        sheet_name,
+        st.session_state.get("hot_items_df"),
+    )
     if not bundle:
         st.info("Для аналитики нет данных.")
         return
@@ -5296,6 +6308,7 @@ def render_operational_analytics_block(sheet_df: pd.DataFrame, photo_df: pd.Data
     m2.metric("Нет в Avito", int(quality.get("in_price_not_in_avito", 0)))
     m3.metric("Дороже рынка", int(len(top_df) if isinstance(top_df, pd.DataFrame) else 0))
     m4.metric("История ручных правок", int(len(patch_history_df) if isinstance(patch_history_df, pd.DataFrame) else 0))
+    st.caption("ⓘ Метрики сверху: Без фото — карточки без изображения; Нет в Avito — позиции без объявления; Дороже рынка — где мы выше лучшего поставщика; История ручных правок — сколько записей накоплено по изменениям цены.")
 
     render_info_banner(
         "Что делать сегодня",
@@ -5311,11 +6324,24 @@ def render_operational_analytics_block(sheet_df: pd.DataFrame, photo_df: pd.Data
     with st.expander("1. Приоритет на пересмотр цены ❔", expanded=False):
         st.caption(
             "Что показывает: где мы дороже рынка и что стоит пересмотреть в первую очередь. "
-            "Как считается приоритет: Разница, % × Наш остаток × Количество связанных объявлений Avito (минимум 1). "
-            "Как пользоваться: чем выше приоритет, тем полезнее сначала проверить именно эту позицию."
+            "Добавлено для решения по цене: продажи в месяц, запас в месяцах и колонка 'Рекомендую, руб' = лучшая цена дистрибьютора минус 5%. "
+            "Как пользоваться: смотри сначала товары с хорошими продажами, небольшим запасом и понятной рекомендованной ценой."
         )
         if isinstance(top_df, pd.DataFrame) and not top_df.empty:
-            view = top_df[["Артикул", "Название", "Наша цена", "Лучшая цена дистрибьютора", "Лучший поставщик", "Разница, руб", "Разница, %", "Наш остаток", "Остаток дистрибьютора", "Приоритет"]].head(100)
+            view = top_df[[
+                "Артикул",
+                "Название",
+                "Продажи, шт/мес",
+                "Наш запас, мес",
+                "Наша цена",
+                "Лучшая цена дистрибьютора",
+                "Рекомендую, руб",
+                "Лучший поставщик",
+                "Разница, руб",
+                "Разница, %",
+                "Наш остаток",
+                "Остаток дистрибьютора",
+            ]].head(100)
             st.dataframe(view, use_container_width=True, hide_index=True)
             render_analytics_jump_helper(view, tab_key, "top")
         else:
@@ -5449,7 +6475,13 @@ def build_crm_header_stats(
         if isinstance(sheet_df, pd.DataFrame) and not sheet_df.empty:
             registry_df = load_avito_registry_df()
             bundle = build_operational_analytics_bundle(
-                sheet_df, photo_df, avito_df, registry_df, float(min_qty), str(tab_label)
+                sheet_df,
+                photo_df,
+                avito_df,
+                registry_df,
+                float(min_qty),
+                str(tab_label),
+                st.session_state.get("hot_items_df"),
             )
             quality = bundle.get("quality", {}) if isinstance(bundle, dict) else {}
             stats["without_photo"] = int(quality.get("without_photo", 0) or 0)
@@ -5477,6 +6509,7 @@ def render_crm_header_bar(
         help_text="Эта шапка ничего не меняет в comparison. Она только помогает быстро открыть нужный рабочий блок без долгой прокрутки.",
     )
     c1, c2, c3, c4, c5 = st.columns(5)
+    st.caption("ⓘ CRM-шапка — это быстрые переключатели по текущему листу: открыть задачи, выгодные закупки и сразу увидеть, где не хватает фото или Avito.")
     with c1:
         open_tasks = bool(st.checkbox(
             f"🔔 Задачи ({stats['tasks_open']})",
@@ -5498,11 +6531,25 @@ def render_crm_header_bar(
             st.session_state["crm_last_active_sheet_for_buy"] = str(sheet_name)
         st.caption("Показывает только выгодные позиции")
     with c3:
-        st.metric("🖼️ Нет фото", stats["without_photo"])
-        st.caption("Сколько позиций на листе без фото")
+        open_no_photo = bool(st.checkbox(
+            f"🖼️ Нет фото ({stats['without_photo']})",
+            value=bool(st.session_state.get(f"crm_show_no_photo_{sheet_name}", False)),
+            key=f"crm_show_no_photo_{sheet_name}",
+            help="Открывает таблицу только по позициям текущего листа без фото. Отсюда можно сразу открыть и поправить карточку.",
+        ))
+        if open_no_photo:
+            st.session_state["crm_last_active_sheet_for_no_photo"] = str(sheet_name)
+        st.caption("Показывает только позиции без фото")
     with c4:
-        st.metric("🛒 Без Avito", stats["without_avito"])
-        st.caption("Сколько позиций на листе без объявления")
+        open_no_avito = bool(st.checkbox(
+            f"🛒 Без Avito ({stats['without_avito']})",
+            value=bool(st.session_state.get(f"crm_show_no_avito_{sheet_name}", False)),
+            key=f"crm_show_no_avito_{sheet_name}",
+            help="Открывает таблицу только по позициям текущего листа без объявлений Avito. Отсюда можно перейти в обычный поиск и быстро разместить.",
+        ))
+        if open_no_avito:
+            st.session_state["crm_last_active_sheet_for_no_avito"] = str(sheet_name)
+        st.caption("Показывает только позиции без Avito")
     with c5:
         st.metric("Лист", tab_label)
         st.caption("CRM-метрики именно по текущему листу")
@@ -5558,9 +6605,19 @@ def render_crm_card_center(
     name = normalize_text(row.get("name", ""))
     photo_url = normalize_text(row.get("photo_url", ""))
     note = normalize_text(row.get("manual_note", ""))
+    brand = normalize_text(row.get("meta_brand", ""))
     model = normalize_text(row.get("meta_model", ""))
     mcode = normalize_text(row.get("meta_manufacturer_code", ""))
+    print_type = normalize_text(row.get("meta_print_type", ""))
+    color = normalize_text(row.get("meta_color", ""))
+    capacity = normalize_text(row.get("meta_capacity", ""))
+    iso_pages = normalize_pages_value(row.get("meta_iso_pages", ""))
+    item_type = normalize_text(row.get("meta_item_type", ""))
+    print_technology = normalize_text(row.get("meta_print_technology", ""))
+    description = normalize_text(row.get("meta_description", ""))
     fits = normalize_text(row.get("meta_fits_models", ""))
+    weight = format_meta_weight(row.get("meta_weight", ""))
+    dimensions = format_meta_dimensions(row.get("meta_length", ""), row.get("meta_width", ""), row.get("meta_height", ""))
     own_price = safe_float(row.get("sale_price"), 0.0)
     own_stock = parse_qty_generic(row.get("free_qty"))
     best = get_best_offer(row, min_qty=float(st.session_state.get("distributor_min_qty", 1.0)))
@@ -5579,6 +6636,7 @@ def render_crm_card_center(
         matched_ads = find_avito_ads(avito_df, one_row)
 
     t_overview, t_prices, t_avito, t_notes = st.tabs(["Обзор", "Цены", "Avito", "Заметки / задачи"])
+    st.caption("ⓘ Обзор — краткая карточка товара. Цены — наша цена и лучший рынок. Avito — объявления по позиции. Заметки / задачи — ручные комментарии и напоминания.")
 
     with t_overview:
         c1, c2 = st.columns([1, 2])
@@ -5596,13 +6654,55 @@ def render_crm_card_center(
             m3.metric("Лучший поставщик", best_source or "—")
             if note:
                 st.info(f"Заметка: {note}")
-            if model or mcode or fits:
-                if model:
-                    st.write(f"**Модель:** {model}")
-                if mcode:
-                    st.write(f"**Код производителя:** {mcode}")
-                if fits:
-                    st.write(f"**Подходит к моделям:** {fits}")
+
+            quick_left = [
+                ("Бренд", brand),
+                ("Модель", model),
+                ("Код производителя", mcode),
+                ("Тип печати", print_type),
+                ("Цвет", color),
+                ("Емкость", capacity),
+            ]
+            quick_right = [
+                ("Ресурс, стр.", iso_pages),
+                ("Тип", item_type),
+                ("Технология", print_technology),
+                ("Вес", weight),
+                ("Габариты", dimensions),
+            ]
+
+            compact_pairs = [
+                ("Бренд", brand),
+                ("Модель", model),
+                ("Код", mcode),
+                ("Цвет", color),
+                ("Ресурс", iso_pages),
+                ("Тип", item_type),
+            ]
+            compact_html = []
+            for label, value in compact_pairs:
+                if value:
+                    compact_html.append(
+                        f"<span style='display:inline-block;margin:0 8px 8px 0;padding:4px 10px;border:1px solid rgba(120,130,160,.25);border-radius:999px;background:rgba(120,130,160,.08);font-size:.92rem;'><b>{html.escape(label)}:</b> {html.escape(str(value))}</span>"
+                    )
+            if compact_html:
+                st.markdown("".join(compact_html), unsafe_allow_html=True)
+
+            if any(v for _, v in quick_left + quick_right) or fits or description:
+                with st.expander("Характеристики", expanded=False):
+                    i1, i2 = st.columns(2)
+                    with i1:
+                        for label, value in quick_left:
+                            if value:
+                                st.markdown(f"**{label}:** {value}")
+                    with i2:
+                        for label, value in quick_right:
+                            if value:
+                                st.markdown(f"**{label}:** {value}")
+                    if fits:
+                        st.markdown(f"**Подходит к моделям:** {fits}")
+                    if description:
+                        st.caption(f"Описание: {description}")
 
     with t_prices:
         st.caption("Здесь видно нашу цену и лучший рынок по текущей позиции. Это быстрый обзор, а полный блок 'Показать цены у всех' остаётся ниже.")
@@ -5641,9 +6741,21 @@ def render_crm_card_center(
         st.caption("Здесь можно быстро поправить карточку и сразу создать задачу на пересмотр без переходов вниз по странице.")
         current_photo = photo_url
         current_name = name
+        current_brand = brand
         current_model = model
         current_code = mcode
+        current_print_type = print_type
+        current_color = color
+        current_capacity = capacity
+        current_iso_pages = iso_pages
+        current_item_type = item_type
+        current_print_technology = print_technology
+        current_description = description
         current_fits = fits
+        current_weight = normalize_text(row.get("meta_weight", ""))
+        current_length = normalize_text(row.get("meta_length", ""))
+        current_width = normalize_text(row.get("meta_width", ""))
+        current_height = normalize_text(row.get("meta_height", ""))
         current_note = note
 
         with st.form(f"crm_card_form_{tab_key}_{art_norm}", clear_on_submit=False):
@@ -5652,11 +6764,30 @@ def render_crm_card_center(
                 photo_url_new = st.text_input("Фото (ссылка)", value=current_photo, key=f"crm_card_photo_{tab_key}_{art_norm}")
             with cc2:
                 name_new = st.text_area("Название", value=current_name, height=90, key=f"crm_card_name_{tab_key}_{art_norm}")
-            mm1, mm2 = st.columns(2)
-            model_new = mm1.text_input("Модель", value=current_model, key=f"crm_card_model_{tab_key}_{art_norm}")
-            code_new = mm2.text_input("Код производителя", value=current_code, key=f"crm_card_code_{tab_key}_{art_norm}")
-            fits_new = st.text_area("Подходит к моделям", value=current_fits, height=80, key=f"crm_card_fits_{tab_key}_{art_norm}")
-            note_new = st.text_area("Заметка", value=current_note, height=70, key=f"crm_card_note_{tab_key}_{art_norm}")
+            mm1, mm2, mm3 = st.columns(3)
+            brand_new = mm1.text_input("Бренд", value=current_brand, key=f"crm_card_brand_{tab_key}_{art_norm}")
+            model_new = mm2.text_input("Модель", value=current_model, key=f"crm_card_model_{tab_key}_{art_norm}")
+            code_new = mm3.text_input("Код производителя", value=current_code, key=f"crm_card_code_{tab_key}_{art_norm}")
+
+            mm4, mm5, mm6 = st.columns(3)
+            print_type_new = mm4.text_input("Тип печати", value=current_print_type, key=f"crm_card_print_type_{tab_key}_{art_norm}")
+            color_new = mm5.text_input("Цвет", value=current_color, key=f"crm_card_color_{tab_key}_{art_norm}")
+            capacity_new = mm6.text_input("Емкость", value=current_capacity, key=f"crm_card_capacity_{tab_key}_{art_norm}")
+
+            mm7, mm8, mm9 = st.columns(3)
+            iso_pages_new = mm7.text_input("Ресурс, стр.", value=current_iso_pages, key=f"crm_card_iso_pages_{tab_key}_{art_norm}")
+            item_type_new = mm8.text_input("Тип", value=current_item_type, key=f"crm_card_item_type_{tab_key}_{art_norm}")
+            print_technology_new = mm9.text_input("Технология", value=current_print_technology, key=f"crm_card_print_technology_{tab_key}_{art_norm}")
+
+            mm10, mm11, mm12, mm13 = st.columns(4)
+            weight_new = mm10.text_input("Вес", value=current_weight, key=f"crm_card_weight_{tab_key}_{art_norm}")
+            length_new = mm11.text_input("Длина", value=current_length, key=f"crm_card_length_{tab_key}_{art_norm}")
+            width_new = mm12.text_input("Ширина", value=current_width, key=f"crm_card_width_{tab_key}_{art_norm}")
+            height_new = mm13.text_input("Высота", value=current_height, key=f"crm_card_height_{tab_key}_{art_norm}")
+
+            fits_new = st.text_area("Подходит к моделям", value=current_fits, height=75, key=f"crm_card_fits_{tab_key}_{art_norm}")
+            description_new = st.text_area("Описание", value=current_description, height=70, key=f"crm_card_description_{tab_key}_{art_norm}")
+            note_new = st.text_area("Заметка", value=current_note, height=65, key=f"crm_card_note_{tab_key}_{art_norm}")
 
             st.markdown("#### 🔔 Создать задачу по карточке")
             st.caption("Заметка — это просто комментарий. Задача — отдельное напоминание со сроком, статусом и причиной.")
@@ -5696,9 +6827,21 @@ def render_crm_card_center(
                 {
                     "photo_url": photo_url_new,
                     "name_override": name_new,
+                    "meta_brand": brand_new,
                     "meta_model": model_new,
                     "meta_manufacturer_code": code_new,
+                    "meta_print_type": print_type_new,
+                    "meta_color": color_new,
+                    "meta_capacity": capacity_new,
+                    "meta_iso_pages": iso_pages_new,
+                    "meta_item_type": item_type_new,
+                    "meta_print_technology": print_technology_new,
+                    "meta_description": description_new,
                     "meta_fits_models": fits_new,
+                    "meta_weight": weight_new,
+                    "meta_length": length_new,
+                    "meta_width": width_new,
+                    "meta_height": height_new,
                     "note": note_new,
                 },
             )
@@ -5782,6 +6925,7 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
             f"<div style='padding-top:9px;color:#64748b;font-size:12px;'>Тип поиска сейчас: <b>{html.escape(search_mode)}</b>. Для коротких OEM-кодов вроде TK-8600Y используй режим «Умный».</div>",
             unsafe_allow_html=True,
         )
+    st.caption("ⓘ Ниже — ленивые рабочие блоки. Каждый чекбокс включает только свой слой: шаблоны, цены, Avito, отчёт по листу или аналитику.")
     st.markdown('</div>', unsafe_allow_html=True)
 
     result_df = st.session_state.get(result_key)
@@ -5978,12 +7122,37 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
             render_card_editor_panel(display_result_df, sheet_name, tab_key)
 
             lazy_c0, lazy_c1, lazy_c2, lazy_c3, lazy_c4, lazy_c5 = st.columns(6)
-            lazy_c0.checkbox("Показать шаблоны", key=f"lazy_templates_{tab_key}")
-            lazy_c1.checkbox("Показать цены у всех", key=f"lazy_all_prices_{tab_key}")
-            lazy_c2.checkbox("Файл для руководителя", key=f"lazy_analysis_{tab_key}")
-            lazy_c3.checkbox("Показать Авито", key=f"lazy_avito_{tab_key}")
-            lazy_c4.checkbox("Считать отчёт по листу", key=f"lazy_report_{tab_key}")
-            lazy_c5.checkbox("Аналитика / задачи", key=f"lazy_analytics_{tab_key}")
+            lazy_c0.checkbox(
+                "Показать шаблоны",
+                key=f"lazy_templates_{tab_key}",
+                help="Готовые текстовые шаблоны по найденным позициям: для ответа клиенту, публикации или быстрой отправки.",
+            )
+            lazy_c1.checkbox(
+                "Показать цены у всех",
+                key=f"lazy_all_prices_{tab_key}",
+                help="Полное сравнение по каждому найденному товару: наша цена и все поставщики с остатками и разницей.",
+            )
+            lazy_c2.checkbox(
+                "Файл для руководителя",
+                key=f"lazy_analysis_{tab_key}",
+                help="Собирает Excel для согласования: артикулы, текущая цена, лучшая цена поставщика и поля для решения по пересмотру.",
+            )
+            lazy_c3.checkbox(
+                "Показать Авито",
+                key=f"lazy_avito_{tab_key}",
+                help="Проверяет, есть ли объявления Авито по найденным артикулам в загруженном файле.",
+            )
+            lazy_c4.checkbox(
+                "Считать отчёт по листу",
+                key=f"lazy_report_{tab_key}",
+                help="Строит управленческий отчёт по всему текущему листу, а не только по найденным строкам.",
+            )
+            lazy_c5.checkbox(
+                "Аналитика / задачи",
+                key=f"lazy_analytics_{tab_key}",
+                help="Открывает операционную аналитику: что пересмотреть, где нет фото/Avito, какие серии и правки требуют внимания.",
+            )
+            st.caption("ⓘ Что за что отвечает: шаблоны — тексты, цены у всех — полная рыночная картина, файл для руководителя — выгрузка на согласование, Авито — наличие объявлений, отчёт по листу — управленческий отчёт, аналитика / задачи — проблемные зоны и действия.")
 
             if st.session_state.get(f"lazy_templates_{tab_key}", False):
                 result_enriched_for_templates = apply_photo_map(result_df, photo_df) if isinstance(result_df, pd.DataFrame) else result_df
@@ -6080,6 +7249,7 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
             icon="📊",
             help_text="Отчёт строится по всему текущему листу, а не только по поисковой выдаче. Порог и минимальный остаток меняются в sidebar.",
         )
+        st.caption("ⓘ Отчёт по листу = управленческий отчёт по всему текущему листу. Если есть watchlist, сюда добавляются спрос, дни запаса, приоритет и действие.")
         report_hot_lookup = build_hot_watchlist_lookup(st.session_state.get("hot_items_df"), tab_label)
         report_df = build_report_df(
             base_sheet_df,
@@ -6194,8 +7364,13 @@ else:
         key="show_task_center_global",
         help="Открывает ленивый список задач и напоминаний по карточкам. Пока чекбокс выключен, список не строится.",
     )
-    switch_r.checkbox("Показать фото", key="show_photos_global")
+    switch_r.checkbox(
+        "Показать фото",
+        key="show_photos_global",
+        help="Включает изображения в карточках поиска. Если отключить, интерфейс становится легче и работает быстрее.",
+    )
 
+    st.caption("ⓘ Верхние переключатели отвечают за быстрый доступ: раздел, задачи и фото. Основные тяжёлые блоки ниже открываются только по чекбоксам.")
     active_sheet_name, active_tab_label, active_tab_key = label_to_spec[st.session_state.get("active_workspace_label", "Оригинал")]
     active_sheet_df = sheets.get(active_sheet_name) if isinstance(sheets, dict) else None
     render_crm_header_bar(
@@ -6208,184 +7383,13 @@ else:
     )
     render_task_center_lazy_panel()
     render_hot_buy_watchlist_lazy_panel()
+    render_crm_quality_issue_lazy_panels(
+        active_sheet_df,
+        st.session_state.get("photo_df"),
+        st.session_state.get("avito_df"),
+        st.session_state.get("distributor_min_qty", 1.0),
+        active_sheet_name,
+        active_tab_label,
+        active_tab_key,
+    )
     render_sheet_workspace(active_sheet_name, active_tab_label, active_tab_key)
-
-def normalize_watchlist_sheet_name(value: Any) -> str:
-    txt = contains_text(value)
-    if "ОРИГИН" in txt or "СРАВН" in txt:
-        return "Оригинал"
-    if "УЦЕН" in txt:
-        return "Уценка"
-    if "СОВМЕСТ" in txt:
-        return "Совместимые"
-    return normalize_text(value)
-
-
-@st.cache_data(show_spinner=False, ttl=3600, max_entries=4)
-def load_hot_watchlist_file(file_name: str, file_bytes: bytes) -> pd.DataFrame:
-    suffix = Path(file_name).suffix.lower()
-    if suffix == ".csv":
-        bio = io.BytesIO(file_bytes)
-        try:
-            raw = pd.read_csv(bio)
-        except UnicodeDecodeError:
-            bio.seek(0)
-            raw = pd.read_csv(bio, encoding="cp1251")
-    else:
-        raw = pd.read_excel(io.BytesIO(file_bytes))
-    raw = raw.dropna(how="all").copy()
-    if raw.empty:
-        return pd.DataFrame(columns=[
-            "watch_article", "watch_key", "watch_name", "current_sheet", "comparison_article",
-            "sales_qty_15m", "sales_per_month", "abc_class", "velocity_band",
-            "best_supplier", "best_supplier_gap_pct", "buy_signal_30pct", "days_of_cover",
-            "priority_score", "action_today", "watch_article_norm", "watch_key_norm",
-            "comparison_article_norm", "match_keys_text",
-        ])
-    raw.columns = [normalize_text(c) for c in raw.columns]
-    rows = []
-    for _, r in raw.iterrows():
-        watch_article = normalize_text(r.get("watch_article", ""))
-        watch_key = normalize_text(r.get("watch_key", ""))
-        watch_name = normalize_text(r.get("watch_name", ""))
-        comparison_article = normalize_text(r.get("comparison_article", ""))
-        keys = unique_preserve_order([
-            normalize_article(watch_article),
-            normalize_article(watch_key),
-            normalize_article(comparison_article),
-        ])
-        if not any(keys):
-            continue
-        rows.append({
-            "watch_article": watch_article,
-            "watch_key": watch_key,
-            "watch_name": watch_name,
-            "current_sheet": normalize_watchlist_sheet_name(r.get("current_sheet", "")),
-            "comparison_article": comparison_article,
-            "sales_qty_15m": safe_float(r.get("sales_qty_15m"), 0.0),
-            "sales_per_month": safe_float(r.get("sales_per_month"), 0.0),
-            "abc_class": normalize_text(r.get("abc_class", "")),
-            "velocity_band": normalize_text(r.get("velocity_band", "")),
-            "best_supplier": normalize_text(r.get("best_supplier", "")),
-            "best_supplier_gap_pct": safe_float(r.get("best_supplier_gap_pct"), 0.0),
-            "buy_signal_30pct": normalize_text(r.get("buy_signal_30pct", "")),
-            "days_of_cover": safe_float(r.get("days_of_cover"), 0.0),
-            "priority_score": safe_float(r.get("priority_score"), 0.0),
-            "action_today": normalize_text(r.get("action_today", "")),
-            "watch_article_norm": normalize_article(watch_article),
-            "watch_key_norm": normalize_article(watch_key),
-            "comparison_article_norm": normalize_article(comparison_article),
-            "match_keys_text": "|".join([k for k in keys if k]),
-        })
-    out = pd.DataFrame(rows)
-    return out.reset_index(drop=True)
-
-
-def build_hot_watchlist_lookup(hot_df: pd.DataFrame | None, tab_label: str = "") -> dict[str, list[dict[str, Any]]]:
-    if not isinstance(hot_df, pd.DataFrame) or hot_df.empty:
-        return {}
-    work = hot_df.copy()
-    tab_label = normalize_text(tab_label)
-    if tab_label:
-        filtered = work[(work["current_sheet"] == "") | (work["current_sheet"] == tab_label)].copy()
-        if not filtered.empty:
-            work = filtered
-    lookup: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for _, row in work.iterrows():
-        rec = row.to_dict()
-        keys = [normalize_article(x) for x in normalize_text(rec.get("match_keys_text", "")).split("|") if normalize_article(x)]
-        if not keys:
-            continue
-        for key in keys:
-            lookup[key].append(rec)
-    return lookup
-
-
-def pick_hot_watch_rec(row: pd.Series, lookup: dict[str, list[dict[str, Any]]]) -> dict[str, Any] | None:
-    if not lookup:
-        return None
-    candidate_keys = []
-    article_norm = normalize_article(row.get("article_norm", row.get("article", "")))
-    if article_norm:
-        candidate_keys.append(article_norm)
-    row_codes = row.get("row_codes")
-    if isinstance(row_codes, list):
-        candidate_keys.extend([normalize_article(x) for x in row_codes if normalize_article(x)])
-    best = None
-    best_score = -10**18
-    seen = set()
-    for key in candidate_keys:
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        for rec in lookup.get(key, []):
-            score = safe_float(rec.get("priority_score"), 0.0)
-            if normalize_text(rec.get("buy_signal_30pct", "")).upper() == "BUY":
-                score += 100000.0
-            if key == normalize_article(rec.get("comparison_article_norm", "")):
-                score += 1000.0
-            elif key == normalize_article(rec.get("watch_article_norm", "")):
-                score += 500.0
-            if score > best_score:
-                best = rec
-                best_score = score
-    return best
-
-
-def apply_hot_watchlist(df: pd.DataFrame | None, hot_df: pd.DataFrame | None, tab_label: str = "") -> pd.DataFrame | None:
-    if not isinstance(df, pd.DataFrame) or df.empty:
-        return df
-    if not isinstance(hot_df, pd.DataFrame) or hot_df.empty:
-        return df
-    lookup = build_hot_watchlist_lookup(hot_df, tab_label=tab_label)
-    if not lookup:
-        return df
-    work = df.copy()
-    matches = [pick_hot_watch_rec(row, lookup) for _, row in work.iterrows()]
-    work["hot_flag"] = [bool(m) for m in matches]
-    work["hot_sales_per_month"] = [safe_float((m or {}).get("sales_per_month"), 0.0) for m in matches]
-    work["hot_priority_score"] = [safe_float((m or {}).get("priority_score"), 0.0) for m in matches]
-    work["hot_abc_class"] = [normalize_text((m or {}).get("abc_class", "")) for m in matches]
-    work["hot_velocity_band"] = [normalize_text((m or {}).get("velocity_band", "")) for m in matches]
-    work["hot_action_today"] = [normalize_text((m or {}).get("action_today", "")) for m in matches]
-    work["hot_buy_signal"] = [normalize_text((m or {}).get("buy_signal_30pct", "")) for m in matches]
-    work["hot_best_supplier"] = [normalize_text((m or {}).get("best_supplier", "")) for m in matches]
-    work["hot_best_supplier_gap_pct"] = [safe_float((m or {}).get("best_supplier_gap_pct"), 0.0) for m in matches]
-    work["hot_watch_article"] = [normalize_text((m or {}).get("watch_article", "")) for m in matches]
-    return work
-
-
-
-
-def dataframe_to_excel_bytes(df: pd.DataFrame) -> bytes:
-    out = io.BytesIO()
-    with pd.ExcelWriter(out, engine="openpyxl") as writer:
-        (df if isinstance(df, pd.DataFrame) else pd.DataFrame()).to_excel(writer, index=False, sheet_name="Watchlist")
-    return out.getvalue()
-
-def hot_watchlist_summary_text() -> str:
-    hot_df = st.session_state.get("hot_items_df")
-    if not isinstance(hot_df, pd.DataFrame) or hot_df.empty:
-        return "watchlist не загружен"
-    buy_count = int((hot_df.get("buy_signal_30pct", pd.Series(dtype=object)).fillna("").map(normalize_text).str.upper() == "BUY").sum())
-    ab_count = int(hot_df.get("abc_class", pd.Series(dtype=object)).fillna("").map(normalize_text).isin(["A", "B"]).sum())
-    return f"Ходовых: {len(hot_df)} • сильный спрос: {ab_count} • можно брать: {buy_count}"
-
-
-def hot_supplier_note(row: pd.Series | dict | None, best: dict | None, threshold_pct: float = 35.0) -> tuple[str, str]:
-    help_text = "Товар ходовой → товар хорошо продавался за выбранный период"
-    if not best:
-        help_text += f"\nСейчас брать невыгодно → нет поставщика с ценой минимум на {threshold_pct:.0f}% ниже нашей цены"
-        return "Сейчас брать невыгодно", help_text
-
-    source = normalize_text((best or {}).get("source", ""))
-    delta_pct = safe_float((best or {}).get("delta_percent"), 0.0)
-    if delta_pct >= float(threshold_pct):
-        action_text = f"Сейчас можно брать у {source}" if source else "Сейчас можно брать"
-        help_text += f"\nСейчас можно брать → лучший поставщик сейчас минимум на {threshold_pct:.0f}% дешевле нашей цены"
-        return action_text, help_text
-
-    help_text += f"\nСейчас брать невыгодно → нет поставщика с ценой минимум на {threshold_pct:.0f}% ниже нашей цены"
-    return "Сейчас брать невыгодно", help_text
-
-
