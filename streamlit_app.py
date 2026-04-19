@@ -170,8 +170,7 @@ def get_service_safe_boot_flag_path() -> Path:
 
 
 def is_service_safe_boot_enabled() -> bool:
-    # TEST: safe boot полностью отключён, чтобы исключить влияние сервисного режима.
-    return False
+    return get_service_safe_boot_flag_path().exists()
 
 
 def enable_service_safe_boot() -> None:
@@ -243,8 +242,12 @@ def get_service_live_file_entries() -> list[dict[str, Any]]:
 
 
 def maybe_create_service_snapshot_before_action(action_key: str, content_sig: str, reason: str) -> str:
-    # TEST: сервисные snapshot перед действиями временно отключены.
-    return ""
+    state_key = f"service_snapshot_sig__{action_key}"
+    if st.session_state.get(state_key) == content_sig:
+        return ""
+    snap_dir = create_service_snapshot(reason=reason, source="auto")
+    st.session_state[state_key] = content_sig
+    return snap_dir.name if isinstance(snap_dir, Path) else ""
 
 
 def create_service_snapshot(reason: str = "", source: str = "manual") -> Path:
@@ -2555,6 +2558,7 @@ def load_photo_registry_df() -> pd.DataFrame:
         df = pd.read_sql_query("SELECT * FROM photo_registry", conn)
     if df.empty:
         return df
+
     expected_cols = [
         "article", "article_norm", "photo_url", "source_sheet",
         "meta_brand", "meta_color", "meta_capacity", "meta_manufacturer_code",
@@ -2567,6 +2571,7 @@ def load_photo_registry_df() -> pd.DataFrame:
         if col not in df.columns:
             df[col] = ""
         df[col] = df[col].fillna("").map(normalize_text)
+
     # Откатили веб-парсер: старые web-fallback записи не подмешиваем в рабочий реестр.
     if "import_name" in df.columns:
         df = df[df["import_name"].fillna("") != "web-fallback"].copy()
@@ -3375,126 +3380,6 @@ def render_analytics_jump_helper(df: pd.DataFrame | None, tab_key: str, box_key:
     )
     if c2.button("Открыть", key=f"analytics_open_btn_{box_key}_{tab_key}", use_container_width=True):
         trigger_search_from_article(selected_article, tab_key)
-
-
-def render_crm_issue_open_helper(
-    df: pd.DataFrame | None,
-    tab_key: str,
-    box_key: str,
-    button_text: str = "Открыть",
-    open_editor: bool = False,
-) -> None:
-    if not isinstance(df, pd.DataFrame) or df.empty or "Артикул" not in df.columns:
-        return
-    articles = [normalize_text(x) for x in df["Артикул"].tolist() if normalize_text(x)]
-    articles = unique_preserve_order(articles)
-    if not articles:
-        return
-    c1, c2 = st.columns([4, 1.3])
-    selected_article = c1.selectbox(
-        "Открыть позицию в обычном поиске",
-        articles,
-        key=f"crm_issue_open_select_{box_key}_{tab_key}",
-        help="Открывает позицию в обычном поиске. Дальше можно сразу работать с шаблоном, Avito и карточкой.",
-    )
-    if c2.button(button_text, key=f"crm_issue_open_btn_{box_key}_{tab_key}", use_container_width=True):
-        if open_editor:
-            st.session_state[f"show_card_editor_{tab_key}"] = True
-        trigger_search_from_article(selected_article, tab_key)
-
-
-def render_crm_quality_issue_lazy_panels(
-    sheet_df: pd.DataFrame | None,
-    photo_df: pd.DataFrame | None,
-    avito_df: pd.DataFrame | None,
-    min_qty: float,
-    sheet_name: str,
-    tab_label: str,
-    tab_key: str,
-) -> None:
-    show_no_photo = bool(st.session_state.get(f"crm_show_no_photo_{sheet_name}", False))
-    show_no_avito = bool(st.session_state.get(f"crm_show_no_avito_{sheet_name}", False))
-    if not (show_no_photo or show_no_avito):
-        return
-    if not isinstance(sheet_df, pd.DataFrame) or sheet_df.empty:
-        return
-
-    registry_df = load_avito_registry_df()
-    bundle = build_operational_analytics_bundle(
-        sheet_df,
-        photo_df,
-        avito_df,
-        registry_df,
-        min_qty,
-        tab_label,
-        st.session_state.get("hot_items_df"),
-    )
-    meta_df = bundle.get("meta_df", pd.DataFrame()) if isinstance(bundle, dict) else pd.DataFrame()
-    if not isinstance(meta_df, pd.DataFrame) or meta_df.empty:
-        return
-
-    def _render_issue_panel(
-        issue_df: pd.DataFrame,
-        title: str,
-        subtitle: str,
-        icon: str,
-        box_key: str,
-        button_text: str,
-        open_editor: bool,
-    ) -> None:
-        st.markdown('<div class="result-wrap">', unsafe_allow_html=True)
-        render_block_header(
-            title,
-            subtitle,
-            icon=icon,
-            help_text="Это ленивый поверхностный инструмент CRM. Он ничего не меняет в ядре, а только помогает открыть нужные позиции в обычном поиске.",
-        )
-        if issue_df.empty:
-            st.info("По текущему листу строк не найдено.")
-        else:
-            view_cols = [
-                "Артикул", "Название", "Наш остаток", "Причины", "Объявлений Авито",
-                "Фото", "Шаблон", "Лучший поставщик", "Разница, %",
-            ]
-            view_cols = [c for c in view_cols if c in issue_df.columns]
-            view = issue_df[view_cols].copy()
-            st.dataframe(
-                view,
-                use_container_width=True,
-                hide_index=True,
-                height=min(520, 120 + len(view) * 35),
-            )
-            render_crm_issue_open_helper(issue_df, tab_key, box_key, button_text=button_text, open_editor=open_editor)
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    if show_no_photo:
-        no_photo_df = meta_df[meta_df.get("Фото", pd.Series(dtype=object)).fillna("").eq("Нет")].copy()
-        if not no_photo_df.empty:
-            no_photo_df = no_photo_df.sort_values(["Наш остаток", "Название"], ascending=[False, True], na_position="last").reset_index(drop=True)
-        _render_issue_panel(
-            no_photo_df,
-            f"Нет фото — позиции для доработки ({len(no_photo_df)})",
-            "Показывает только позиции текущего листа без фото. Можно быстро открыть товар в обычном поиске и сразу поправить карточку.",
-            icon="🖼️",
-            box_key="crm_no_photo",
-            button_text="Открыть и редактировать",
-            open_editor=True,
-        )
-
-    if show_no_avito:
-        no_avito_mask = pd.to_numeric(meta_df.get("Объявлений Авито", 0), errors="coerce").fillna(0).eq(0)
-        no_avito_df = meta_df[no_avito_mask].copy()
-        if not no_avito_df.empty:
-            no_avito_df = no_avito_df.sort_values(["Наш остаток", "Название"], ascending=[False, True], na_position="last").reset_index(drop=True)
-        _render_issue_panel(
-            no_avito_df,
-            f"Без Avito — позиции для размещения ({len(no_avito_df)})",
-            "Показывает только позиции текущего листа без объявлений Avito. Можно быстро открыть позицию в обычном поиске и перейти к шаблону/размещению.",
-            icon="🛒",
-            box_key="crm_no_avito",
-            button_text="Открыть",
-            open_editor=False,
-        )
 
 
 def render_card_editor_panel(result_df: pd.DataFrame | None, sheet_name: str, tab_key: str) -> None:
@@ -5767,6 +5652,12 @@ with st.sidebar:
         st.markdown('<div class="sidebar-mini">Прайс сохраняется локально. После правок цены не пропадут до загрузки нового файла.</div>', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
+
+    st.markdown('<div class="sidebar-card">', unsafe_allow_html=True)
+    render_sidebar_card_header("Сервисный режим", "🛡️", "Ленивый блок для проверки системы, snapshot, восстановления и backup.zip.")
+    render_service_mode_sidebar()
+    st.markdown('</div>', unsafe_allow_html=True)
+
     st.markdown('<div class="sidebar-card">', unsafe_allow_html=True)
     render_sidebar_card_header("Настройки", "⚙️", "Управляет режимом поиска, главной ценой, пользовательской скидкой и округлением.")
     st.radio("Режим поиска", ["Только артикул", "Умный", "Артикул + название + бренд"], key="search_mode")
@@ -6531,25 +6422,11 @@ def render_crm_header_bar(
             st.session_state["crm_last_active_sheet_for_buy"] = str(sheet_name)
         st.caption("Показывает только выгодные позиции")
     with c3:
-        open_no_photo = bool(st.checkbox(
-            f"🖼️ Нет фото ({stats['without_photo']})",
-            value=bool(st.session_state.get(f"crm_show_no_photo_{sheet_name}", False)),
-            key=f"crm_show_no_photo_{sheet_name}",
-            help="Открывает таблицу только по позициям текущего листа без фото. Отсюда можно сразу открыть и поправить карточку.",
-        ))
-        if open_no_photo:
-            st.session_state["crm_last_active_sheet_for_no_photo"] = str(sheet_name)
-        st.caption("Показывает только позиции без фото")
+        st.metric("🖼️ Нет фото", stats["without_photo"])
+        st.caption("Сколько позиций на листе без фото")
     with c4:
-        open_no_avito = bool(st.checkbox(
-            f"🛒 Без Avito ({stats['without_avito']})",
-            value=bool(st.session_state.get(f"crm_show_no_avito_{sheet_name}", False)),
-            key=f"crm_show_no_avito_{sheet_name}",
-            help="Открывает таблицу только по позициям текущего листа без объявлений Avito. Отсюда можно перейти в обычный поиск и быстро разместить.",
-        ))
-        if open_no_avito:
-            st.session_state["crm_last_active_sheet_for_no_avito"] = str(sheet_name)
-        st.caption("Показывает только позиции без Avito")
+        st.metric("🛒 Без Avito", stats["without_avito"])
+        st.caption("Сколько позиций на листе без объявления")
     with c5:
         st.metric("Лист", tab_label)
         st.caption("CRM-метрики именно по текущему листу")
@@ -7373,23 +7250,197 @@ else:
     st.caption("ⓘ Верхние переключатели отвечают за быстрый доступ: раздел, задачи и фото. Основные тяжёлые блоки ниже открываются только по чекбоксам.")
     active_sheet_name, active_tab_label, active_tab_key = label_to_spec[st.session_state.get("active_workspace_label", "Оригинал")]
     active_sheet_df = sheets.get(active_sheet_name) if isinstance(sheets, dict) else None
-    render_crm_header_bar(
-        active_sheet_df,
-        st.session_state.get("photo_df"),
-        st.session_state.get("avito_df"),
-        active_sheet_name,
-        active_tab_label,
-        st.session_state.get("distributor_min_qty", 1.0),
-    )
-    render_task_center_lazy_panel()
-    render_hot_buy_watchlist_lazy_panel()
-    render_crm_quality_issue_lazy_panels(
-        active_sheet_df,
-        st.session_state.get("photo_df"),
-        st.session_state.get("avito_df"),
-        st.session_state.get("distributor_min_qty", 1.0),
-        active_sheet_name,
-        active_tab_label,
-        active_tab_key,
-    )
-    render_sheet_workspace(active_sheet_name, active_tab_label, active_tab_key)
+    if is_service_safe_boot_enabled():
+        st.warning("Включён безопасный запуск. Основные тяжёлые блоки временно отключены. Открой 🛡️ Сервисный режим в боковой панели, чтобы проверить систему, восстановить snapshot или выключить safe boot.")
+    else:
+        render_crm_header_bar(
+            active_sheet_df,
+            st.session_state.get("photo_df"),
+            st.session_state.get("avito_df"),
+            active_sheet_name,
+            active_tab_label,
+            st.session_state.get("distributor_min_qty", 1.0),
+        )
+        render_task_center_lazy_panel()
+        render_hot_buy_watchlist_lazy_panel()
+        render_sheet_workspace(active_sheet_name, active_tab_label, active_tab_key)
+
+def normalize_watchlist_sheet_name(value: Any) -> str:
+    txt = contains_text(value)
+    if "ОРИГИН" in txt or "СРАВН" in txt:
+        return "Оригинал"
+    if "УЦЕН" in txt:
+        return "Уценка"
+    if "СОВМЕСТ" in txt:
+        return "Совместимые"
+    return normalize_text(value)
+
+
+@st.cache_data(show_spinner=False, ttl=3600, max_entries=4)
+def load_hot_watchlist_file(file_name: str, file_bytes: bytes) -> pd.DataFrame:
+    suffix = Path(file_name).suffix.lower()
+    if suffix == ".csv":
+        bio = io.BytesIO(file_bytes)
+        try:
+            raw = pd.read_csv(bio)
+        except UnicodeDecodeError:
+            bio.seek(0)
+            raw = pd.read_csv(bio, encoding="cp1251")
+    else:
+        raw = pd.read_excel(io.BytesIO(file_bytes))
+    raw = raw.dropna(how="all").copy()
+    if raw.empty:
+        return pd.DataFrame(columns=[
+            "watch_article", "watch_key", "watch_name", "current_sheet", "comparison_article",
+            "sales_qty_15m", "sales_per_month", "abc_class", "velocity_band",
+            "best_supplier", "best_supplier_gap_pct", "buy_signal_30pct", "days_of_cover",
+            "priority_score", "action_today", "watch_article_norm", "watch_key_norm",
+            "comparison_article_norm", "match_keys_text",
+        ])
+    raw.columns = [normalize_text(c) for c in raw.columns]
+    rows = []
+    for _, r in raw.iterrows():
+        watch_article = normalize_text(r.get("watch_article", ""))
+        watch_key = normalize_text(r.get("watch_key", ""))
+        watch_name = normalize_text(r.get("watch_name", ""))
+        comparison_article = normalize_text(r.get("comparison_article", ""))
+        keys = unique_preserve_order([
+            normalize_article(watch_article),
+            normalize_article(watch_key),
+            normalize_article(comparison_article),
+        ])
+        if not any(keys):
+            continue
+        rows.append({
+            "watch_article": watch_article,
+            "watch_key": watch_key,
+            "watch_name": watch_name,
+            "current_sheet": normalize_watchlist_sheet_name(r.get("current_sheet", "")),
+            "comparison_article": comparison_article,
+            "sales_qty_15m": safe_float(r.get("sales_qty_15m"), 0.0),
+            "sales_per_month": safe_float(r.get("sales_per_month"), 0.0),
+            "abc_class": normalize_text(r.get("abc_class", "")),
+            "velocity_band": normalize_text(r.get("velocity_band", "")),
+            "best_supplier": normalize_text(r.get("best_supplier", "")),
+            "best_supplier_gap_pct": safe_float(r.get("best_supplier_gap_pct"), 0.0),
+            "buy_signal_30pct": normalize_text(r.get("buy_signal_30pct", "")),
+            "days_of_cover": safe_float(r.get("days_of_cover"), 0.0),
+            "priority_score": safe_float(r.get("priority_score"), 0.0),
+            "action_today": normalize_text(r.get("action_today", "")),
+            "watch_article_norm": normalize_article(watch_article),
+            "watch_key_norm": normalize_article(watch_key),
+            "comparison_article_norm": normalize_article(comparison_article),
+            "match_keys_text": "|".join([k for k in keys if k]),
+        })
+    out = pd.DataFrame(rows)
+    return out.reset_index(drop=True)
+
+
+def build_hot_watchlist_lookup(hot_df: pd.DataFrame | None, tab_label: str = "") -> dict[str, list[dict[str, Any]]]:
+    if not isinstance(hot_df, pd.DataFrame) or hot_df.empty:
+        return {}
+    work = hot_df.copy()
+    tab_label = normalize_text(tab_label)
+    if tab_label:
+        filtered = work[(work["current_sheet"] == "") | (work["current_sheet"] == tab_label)].copy()
+        if not filtered.empty:
+            work = filtered
+    lookup: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for _, row in work.iterrows():
+        rec = row.to_dict()
+        keys = [normalize_article(x) for x in normalize_text(rec.get("match_keys_text", "")).split("|") if normalize_article(x)]
+        if not keys:
+            continue
+        for key in keys:
+            lookup[key].append(rec)
+    return lookup
+
+
+def pick_hot_watch_rec(row: pd.Series, lookup: dict[str, list[dict[str, Any]]]) -> dict[str, Any] | None:
+    if not lookup:
+        return None
+    candidate_keys = []
+    article_norm = normalize_article(row.get("article_norm", row.get("article", "")))
+    if article_norm:
+        candidate_keys.append(article_norm)
+    row_codes = row.get("row_codes")
+    if isinstance(row_codes, list):
+        candidate_keys.extend([normalize_article(x) for x in row_codes if normalize_article(x)])
+    best = None
+    best_score = -10**18
+    seen = set()
+    for key in candidate_keys:
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        for rec in lookup.get(key, []):
+            score = safe_float(rec.get("priority_score"), 0.0)
+            if normalize_text(rec.get("buy_signal_30pct", "")).upper() == "BUY":
+                score += 100000.0
+            if key == normalize_article(rec.get("comparison_article_norm", "")):
+                score += 1000.0
+            elif key == normalize_article(rec.get("watch_article_norm", "")):
+                score += 500.0
+            if score > best_score:
+                best = rec
+                best_score = score
+    return best
+
+
+def apply_hot_watchlist(df: pd.DataFrame | None, hot_df: pd.DataFrame | None, tab_label: str = "") -> pd.DataFrame | None:
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    if not isinstance(hot_df, pd.DataFrame) or hot_df.empty:
+        return df
+    lookup = build_hot_watchlist_lookup(hot_df, tab_label=tab_label)
+    if not lookup:
+        return df
+    work = df.copy()
+    matches = [pick_hot_watch_rec(row, lookup) for _, row in work.iterrows()]
+    work["hot_flag"] = [bool(m) for m in matches]
+    work["hot_sales_per_month"] = [safe_float((m or {}).get("sales_per_month"), 0.0) for m in matches]
+    work["hot_priority_score"] = [safe_float((m or {}).get("priority_score"), 0.0) for m in matches]
+    work["hot_abc_class"] = [normalize_text((m or {}).get("abc_class", "")) for m in matches]
+    work["hot_velocity_band"] = [normalize_text((m or {}).get("velocity_band", "")) for m in matches]
+    work["hot_action_today"] = [normalize_text((m or {}).get("action_today", "")) for m in matches]
+    work["hot_buy_signal"] = [normalize_text((m or {}).get("buy_signal_30pct", "")) for m in matches]
+    work["hot_best_supplier"] = [normalize_text((m or {}).get("best_supplier", "")) for m in matches]
+    work["hot_best_supplier_gap_pct"] = [safe_float((m or {}).get("best_supplier_gap_pct"), 0.0) for m in matches]
+    work["hot_watch_article"] = [normalize_text((m or {}).get("watch_article", "")) for m in matches]
+    return work
+
+
+
+
+def dataframe_to_excel_bytes(df: pd.DataFrame) -> bytes:
+    out = io.BytesIO()
+    with pd.ExcelWriter(out, engine="openpyxl") as writer:
+        (df if isinstance(df, pd.DataFrame) else pd.DataFrame()).to_excel(writer, index=False, sheet_name="Watchlist")
+    return out.getvalue()
+
+def hot_watchlist_summary_text() -> str:
+    hot_df = st.session_state.get("hot_items_df")
+    if not isinstance(hot_df, pd.DataFrame) or hot_df.empty:
+        return "watchlist не загружен"
+    buy_count = int((hot_df.get("buy_signal_30pct", pd.Series(dtype=object)).fillna("").map(normalize_text).str.upper() == "BUY").sum())
+    ab_count = int(hot_df.get("abc_class", pd.Series(dtype=object)).fillna("").map(normalize_text).isin(["A", "B"]).sum())
+    return f"Ходовых: {len(hot_df)} • сильный спрос: {ab_count} • можно брать: {buy_count}"
+
+
+def hot_supplier_note(row: pd.Series | dict | None, best: dict | None, threshold_pct: float = 35.0) -> tuple[str, str]:
+    help_text = "Товар ходовой → товар хорошо продавался за выбранный период"
+    if not best:
+        help_text += f"\nСейчас брать невыгодно → нет поставщика с ценой минимум на {threshold_pct:.0f}% ниже нашей цены"
+        return "Сейчас брать невыгодно", help_text
+
+    source = normalize_text((best or {}).get("source", ""))
+    delta_pct = safe_float((best or {}).get("delta_percent"), 0.0)
+    if delta_pct >= float(threshold_pct):
+        action_text = f"Сейчас можно брать у {source}" if source else "Сейчас можно брать"
+        help_text += f"\nСейчас можно брать → лучший поставщик сейчас минимум на {threshold_pct:.0f}% дешевле нашей цены"
+        return action_text, help_text
+
+    help_text += f"\nСейчас брать невыгодно → нет поставщика с ценой минимум на {threshold_pct:.0f}% ниже нашей цены"
+    return "Сейчас брать невыгодно", help_text
+
+
