@@ -5812,6 +5812,27 @@ st.markdown(f"""
 </div></div>
 """, unsafe_allow_html=True)
 
+debug_run_file = normalize_text(str(Path(__file__).resolve()))
+st.markdown(
+    f"""
+    <div style="
+        margin:8px 0 14px 0;
+        padding:10px 14px;
+        border-radius:16px;
+        border:1px solid #dbe5f1;
+        background:linear-gradient(180deg,#ffffff 0%,#f8fbff 100%);
+        color:#334155;
+        font-size:12.5px;
+        line-height:1.55;
+        box-shadow:0 8px 18px rgba(15,23,42,.05);
+    ">
+      <b>DEBUG RUN</b> • VERSION: <b>{html.escape(APP_VERSION)}</b><br>
+      <b>FILE:</b> {html.escape(debug_run_file)}
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
 
 
 
