@@ -3645,6 +3645,8 @@ def render_card_editor_panel(result_df: pd.DataFrame | None, sheet_name: str, ta
                 note=task_note or note,
                 source="card_editor",
             )
+        rebuild_current_df()
+        refresh_all_search_results()
         st.success(f"Карточка {art} сохранена.")
         if create_task_flag:
             st.info(f"Задача по {art} создана до {task_due_date}.")
@@ -3652,6 +3654,8 @@ def render_card_editor_panel(result_df: pd.DataFrame | None, sheet_name: str, ta
 
     if reset_clicked:
         delete_card_override(sheet_name, art_norm)
+        rebuild_current_df()
+        refresh_all_search_results()
         st.success(f"Ручные правки для {art} сброшены.")
         st.rerun()
 
@@ -6865,6 +6869,8 @@ def render_crm_card_center(
                     note=task_note or note_new,
                     source="crm_card",
                 )
+            rebuild_current_df()
+            refresh_all_search_results()
             st.success(f"Карточка {art} сохранена.")
             if make_task:
                 st.info(f"Задача по {art} создана до {due_date}.")
@@ -6872,6 +6878,8 @@ def render_crm_card_center(
 
         if reset_clicked:
             delete_card_override(sheet_name, art_norm)
+            rebuild_current_df()
+            refresh_all_search_results()
             st.success(f"Ручные правки для {art} сброшены.")
             st.rerun()
 
@@ -7115,53 +7123,60 @@ def render_sheet_workspace(sheet_name: str, tab_label: str, tab_key: str) -> Non
                     tech = tech[["article", "name", "Наша цена", "Наш склад", "Лучший поставщик", "Лучшая цена", "Фото"]].rename(columns={"article": "Артикул", "name": "Название"})
                 st.dataframe(tech, use_container_width=True, hide_index=True)
 
-            render_crm_card_center(
-                result_df,
-                display_result_df,
-                compare_map,
-                st.session_state.get("avito_df"),
-                sheet_name,
-                tab_label,
-                tab_key,
-                price_mode,
-                round100,
-                custom_discount,
-            )
-
-            render_card_editor_panel(display_result_df, sheet_name, tab_key)
-
-            lazy_c0, lazy_c1, lazy_c2, lazy_c3, lazy_c4, lazy_c5 = st.columns(6)
+            lazy_c0, lazy_c1, lazy_c2, lazy_c3, lazy_c4, lazy_c5, lazy_c6 = st.columns(7)
             lazy_c0.checkbox(
+                "Показать CRM-карточку",
+                key=f"lazy_crm_card_{tab_key}",
+                value=False,
+                help="Открывает компактную CRM-карточку товара только по требованию.",
+            )
+            lazy_c1.checkbox(
                 "Показать шаблоны",
                 key=f"lazy_templates_{tab_key}",
                 help="Готовые текстовые шаблоны по найденным позициям: для ответа клиенту, публикации или быстрой отправки.",
             )
-            lazy_c1.checkbox(
+            lazy_c2.checkbox(
                 "Показать цены у всех",
                 key=f"lazy_all_prices_{tab_key}",
                 help="Полное сравнение по каждому найденному товару: наша цена и все поставщики с остатками и разницей.",
             )
-            lazy_c2.checkbox(
+            lazy_c3.checkbox(
                 "Файл для руководителя",
                 key=f"lazy_analysis_{tab_key}",
                 help="Собирает Excel для согласования: артикулы, текущая цена, лучшая цена поставщика и поля для решения по пересмотру.",
             )
-            lazy_c3.checkbox(
+            lazy_c4.checkbox(
                 "Показать Авито",
                 key=f"lazy_avito_{tab_key}",
                 help="Проверяет, есть ли объявления Авито по найденным артикулам в загруженном файле.",
             )
-            lazy_c4.checkbox(
+            lazy_c5.checkbox(
                 "Считать отчёт по листу",
                 key=f"lazy_report_{tab_key}",
                 help="Строит управленческий отчёт по всему текущему листу, а не только по найденным строкам.",
             )
-            lazy_c5.checkbox(
+            lazy_c6.checkbox(
                 "Аналитика / задачи",
                 key=f"lazy_analytics_{tab_key}",
                 help="Открывает операционную аналитику: что пересмотреть, где нет фото/Avito, какие серии и правки требуют внимания.",
             )
-            st.caption("ⓘ Что за что отвечает: шаблоны — тексты, цены у всех — полная рыночная картина, файл для руководителя — выгрузка на согласование, Авито — наличие объявлений, отчёт по листу — управленческий отчёт, аналитика / задачи — проблемные зоны и действия.")
+            st.caption("ⓘ Что за что отвечает: CRM-карточка — компактный обзор позиции, шаблоны — тексты, цены у всех — полная рыночная картина, файл для руководителя — выгрузка на согласование, Авито — наличие объявлений, отчёт по листу — управленческий отчёт, аналитика / задачи — проблемные зоны и действия.")
+
+            if st.session_state.get(f"lazy_crm_card_{tab_key}", False):
+                render_crm_card_center(
+                    result_df,
+                    display_result_df,
+                    compare_map,
+                    st.session_state.get("avito_df"),
+                    sheet_name,
+                    tab_label,
+                    tab_key,
+                    price_mode,
+                    round100,
+                    custom_discount,
+                )
+
+            render_card_editor_panel(display_result_df, sheet_name, tab_key)
 
             if st.session_state.get(f"lazy_templates_{tab_key}", False):
                 result_enriched_for_templates = apply_photo_map(result_df, photo_df) if isinstance(result_df, pd.DataFrame) else result_df
@@ -7381,7 +7396,12 @@ else:
 
     st.caption("ⓘ Верхние переключатели отвечают за быстрый доступ: раздел, задачи и фото. Основные тяжёлые блоки ниже открываются только по чекбоксам.")
     active_sheet_name, active_tab_label, active_tab_key = label_to_spec[st.session_state.get("active_workspace_label", "Оригинал")]
-    active_sheet_df = sheets.get(active_sheet_name) if isinstance(sheets, dict) else None
+    active_sheet_raw = sheets.get(active_sheet_name) if isinstance(sheets, dict) else None
+    active_sheet_df = (
+        apply_card_overrides(active_sheet_raw.copy(), active_sheet_name)
+        if isinstance(active_sheet_raw, pd.DataFrame)
+        else None
+    )
     if is_service_safe_boot_enabled():
         st.warning("Включён безопасный запуск. Основные тяжёлые блоки временно отключены. Открой 🛡️ Сервисный режим в боковой панели, чтобы проверить систему, восстановить snapshot или выключить safe boot.")
     else:
