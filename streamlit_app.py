@@ -8756,6 +8756,58 @@ def classify_search_procurement_stock_status(row: pd.Series | dict[str, Any]) ->
     return "Норма"
 
 
+def _classify_procurement_market_signals(row: pd.Series | dict[str, Any], threshold_pct: float = 35.0) -> dict[str, Any]:
+    own_price = safe_float((row or {}).get("Наша цена", None), 0.0) if isinstance(row, dict) else safe_float(row.get("Наша цена", None), 0.0)
+    offers = []
+    if isinstance(row, dict):
+        offers = row.get("supplier_valid_offers", []) or []
+    else:
+        offers = row.get("supplier_valid_offers", []) or []
+    valid_prices = sorted([safe_float((o or {}).get("price"), 0.0) for o in offers if safe_float((o or {}).get("price"), 0.0) > 0])
+    if own_price <= 0 or not valid_prices:
+        return {
+            "market_vs_our_price": "нет сигнала",
+            "buy_signal_flag": "Нет",
+            "price_signal_flag": "Проверить",
+            "market_below_pct": None,
+            "market_above_pct": None,
+            "supplier_price_any": None,
+        }
+
+    best_market_price = valid_prices[0]
+    if abs(best_market_price - own_price) < 1e-9:
+        return {
+            "market_vs_our_price": "на уровне нашей цены",
+            "buy_signal_flag": "Нет",
+            "price_signal_flag": "Оставить",
+            "market_below_pct": 0.0,
+            "market_above_pct": 0.0,
+            "supplier_price_any": best_market_price,
+        }
+
+    if best_market_price < own_price:
+        gap_pct = round(((own_price - best_market_price) / own_price) * 100.0, 2) if own_price > 0 else 0.0
+        return {
+            "market_vs_our_price": f"ниже на {gap_pct:.1f}%",
+            "buy_signal_flag": "Да" if gap_pct >= float(threshold_pct) else "Нет",
+            "price_signal_flag": "Нет",
+            "market_below_pct": gap_pct,
+            "market_above_pct": None,
+            "supplier_price_any": best_market_price,
+        }
+
+    gap_pct = round(((best_market_price - own_price) / own_price) * 100.0, 2) if own_price > 0 else 0.0
+    price_signal = "Поднять" if gap_pct >= 5.0 else "Оставить"
+    return {
+        "market_vs_our_price": f"выше на {gap_pct:.1f}%",
+        "buy_signal_flag": "Нет",
+        "price_signal_flag": price_signal,
+        "market_below_pct": None,
+        "market_above_pct": gap_pct,
+        "supplier_price_any": best_market_price,
+    }
+
+
 def build_search_procurement_summary_df(
     result_df: pd.DataFrame | None,
     photo_df: pd.DataFrame | None,
@@ -8780,6 +8832,7 @@ def build_search_procurement_summary_df(
             "article_norm", "purchase_avg_cost", "purchase_match_source", "purchase_source_name",
             "purchase_source_sheet", "recommended_price", "decision_reason", "best_source",
             "best_price", "best_qty", "open_tasks", "pipeline_status", "current_queue",
+            "supplier_valid_offers",
         ] if c in products_df.columns
     ]
     extra_df = products_df[extra_cols].copy() if extra_cols else pd.DataFrame()
@@ -8809,11 +8862,27 @@ def build_search_procurement_summary_df(
     out["Pipeline"] = out.get("Pipeline", out.get("pipeline_status", ""))
     out["Очередь"] = out.get("Очередь", out.get("current_queue", ""))
 
+    threshold_pct = float(st.session_state.get("distributor_threshold", 35.0) or 35.0)
+    signal_records = out.apply(lambda r: _classify_procurement_market_signals(r, threshold_pct=threshold_pct), axis=1)
+    signal_df = pd.DataFrame(list(signal_records)) if len(signal_records) else pd.DataFrame()
+    if not signal_df.empty:
+        signal_df.index = out.index
+        out["Рынок vs наша цена"] = signal_df.get("market_vs_our_price")
+        out["Сигнал закупки"] = signal_df.get("buy_signal_flag")
+        out["Сигнал цены"] = signal_df.get("price_signal_flag")
+        out["Рынок ниже, %"] = signal_df.get("market_below_pct")
+        out["Рынок выше, %"] = signal_df.get("market_above_pct")
+        out["Лучшая цена рынка"] = signal_df.get("supplier_price_any")
+    else:
+        out["Рынок vs наша цена"] = "нет сигнала"
+        out["Сигнал закупки"] = "Нет"
+        out["Сигнал цены"] = "Проверить"
+
     preferred = [
         "Артикул", "Товар", "Наш остаток", "Наша цена", "Средняя закупка", "Наценка, ₽", "Наценка, %",
         "Продажи, шт/мес", "Запас, мес", "Статус склада", "Лучший поставщик", "Цена поставщика",
-        "Разница, %", "Рекомендованная цена", "Фото", "Avito", "Решение", "Почему",
-        "Открытых задач", "Pipeline", "Очередь",
+        "Разница, %", "Рынок vs наша цена", "Сигнал закупки", "Сигнал цены", "Рекомендованная цена",
+        "Фото", "Avito", "Решение", "Почему", "Открытых задач", "Pipeline", "Очередь",
     ]
     keep = [c for c in preferred if c in out.columns]
     out = out[keep].copy()
@@ -8842,11 +8911,12 @@ def render_search_procurement_summary_block(
     )
     st.caption("ⓘ Здесь собрана вся ключевая информация по найденным товарам в одном месте: склад, экономика, спрос, рынок и итоговое решение.")
 
-    m1, m2, m3, m4 = st.columns(4)
+    m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("Позиций", len(summary_df))
-    m2.metric("Можно закупать", int(summary_df.get("Решение", pd.Series(dtype=object)).fillna("").astype(str).eq("Можно закупать").sum()))
-    m3.metric("Залежалый / не покупать", int(summary_df.get("Решение", pd.Series(dtype=object)).fillna("").astype(str).isin(["Не покупать", "Распродавать"]).sum()))
-    m4.metric("Требуют цены", int(summary_df.get("Решение", pd.Series(dtype=object)).fillna("").astype(str).isin(["Пересмотреть цену"]).sum()))
+    m2.metric("Вход 35%+", int(summary_df.get("Сигнал закупки", pd.Series(dtype=object)).fillna("").astype(str).eq("Да").sum()))
+    m3.metric("Можно поднять цену", int(summary_df.get("Сигнал цены", pd.Series(dtype=object)).fillna("").astype(str).eq("Поднять").sum()))
+    m4.metric("Залежалый / не покупать", int(summary_df.get("Решение", pd.Series(dtype=object)).fillna("").astype(str).isin(["Не покупать", "Распродавать"]).sum()))
+    m5.metric("Требуют цены", int(summary_df.get("Решение", pd.Series(dtype=object)).fillna("").astype(str).isin(["Пересмотреть цену"]).sum()))
 
     view_df = summary_df.copy()
     st.dataframe(view_df, use_container_width=True, hide_index=True, height=min(560, 140 + len(view_df) * 35))
